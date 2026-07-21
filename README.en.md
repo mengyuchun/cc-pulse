@@ -2,9 +2,9 @@
 
 # CC-Pulse
 
-**Health checks and deep single-model diagnostics for [cc-switch](https://github.com/farion1231/cc-switch) providers**
+**Listen to the "heartbeat" of [cc-switch](https://github.com/farion1231/cc-switch) providers — health checks and deep single-model diagnostics**
 
-Don't trust "it connected". Trust "it answered correctly". See which providers actually work before you switch.
+Don't trust "it connected". Trust "it works". With so many providers, see at a glance which ones you can actually use.
 
 [中文](README.md) · English
 
@@ -28,7 +28,7 @@ cc-switch helps you manage many Claude Code / Codex API relay providers. But rel
 - 📏 **Shrinking context**: advertised as 1M, rejected around 526k
 - 🛠️ **Tool / vision gaps**: coding agents depend on `tool_use`, but many relays only pretend to support it
 
-CC-Pulse does not stop at connectivity. It asks a real question and checks whether the answer is correct — so you can see the truth before switching providers.
+CC-Pulse does not stop at connectivity. It checks whether a provider can actually be used — so with so many providers, you can see at a glance which ones really work.
 
 ---
 
