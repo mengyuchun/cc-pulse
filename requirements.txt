@@ -1,0 +1,7 @@
+# CC-Pulse dependencies
+# Runtime: pure Python standard library only — no third-party packages required.
+# This file is kept for tooling consistency; nothing needs to be installed for usage.
+#
+# Optional dev tools (not required to run CC-Pulse):
+#   ruff          # format + lint
+#   just          # task runner (justfile)

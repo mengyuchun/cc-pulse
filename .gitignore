@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.eggs/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local secrets / credentials (never commit)
+*.pem
+*.key
+*credentials*
+*secrets*
+
+# Local debug dumps
+.tmp_*.txt
+*.tmp
+*.bak
+*.bakup
+
+# Logs
+*.log
+logs/
+
+# CodeGraph
+.codegraph/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Cache
+.cache/
+*.cache
+.ruff_cache/
+
+# Local data dumps
+outputs/
+results/
