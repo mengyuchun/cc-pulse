@@ -35,28 +35,50 @@ cc-switch 自带 stream check（连通性检测），会记录 `http_status` / `
 
 | 维度 | cc-switch 内置检测 | CC-Pulse |
 |------|-------------------|----------|
-| 侧重 | 连通性（能连上、多快） | 实际可用性（能正确回答吗） |
-| 判定依据 | HTTP 状态码 + 响应时间 | HTTP 状态码 + **答案内容校验** |
-| 200 但答案空 | 通常判为健康 | 判为 `answer_mismatch`（不可用） |
-| 200 但业务错误体 | 通常判为健康 | 判为 `invalid_response` 并显示原文 |
-| thinking 耗光 token | 不涉及 | 默认禁用 thinking，可调 `max_tokens` |
-| 模型静默路由 | 不检测 | `inspect` 抓 `model_consistency` |
-| 多档位回退 | 单次检测 | haiku→sonnet→opus→fable→default |
-| 流式 / 工具 / 上下文 / vision | 不涉及 | `inspect` 7 维度诊断 |
+| 侧重 | 连通性 / 延迟 / 运行态 | 实际可用性（认证 + 正确回答） |
+| 对上游发真实模型请求 | 取决于当前 cc-switch 版本与检测配置 | ✅ 每个档位都发真实请求 |
+| API key / token 无效 | 取决于检测是否覆盖该供应商认证链路 | ✅ 401 / 403 明确归为 `authentication` |
+| 200 但答案空 | 可能无法从连通性结果区分 | ✅ `answer_mismatch`（不可用） |
+| 200 但业务错误体 | 可能表现为「HTTP 成功」 | ✅ `invalid_response`，保留错误原文 |
+| thinking 耗光 token | 不属于基础连通性检测范围 | ✅ 默认禁用 thinking，可调 `max_tokens` |
+| 模型静默路由 | ❌ 不在基础检测范围 | ✅ `inspect` 比对 request / response model |
+| 多档位回退 | 取决于运行时故障转移 | ✅ haiku → sonnet → opus → fable → default 主动探测 |
+| 流式 / 工具 / 上下文 / vision | ❌ 不属于基础检测范围 | ✅ `inspect` 7 维度诊断 |
 
-**实测案例**（都是真实遇到过的）：某供应商返回 HTTP 200，但 body 是
+**典型陷阱场景**（都是真实遇到过的）：
+
+**① HTTP 200，但 body 是业务错误**
 
 ```json
 {"code":0,"msg":"旧转发链路已关闭","data":null}
 ```
 
-或者
+✅ 连上 · ❌ 根本没出模型内容 → CC-Pulse 判 `invalid_response`
+
+**② HTTP 200，但答案是空字符串**
 
 ```json
 {"content":[{"type":"text","text":""}]}
 ```
 
-前者是业务错误、后者是 thinking 耗光预算的空答案。**连通性检测会把它们标为健康**，于是你在 cc-switch 里切过去，真用起来才发现 Claude Code 一句话都回不了。CC-Pulse 会标为不可用，并给出原因与错误分类。
+✅ 连上 · ❌ thinking 把 token 花光，没有最终答案 → CC-Pulse 判 `answer_mismatch`
+
+**③ key / token 错误或被吊销**
+
+```json
+{"type":"error","error":{"type":"AuthError","message":"Invalid API key."}}
+```
+
+✅ 端点活着 · ❌ 认证失败，实际用不了 → CC-Pulse 判 `authentication` 并告诉你到底哪步炸了
+
+**④ key 还能列模型、但不能推理**
+
+```text
+GET /v1/models  → 200 ✅
+POST /v1/messages → 401 Invalid API key ❌
+```
+
+cc-switch 的基础检测若只覆盖连通性维度，可能只看到前半段「能列模型」就判健康；CC-Pulse 会发真实推理请求，把后半段认证失效暴露出来。
 
 一句话：**cc-switch 回答「能不能连」，CC-Pulse 回答「能不能用」**。
 
