@@ -6,6 +6,8 @@
 
 不信「能连上」，只信「能正确回答」。在切换供应商前，一眼看清哪些真能用。
 
+[中文](README.md) · [English](README.en.md)
+
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
 [![Tests](https://img.shields.io/badge/tests-208%20pass-brightgreen.svg)](#测试)
@@ -451,7 +453,8 @@ CC-Pulse/
 │   └── test_ps1_launcher.py   # PS1 启动器交互流程
 ├── CLAUDE.md                   # 项目级 Claude Code 指令
 ├── LICENSE                     # MIT License
-└── README.md
+├── README.md                   # 中文文档
+└── README.en.md                # English docs
 ```
 
 ---
