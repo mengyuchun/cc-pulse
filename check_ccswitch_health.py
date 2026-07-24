@@ -1713,6 +1713,13 @@ def run_health_check(args, providers, say) -> int:
                 fails = " | ".join(f"{a['tier']}:{a['status']}({a['error'][:30]})"
                                    for a in r["attempts"])
                 say(f"[{i:>2}/{len(providers)}] {icon} {r['name'][:24]:24} {fails}")
+            if getattr(args, "with_history", False):
+                try:
+                    say(format_history_sidebar(
+                        args.db, r["name"],
+                        since=getattr(args, "history_since", "24h") or "24h"))
+                except Exception as e:
+                    say(f"  history: 读取失败 ({type(e).__name__}: {e})")
 
     ok = [r for r in results if r["overall_ok"]]
     fail = [r for r in results if not r["overall_ok"]]
@@ -2141,12 +2148,30 @@ def run_inspect(args, providers, say) -> int:
             "recommended_actions": recommended,
         },
     }
+    if getattr(args, "with_history", False):
+        try:
+            since = getattr(args, "history_since", "24h") or "24h"
+            report["history"] = summarize_provider_history(
+                args.db, inspect_p.name, since_ts=_parse_since(since))
+            report["history_since"] = since
+        except Exception as e:
+            report["history"] = {"error": f"{type(e).__name__}: {e}"}
 
     if args.human:
         # 人类可读输出到 stdout（即使 JSON 模式，也走 stdout）
-        print(format_inspect_human(report))
+        text = format_inspect_human(report)
+        if report.get("history") and not report["history"].get("error"):
+            h = report["history"]
+            since = report.get("history_since", "24h")
+            rate = f"{h.get('success_rate', 0)*100:.0f}%"
+            text += (f"\n  history({since}): 请求{h.get('total')} 成功{rate} "
+                     f"失败{h.get('fail')} 主因={h.get('top_fail_category') or '-'} "
+                     f"路由≠{h.get('mismatch_rate', 0)*100:.0f}%")
+        elif report.get("history", {}).get("error"):
+            text += f"\n  history: {report['history']['error']}"
+        print(text)
     else:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     return 0 if verdict in ("healthy", "skipped") else 1
 
 
@@ -2310,6 +2335,445 @@ def format_inspect_human(r: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------- cc-switch 运行日志（只读） ----------
+
+LOGS_DIR = str(Path.home() / ".cc-switch" / "logs")
+
+
+def _parse_since(s: str | None) -> int | None:
+    """解析 --since：24h / 7d / 30m / 3600 → unix 秒下限；None 表示不限。"""
+    if not s:
+        return None
+    s = str(s).strip().lower()
+    now = int(time.time())
+    if s.isdigit():
+        return now - int(s)
+    m = re.fullmatch(r"(\d+)([smhd])", s)
+    if not m:
+        raise ValueError(f"无法解析 --since: {s!r}（示例: 24h / 7d / 30m / 3600）")
+    n, u = int(m.group(1)), m.group(2)
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[u]
+    return now - n * mult
+
+
+def _fmt_ts(ts) -> str:
+    if ts is None:
+        return "?"
+    try:
+        t = float(ts)
+        if t > 1e12:
+            t = t / 1e9 if t > 1e15 else t / 1e3
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+    except Exception:
+        return str(ts)
+
+
+def load_provider_id_map(db_path: str) -> dict:
+    """provider_id(uuid) -> name；只读。"""
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        out = {}
+        for pid, name in conn.execute("SELECT id, name FROM providers"):
+            if pid:
+                out[pid] = name or pid
+        return out
+    finally:
+        conn.close()
+
+
+def resolve_provider_name(pid: str | None, id_map: dict) -> str:
+    if not pid:
+        return "?"
+    if pid in id_map:
+        return id_map[pid]
+    return f"deleted:{str(pid)[:8]}"
+
+
+def classify_log_error(status_code: int | None, error_message: str | None) -> str:
+    """把 proxy_request_logs 的 status/error_message 映射到 ErrorCategory 字符串。"""
+    msg = error_message or ""
+    low = msg.lower()
+    st = int(status_code or 0)
+
+    # 关键词优先（比纯 status 更准）
+    if any(k in low for k in ("invalid api", "missing api", "authentication",
+                               "unauthorized", "forbidden")):
+        return ErrorCategory.AUTH.value
+    if any(k in msg for k in ("余额", "预扣", "额度")) or "insufficient" in low:
+        return ErrorCategory.AUTH.value  # 额度/鉴权类，归 authentication
+    if any(k in low for k in ("rate limit", "rate_limit", "too many", "429")) or st == 429:
+        return ErrorCategory.RATE_LIMIT.value
+    if any(k in low for k in ("model_not", "no available channel", "unknown model",
+                               "model does not exist")) or st == 404:
+        return ErrorCategory.MODEL_NOT_FOUND.value
+    if any(k in low for k in ("timeout", "首包超时", "ttft")):
+        return ErrorCategory.TTFT_TIMEOUT.value
+    if any(k in low for k in ("connect", "连接", "tls", "certificate")) or st in (502, 522, 524):
+        return ErrorCategory.NETWORK.value
+    if any(k in low for k in ("schema", "invalid request", "maximum prompt",
+                               "too large", "413")) or st in (400, 413, 422):
+        return ErrorCategory.PROTOCOL_INCOMPATIBLE.value
+    if st in (401, 403, 402):
+        return ErrorCategory.AUTH.value
+    if st >= 500:
+        return ErrorCategory.SERVER.value
+    if st and st != 200:
+        cat = _category_from_status(st)
+        if cat is not None:
+            return cat.value
+    if msg.strip():
+        return ErrorCategory.UNKNOWN.value
+    return ErrorCategory.NONE.value
+
+
+def _open_ro(db_path: str):
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+
+def _table_exists(conn, name: str) -> bool:
+    r = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return r is not None
+
+
+def query_proxy_logs(db_path: str, *, since_ts: int | None = None, limit: int = 20,
+                     fails_only: bool = False, provider_substr: str | None = None) -> list:
+    """查询 proxy_request_logs，返回 dict 列表（已解析供应商名与 error_category）。"""
+    id_map = load_provider_id_map(db_path)
+    # reverse name filter: match provider ids whose name contains substr
+    name_pids = None
+    if provider_substr:
+        sub = provider_substr.lower()
+        name_pids = {pid for pid, n in id_map.items() if sub in (n or "").lower()}
+
+    conn = _open_ro(db_path)
+    try:
+        if not _table_exists(conn, "proxy_request_logs"):
+            return []
+        where = []
+        args: list = []
+        if since_ts is not None:
+            where.append("created_at >= ?")
+            args.append(since_ts)
+        if fails_only:
+            where.append(
+                "(status_code IS NULL OR status_code != 200 "
+                "OR (error_message IS NOT NULL AND error_message != ''))"
+            )
+        if name_pids is not None:
+            if not name_pids:
+                return []
+            placeholders = ",".join("?" * len(name_pids))
+            where.append(f"provider_id IN ({placeholders})")
+            args.extend(name_pids)
+        sql = "SELECT * FROM proxy_request_logs"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(int(limit))
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(proxy_request_logs)")]
+        rows = []
+        for row in conn.execute(sql, args):
+            d = dict(zip(cols, row))
+            d["provider_name"] = resolve_provider_name(d.get("provider_id"), id_map)
+            d["error_category"] = classify_log_error(d.get("status_code"), d.get("error_message"))
+            d["routing_mismatch"] = bool(
+                d.get("request_model") and d.get("model")
+                and d.get("request_model") != d.get("model")
+            )
+            d["created_at_fmt"] = _fmt_ts(d.get("created_at"))
+            rows.append(d)
+        return rows
+    finally:
+        conn.close()
+
+
+def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
+    """按供应商汇总：请求数、成功、失败、主失败因、中位延迟近似、路由不一致率。"""
+    id_map = load_provider_id_map(db_path)
+    conn = _open_ro(db_path)
+    try:
+        if not _table_exists(conn, "proxy_request_logs"):
+            return []
+        where = ""
+        args: list = []
+        if since_ts is not None:
+            where = "WHERE created_at >= ?"
+            args.append(since_ts)
+        # 拉原始行做聚合（2万级可接受）
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(proxy_request_logs)")]
+        sql = f"SELECT * FROM proxy_request_logs {where}"
+        buckets: dict[str, dict] = {}
+        for row in conn.execute(sql, args):
+            d = dict(zip(cols, row))
+            pid = d.get("provider_id") or "?"
+            b = buckets.get(pid)
+            if b is None:
+                b = {
+                    "provider_id": pid,
+                    "provider_name": resolve_provider_name(pid, id_map),
+                    "total": 0,
+                    "ok": 0,
+                    "fail": 0,
+                    "mismatch": 0,
+                    "latencies": [],
+                    "fail_cats": {},
+                    "status_counts": {},
+                }
+                buckets[pid] = b
+            b["total"] += 1
+            st = d.get("status_code")
+            err = d.get("error_message")
+            is_fail = (st is None or st != 200 or (err is not None and err != ""))
+            if is_fail:
+                b["fail"] += 1
+                cat = classify_log_error(st, err)
+                b["fail_cats"][cat] = b["fail_cats"].get(cat, 0) + 1
+                key = str(st)
+                b["status_counts"][key] = b["status_counts"].get(key, 0) + 1
+            else:
+                b["ok"] += 1
+            if (d.get("request_model") and d.get("model")
+                    and d.get("request_model") != d.get("model")):
+                b["mismatch"] += 1
+            lat = d.get("latency_ms")
+            if isinstance(lat, (int, float)) and lat >= 0:
+                b["latencies"].append(lat)
+        out = []
+        for b in buckets.values():
+            lats = sorted(b["latencies"])
+            med = lats[len(lats) // 2] if lats else None
+            top_cat = None
+            if b["fail_cats"]:
+                top_cat = max(b["fail_cats"].items(), key=lambda x: x[1])[0]
+            total = b["total"] or 1
+            out.append({
+                "provider_id": b["provider_id"],
+                "provider_name": b["provider_name"],
+                "total": b["total"],
+                "ok": b["ok"],
+                "fail": b["fail"],
+                "success_rate": round(b["ok"] / total, 4),
+                "mismatch": b["mismatch"],
+                "mismatch_rate": round(b["mismatch"] / total, 4),
+                "median_latency_ms": med,
+                "top_fail_category": top_cat,
+                "fail_categories": b["fail_cats"],
+                "status_counts": b["status_counts"],
+            })
+        out.sort(key=lambda x: (-x["fail"], -x["total"]))
+        return out
+    finally:
+        conn.close()
+
+
+def query_routing(db_path: str, *, since_ts: int | None = None, limit: int = 20) -> list:
+    """静默路由排行：request_model -> model。"""
+    conn = _open_ro(db_path)
+    try:
+        if not _table_exists(conn, "proxy_request_logs"):
+            return []
+        where = "WHERE request_model IS NOT NULL AND model IS NOT NULL AND request_model != model"
+        args: list = []
+        if since_ts is not None:
+            where += " AND created_at >= ?"
+            args.append(since_ts)
+        sql = f"""
+            SELECT request_model, model, COUNT(*) AS n
+            FROM proxy_request_logs
+            {where}
+            GROUP BY request_model, model
+            ORDER BY n DESC
+            LIMIT ?
+        """
+        args.append(int(limit))
+        return [
+            {"request_model": a, "actual_model": b, "count": n}
+            for a, b, n in conn.execute(sql, args)
+        ]
+    finally:
+        conn.close()
+
+
+def summarize_provider_history(db_path: str, provider_name: str,
+                               since_ts: int | None = None) -> dict | None:
+    """单个供应商 24h 摘要，供 check/inspect 挂钩。"""
+    stats = query_stats(db_path, since_ts=since_ts)
+    for s in stats:
+        if s["provider_name"] == provider_name:
+            return s
+    # 模糊
+    low = provider_name.lower()
+    for s in stats:
+        if low in s["provider_name"].lower():
+            return s
+    return None
+
+
+def read_log_file_tail(path: str, lines: int = 50, keyword: str | None = None) -> list:
+    """读磁盘日志尾部（P3）。大文件只读末尾约 512KB。"""
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return [f"日志文件不存在: {path}"]
+    size = p.stat().st_size
+    chunk = min(size, 512 * 1024)
+    with open(p, "rb") as f:
+        if size > chunk:
+            f.seek(-chunk, 2)
+        data = f.read().decode("utf-8", errors="replace")
+    raw_lines = data.splitlines()
+    if keyword:
+        raw_lines = [ln for ln in raw_lines if keyword.lower() in ln.lower()]
+    return raw_lines[-lines:]
+
+
+def run_history(args, say) -> int:
+    """history 子命令。"""
+    try:
+        since_ts = _parse_since(getattr(args, "since", None))
+    except ValueError as e:
+        say(str(e))
+        return 2
+    limit = getattr(args, "limit", 20) or 20
+    fails = getattr(args, "fails", False)
+    prov = getattr(args, "provider", None) or None
+    rows = query_proxy_logs(
+        args.db, since_ts=since_ts, limit=limit, fails_only=fails, provider_substr=prov
+    )
+    report = {
+        "schema_version": 1,
+        "command": "history",
+        "since": getattr(args, "since", None),
+        "limit": limit,
+        "fails_only": fails,
+        "count": len(rows),
+        "entries": [
+            {
+                "created_at": r.get("created_at"),
+                "created_at_fmt": r.get("created_at_fmt"),
+                "provider_name": r.get("provider_name"),
+                "app_type": r.get("app_type"),
+                "request_model": r.get("request_model"),
+                "model": r.get("model"),
+                "status_code": r.get("status_code"),
+                "latency_ms": r.get("latency_ms"),
+                "first_token_ms": r.get("first_token_ms"),
+                "input_tokens": r.get("input_tokens"),
+                "output_tokens": r.get("output_tokens"),
+                "error_message": r.get("error_message"),
+                "error_category": r.get("error_category"),
+                "routing_mismatch": r.get("routing_mismatch"),
+                "data_source": r.get("data_source"),
+            }
+            for r in rows
+        ],
+    }
+    # 可选磁盘日志
+    log_file = getattr(args, "log_file", None)
+    if log_file:
+        report["log_file_tail"] = read_log_file_tail(
+            log_file, lines=getattr(args, "log_lines", 50) or 50,
+            keyword=getattr(args, "log_keyword", None),
+        )
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+    else:
+        say(f"history: {len(rows)} 条"
+            f"{'（仅失败）' if fails else ''}"
+            f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}")
+        for i, r in enumerate(rows, 1):
+            st = r.get("status_code")
+            ok = st == 200 and not r.get("error_message")
+            flag = "OK" if ok else "FAIL"
+            say(f"[{i:02d}] {flag} {r.get('created_at_fmt')}  {r.get('provider_name')}")
+            say(f"     {r.get('request_model')} -> {r.get('model')}  "
+                f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms")
+            if r.get("routing_mismatch"):
+                say(f"     !! 路由不一致: {r.get('request_model')} => {r.get('model')}")
+            if r.get("error_message"):
+                say(f"     [{r.get('error_category')}] {str(r.get('error_message'))[:160]}")
+        if log_file and report.get("log_file_tail"):
+            say(f"\n--- log file tail: {log_file} ---")
+            for ln in report["log_file_tail"]:
+                say(ln)
+    return 0
+
+
+def run_stats(args, say) -> int:
+    try:
+        since_ts = _parse_since(getattr(args, "since", None))
+    except ValueError as e:
+        say(str(e))
+        return 2
+    stats = query_stats(args.db, since_ts=since_ts)
+    report = {
+        "schema_version": 1,
+        "command": "stats",
+        "since": getattr(args, "since", None),
+        "providers": stats,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+    else:
+        say(f"stats: {len(stats)} 个供应商"
+            f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}")
+        say(f"{'供应商':24} {'请求':>6} {'成功%':>7} {'失败':>5} {'主失败因':18} "
+            f"{'中位延迟':>8} {'路由≠%':>7}")
+        say("-" * 90)
+        for s in stats:
+            rate = f"{s['success_rate']*100:.0f}%"
+            med = f"{s['median_latency_ms']:.0f}ms" if s["median_latency_ms"] is not None else "-"
+            mm = f"{s['mismatch_rate']*100:.0f}%"
+            cat = s.get("top_fail_category") or "-"
+            say(f"{s['provider_name'][:24]:24} {s['total']:6d} {rate:>7} {s['fail']:5d} "
+                f"{cat[:18]:18} {med:>8} {mm:>7}")
+    return 0
+
+
+def run_routing(args, say) -> int:
+    try:
+        since_ts = _parse_since(getattr(args, "since", None))
+    except ValueError as e:
+        say(str(e))
+        return 2
+    limit = getattr(args, "limit", 20) or 20
+    pairs = query_routing(args.db, since_ts=since_ts, limit=limit)
+    report = {
+        "schema_version": 1,
+        "command": "routing",
+        "since": getattr(args, "since", None),
+        "pairs": pairs,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+    else:
+        say(f"routing: top {len(pairs)} 静默路由"
+            f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}")
+        for i, p in enumerate(pairs, 1):
+            say(f"[{i:02d}] {p['count']:5d}×  {p['request_model']}  =>  {p['actual_model']}")
+    return 0
+
+
+def format_history_sidebar(db_path: str, provider_name: str, since: str = "24h") -> str:
+    """给 check/inspect 附带的一行历史摘要。"""
+    try:
+        since_ts = _parse_since(since)
+    except ValueError:
+        since_ts = _parse_since("24h")
+    s = summarize_provider_history(db_path, provider_name, since_ts=since_ts)
+    if not s:
+        return f"  history({since}): 无记录"
+    rate = f"{s['success_rate']*100:.0f}%"
+    med = f"{s['median_latency_ms']:.0f}ms" if s["median_latency_ms"] is not None else "-"
+    mm = f"{s['mismatch_rate']*100:.0f}%"
+    cat = s.get("top_fail_category") or "-"
+    return (f"  history({since}): 请求{s['total']} 成功{rate} 失败{s['fail']}"
+            f" 主因={cat} 中位延迟={med} 路由≠{mm}")
+
+
 def _inject_default_command(argv: list[str]) -> list[str]:
     """无子命令时注入 check，兼容文档中的「可省略 check」用法。
 
@@ -2317,7 +2781,8 @@ def _inject_default_command(argv: list[str]) -> list[str]:
       prog --failover-only  →  prog check --failover-only
       prog                  →  prog check
     """
-    known = {"check", "list-models", "inspect", "-h", "--help"}
+    known = {"check", "list-models", "inspect", "history", "stats", "routing",
+             "-h", "--help"}
     if len(argv) <= 1:
         return argv + ["check"]
     head = argv[1]
@@ -2360,6 +2825,10 @@ def _build_parser():
                          help="只测故障转移队列里的供应商（含当前激活的）")
     p_check.add_argument("--json", action="store_true",
                          help="输出结构化 JSON 报告到 stdout（人类可读文本保留到 stderr）")
+    p_check.add_argument("--with-history", action="store_true",
+                         help="每个供应商探测结果后附加 cc-switch 近 24h 日志摘要")
+    p_check.add_argument("--history-since", default="24h",
+                         help="--with-history 时间窗口（默认 24h；如 7d / 30m）")
 
     # list-models：拉取供应商 /v1/models
     p_lm = sub.add_parser("list-models", parents=[common],
@@ -2398,10 +2867,38 @@ def _build_parser():
                            help="上下文窗口探测档位：512k（默认）或 1m；仅在元数据无声明时触发")
     p_inspect.add_argument("--human", action="store_true",
                            help="以人类可读格式输出到 stdout（默认 JSON）")
+    p_inspect.add_argument("--with-history", action="store_true",
+                           help="报告中附加该供应商近 24h 日志摘要")
+    p_inspect.add_argument("--history-since", default="24h",
+                           help="--with-history 时间窗口（默认 24h）")
+
+    # history / stats / routing：只读日志，不发 HTTP
+    p_hist = sub.add_parser("history", parents=[common],
+                            help="读取 cc-switch 代理请求日志（最近 N 条）")
+    p_hist.add_argument("--limit", type=int, default=20, help="条数（默认 20）")
+    p_hist.add_argument("--fails", action="store_true", help="只显示失败记录")
+    p_hist.add_argument("--since", default=None, help="时间窗口：24h / 7d / 30m / 秒数")
+    p_hist.add_argument("--provider", default=None, help="按供应商名子串过滤")
+    p_hist.add_argument("--json", action="store_true", help="JSON 输出")
+    p_hist.add_argument("--log-file", default=None,
+                        help="可选：额外打印磁盘日志尾部（如 ~/.cc-switch/logs/cc-switch.log）")
+    p_hist.add_argument("--log-lines", type=int, default=50, help="磁盘日志尾部行数（默认 50）")
+    p_hist.add_argument("--log-keyword", default=None, help="磁盘日志关键词过滤")
+
+    p_stats = sub.add_parser("stats", parents=[common],
+                             help="按供应商汇总成功率/延迟/路由不一致")
+    p_stats.add_argument("--since", default="7d", help="时间窗口（默认 7d）")
+    p_stats.add_argument("--json", action="store_true", help="JSON 输出")
+
+    p_route = sub.add_parser("routing", parents=[common],
+                             help="静默路由排行（request_model => actual model）")
+    p_route.add_argument("--since", default="7d", help="时间窗口（默认 7d）")
+    p_route.add_argument("--limit", type=int, default=20, help="显示条数（默认 20）")
+    p_route.add_argument("--json", action="store_true", help="JSON 输出")
 
     # 兜底默认（注入 check 后子解析器会覆盖这些）
     ap.set_defaults(command="check", type="claude", failover_only=False, json=False)
-    return ap, common, p_check, p_lm, p_inspect
+    return ap, common, p_check, p_lm, p_inspect, p_hist, p_stats, p_route
 
 
 def main():
@@ -2409,14 +2906,12 @@ def main():
     ap, *_ = _build_parser()
     args = ap.parse_args()
 
-    # 在 JSON 模式下，先把人类可读输出切换到 stderr，stdout 仅承载 JSON。
-    # 必须早于 --user-agent / TLS 等提示，避免提示污染 JSON stdout。
-    wants_json = getattr(args, "json", False) or args.command == "inspect"
-    if wants_json and not getattr(args, "human", False):
-        global _human_out
+    global _human_out
+    # JSON 输出时：人类可读走 stderr，stdout 仅承载 JSON
+    if getattr(args, "json", False) or (
+            args.command == "inspect" and not getattr(args, "human", False)):
         _human_out = sys.stderr
 
-    # --user-agent 覆盖：通过参数传入各 probe_*，不使用全局可变状态
     if getattr(args, "user_agent", None):
         say(f"User-Agent 已覆盖: {args.user_agent}")
 
@@ -2427,7 +2922,14 @@ def main():
         say(f"数据库不存在: {args.db}")
         return 2
 
-    # list-models 与 check 共享类型/范围逻辑
+    # 纯日志子命令：不加载 providers、不发 HTTP
+    if args.command == "history":
+        return run_history(args, say)
+    if args.command == "stats":
+        return run_stats(args, say)
+    if args.command == "routing":
+        return run_routing(args, say)
+
     types = ["claude", "codex", "openclaw"] if getattr(args, "type", "claude") == "all" else [getattr(args, "type", "claude")]
     providers = []
     for t in types:
@@ -2453,7 +2955,6 @@ def main():
     if args.command == "inspect":
         return run_inspect(args, providers, say)
 
-    # 兜底：不会到这里
     say(f"未知子命令: {args.command}")
     return 2
 

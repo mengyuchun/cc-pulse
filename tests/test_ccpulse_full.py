@@ -1328,6 +1328,86 @@ r = mod._probe_vision(p_codex, "m", 5, False)
 test("vision codex unsupported", r.get("status") == "unsupported", f"r={r}")
 
 
+print("\n[Unit] classify_log_error + parse_since + history helpers")
+test("parse_since 24h", mod._parse_since("24h") is not None)
+test("parse_since 7d", mod._parse_since("7d") is not None)
+test("classify 401 invalid api",
+     mod.classify_log_error(401, "Invalid API key.") == "authentication")
+test("classify 429", mod.classify_log_error(429, "rate limit") == "rate_limit")
+test("classify 余额",
+     mod.classify_log_error(403, "预扣费额度失败") == "authentication")
+test("classify channel",
+     mod.classify_log_error(503, "No available channel for model x") == "model_not_found")
+test("classify connect",
+     mod.classify_log_error(502, "client error (Connect)") == "network")
+test("classify prompt too long",
+     mod.classify_log_error(400, "maximum prompt length") == "protocol_incompatible")
+test("orphan name", mod.resolve_provider_name("abcd-uuid", {}) == "deleted:abcd-uui")
+
+
+print("\n[Unit] history/stats/routing on temp sqlite with proxy_request_logs")
+log_db = os.path.join(tmp, "logs.db")
+conn = sqlite3.connect(log_db)
+conn.execute("""CREATE TABLE providers (
+    id TEXT, name TEXT, app_type TEXT, settings_config TEXT,
+    is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER
+)""")
+conn.execute(
+    "INSERT INTO providers VALUES (?,?,?,?,?,?,?)",
+    ("pid-a", "Prov-A", "claude", "{}", 1, 1, 0))
+conn.execute(
+    "INSERT INTO providers VALUES (?,?,?,?,?,?,?)",
+    ("pid-b", "Prov-B", "claude", "{}", 0, 1, 1))
+conn.execute("""CREATE TABLE proxy_request_logs (
+    request_id TEXT, provider_id TEXT, app_type TEXT, model TEXT,
+    request_model TEXT, input_tokens INTEGER, output_tokens INTEGER,
+    cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
+    input_cost_usd TEXT, output_cost_usd TEXT, cache_read_cost_usd TEXT,
+    cache_creation_cost_usd TEXT, total_cost_usd TEXT,
+    latency_ms INTEGER, first_token_ms INTEGER, duration_ms INTEGER,
+    status_code INTEGER, error_message TEXT, session_id TEXT,
+    provider_type TEXT, is_streaming INTEGER, cost_multiplier TEXT,
+    created_at INTEGER, data_source TEXT, pricing_model TEXT,
+    input_token_semantics INTEGER
+)""")
+now = int(time.time())
+# ok routed
+conn.execute(
+    "INSERT INTO proxy_request_logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ("r1", "pid-a", "claude", "grok-4.5", "claude-opus-4-8",
+     10, 5, 0, 0, "0", "0", "0", "0", "0",
+     1000, 200, None, 200, None, "s", None, 1, "1", now - 60, "proxy", "grok", 2))
+# fail auth
+conn.execute(
+    "INSERT INTO proxy_request_logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ("r2", "pid-b", "claude", "claude-opus-4-8", "claude-opus-4-8",
+     0, 0, 0, 0, "0", "0", "0", "0", "0",
+     500, None, None, 401, "Invalid API key.", "s", None, 1, "1", now - 30, "proxy", "", 2))
+# orphan fail
+conn.execute(
+    "INSERT INTO proxy_request_logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ("r3", "dead-uuid-xxx", "claude", "m", "m",
+     0, 0, 0, 0, "0", "0", "0", "0", "0",
+     100, None, None, 429, "rate limit", "s", None, 0, "1", now - 10, "proxy", "", 2))
+conn.commit()
+conn.close()
+
+rows = mod.query_proxy_logs(log_db, limit=10, fails_only=True)
+test("history fails only", len(rows) == 2, f"n={len(rows)}")
+test("history classifies auth",
+     any(r["error_category"] == "authentication" for r in rows), f"{rows}")
+test("history orphan name",
+     any(str(r["provider_name"]).startswith("deleted:") for r in rows), f"{rows}")
+stats = mod.query_stats(log_db)
+test("stats has providers", len(stats) >= 2, f"{stats}")
+route = mod.query_routing(log_db, limit=5)
+test("routing has mismatch pair",
+     any(p["request_model"] == "claude-opus-4-8" and p["actual_model"] == "grok-4.5"
+         for p in route), f"{route}")
+side = mod.format_history_sidebar(log_db, "Prov-A", since="24h")
+test("history sidebar contains Prov", "请求" in side, f"{side}")
+
+
 # 清理
 import shutil
 shutil.rmtree(tmp, ignore_errors=True)

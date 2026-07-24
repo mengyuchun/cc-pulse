@@ -10,7 +10,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-208%20pass-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-223%20pass-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -202,6 +202,8 @@ python check_ccswitch_health.py check --failover-only --json  # 机器可读
 | `--probe-enable-thinking` | 允许 thinking 模式 | 关 |
 | `--user-agent UA` | 覆盖 UA（默认读本机 `claude --version`） | 自动 |
 | `--skip-tls-verify` | ⚠️ 跳过 TLS 证书验证 | 关 |
+| `--with-history` | 每个供应商后附加近 24h 日志摘要 | 关 |
+| `--history-since` | 历史摘要时间窗 | `24h` |
 
 ### `list-models` —— 拉取模型目录
 
@@ -209,6 +211,43 @@ python check_ccswitch_health.py check --failover-only --json  # 机器可读
 python check_ccswitch_health.py list-models
 python check_ccswitch_health.py list-models --failover-only --type all
 ```
+
+### `history` / `stats` / `routing` —— 只读 cc-switch 运行日志
+
+不发 HTTP，只读 `~/.cc-switch/cc-switch.db` 里的 `proxy_request_logs`（及可选磁盘日志）。
+
+```bash
+# 最近 20 条（含路由不一致标记）
+python check_ccswitch_health.py history
+
+# 只看失败
+python check_ccswitch_health.py history --fails --limit 50
+
+# 按供应商名过滤 + 时间窗
+python check_ccswitch_health.py history --provider Fengwind --since 24h
+
+# 按供应商汇总成功率 / 主失败因 / 中位延迟 / 路由不一致率
+python check_ccswitch_health.py stats --since 7d
+
+# 静默路由排行（request_model => actual model）
+python check_ccswitch_health.py routing --since 24h --limit 20
+
+# 可选：附加磁盘日志尾部（大文件只读末尾约 512KB）
+python check_ccswitch_health.py history --fails \
+  --log-file ~/.cc-switch/logs/cc-switch.log --log-lines 80
+```
+
+| 参数 | 说明 | 适用 |
+|------|------|------|
+| `--limit N` | 条数 | history / routing |
+| `--fails` | 只显示失败 | history |
+| `--since 24h\|7d\|30m\|秒` | 时间窗口 | history / stats / routing |
+| `--provider 子串` | 供应商名过滤 | history |
+| `--json` | JSON 输出 | 三个命令 |
+| `--log-file PATH` | 磁盘日志尾部 | history |
+| `--with-history` | check/inspect 后附 24h 摘要 | check / inspect |
+
+失败原因会映射到与探测相同的 `error_category`（如 `authentication` / `rate_limit` / `network` / `model_not_found`）。
 
 ### `inspect` —— 单模型深度诊断
 
@@ -426,7 +465,7 @@ just test
 just test-ps1
 ```
 
-测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **208 个测试全部通过**（177 + 31）。
+测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **192 个 Python 测试 + 31 个 PS1 测试**。
 
 ## 开发
 

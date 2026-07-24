@@ -24,6 +24,18 @@ models:
 models-all:
     {{PYTHON}} {{SCRIPT}} list-models
 
+# 最近失败日志
+history-fails:
+    {{PYTHON}} {{SCRIPT}} history --fails --limit 30
+
+# 7 天统计
+stats:
+    {{PYTHON}} {{SCRIPT}} stats --since 7d
+
+# 静默路由排行
+routing:
+    {{PYTHON}} {{SCRIPT}} routing --since 7d --limit 20
+
 # JSON 健康报告（管道到 jq）
 check-json:
     {{PYTHON}} {{SCRIPT}} check --failover-only --json
