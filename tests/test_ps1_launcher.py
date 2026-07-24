@@ -4,7 +4,8 @@
   1. 菜单渲染（6 项主菜单）
   2. 健康检测快速体检（选项 1）零子提示一键跑
   3. inspect（选项 4）精简 3 步交互
-  4. 高级设置（选项 5）
+  4. 运行日志（选项 5）
+  5. 高级设置（选项 6）
   5. 退出码正确透传
 
 用临时假 SQLite 库，连接到 127.0.0.1 mock server。
@@ -90,8 +91,8 @@ def run_pwsh(stdin_text, timeout=30):
 write_fake_db()
 
 
-print("\n[PS1] 主菜单 - 退出选项 6")
-rc, out, err = run_pwsh("6\n")
+print("\n[PS1] 主菜单 - 退出选项 7")
+rc, out, err = run_pwsh("7\n")
 test("退出码 == 0", rc == 0, f"rc={rc} stderr={err[:200]}")
 test("输出含主菜单标题", "CC-Pulse" in out or "CC-Pulse" in err)
 test("输出含 inspect 入口", "深度诊断" in (out + err) or "inspect" in (out + err))
@@ -101,7 +102,7 @@ test("输出含退出提示", "退出" in (out + err))
 
 print("\n[PS1] 健康检测 · 快速体检 - 选项 1（零子提示）")
 # 主菜单 1 -> 直接跑 -> 回车返回 -> 6 退出
-rc, out, err = run_pwsh("1\n\n6\n", timeout=120)
+rc, out, err = run_pwsh("1\n\n7\n", timeout=120)
 test("退出码 0 或 1", rc in (0, 1), f"rc={rc}")
 combined = out + err
 test("输出含 '健康检测'", "健康检测" in combined)
@@ -111,7 +112,7 @@ test("快速体检带 --failover-only", "--failover-only" in combined)
 
 
 print("\n[PS1] 拉模型列表 - 选项 3 -> 1 (默认 claude/队列)")
-rc, out, err = run_pwsh("3\n\n1\n\n6\n", timeout=120)
+rc, out, err = run_pwsh("3\n\n1\n\n7\n", timeout=120)
 test("退出码 0 或 1", rc in (0, 1), f"rc={rc}")
 combined = out + err
 test("输出含 '拉模型' 标识", "拉模型" in combined or "list-models" in combined)
@@ -127,7 +128,7 @@ stdin_text = (
     "1\n"                 # source: configured
     "claude-haiku-4-5\n"  # model
     "\n"                  # 返回主菜单
-    "6\n"                 # 退出
+    "7\n"                 # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=180)
 combined = out + err
@@ -145,10 +146,10 @@ test("输出含 inspect 结果",
      or "verdict" in combined.lower())
 
 
-print("\n[PS1] 高级设置 - 选项 5")
+print("\n[PS1] 高级设置 - 选项 6")
 # 菜单5 + JSON/max-tokens/thinking/UA/context/vision 共 6 项默认 + 返回主菜单 + 退出
 # 共 1+6+1+1 = 9 次输入
-rc, out, err = run_pwsh("5\n\n\n\n\n\n\n\n6\n", timeout=60)
+rc, out, err = run_pwsh("6\n\n\n\n\n\n\n\n7\n", timeout=60)
 combined = out + err
 test("退出码 0", rc == 0, f"rc={rc}")
 test("输出含 '高级设置'", "高级设置" in combined)
@@ -158,9 +159,9 @@ test("显示 vision 设置", "vision" in combined.lower())
 
 
 print("\n[PS1] 高级设置端到端：开启 JSON 后快速体检输出 JSON")
-# [5] 开启 JSON -> 其余默认回车 -> [1] 快速体检 -> [6] 退出
+# [6] 开启 JSON -> 其余默认回车 -> [1] 快速体检 -> [6] 退出
 stdin_text = (
-    "5\n"           # 主菜单: 高级设置
+    "6\n"           # 主菜单: 高级设置
     "y\n"           # JSON 输出: 开
     "\n"            # max-tokens: 默认
     "\n"            # thinking: 默认
@@ -170,7 +171,7 @@ stdin_text = (
     "\n"            # 回车返回主菜单
     "1\n"           # 主菜单: 快速体检
     "\n"            # 回车返回主菜单
-    "6\n"           # 退出
+    "7\n"           # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=120)
 combined = out + err
@@ -182,7 +183,7 @@ test("stdout 含 JSON 报告", '"schema_version"' in combined or '"providers"' i
 print("\n[PS1] 高级设置：上下文档位 1m + vision 后 inspect 带参")
 # 高级设置设 1m + vision，再跑 inspect（手动 provider），检查命令行含新参数
 stdin_text = (
-    "5\n"
+    "6\n"
     "\n"            # JSON 默认
     "\n"            # max-tokens
     "\n"            # thinking
@@ -197,7 +198,7 @@ stdin_text = (
     "1\n"           # source configured
     "claude-haiku-4-5\n"
     "\n"            # 返回主菜单
-    "6\n"
+    "7\n"
 )
 rc, out, err = run_pwsh(stdin_text, timeout=180)
 combined = out + err
@@ -208,15 +209,22 @@ test("inspect 命令含 vision include", "vision" in combined.lower(),
      f"tail={combined[-500:]}")
 
 
-print("\n[PS1] 退出选项 6（直接退出）")
-rc, out, err = run_pwsh("6\n")
+print("\n[PS1] 运行日志入口 - 选项 5")
+rc, out, err = run_pwsh("5\n6\n7\n", timeout=60)
+combined = out + err
+test("运行日志菜单可见", "运行日志" in combined or "history" in combined.lower() or "失败日志" in combined)
+test("运行日志菜单可返回", rc == 0, f"rc={rc}")
+
+
+print("\n[PS1] 退出选项 7（直接退出）")
+rc, out, err = run_pwsh("7\n")
 test("退出码 0", rc == 0, f"rc={rc}")
 
 
 print("\n[PS1] 错误输入 -> 提示重试 -> 退出")
-rc, out, err = run_pwsh("9\n\n6\n", timeout=30)
+rc, out, err = run_pwsh("9\n\n7\n", timeout=30)
 combined = out + err
-test("退出码 0（最终选 6 退出）", rc == 0, f"rc={rc}")
+test("退出码 0（最终选 7 退出）", rc == 0, f"rc={rc}")
 test("提示无效输入", "无效" in combined)
 
 

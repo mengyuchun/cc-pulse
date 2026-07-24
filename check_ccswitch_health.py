@@ -2757,6 +2757,68 @@ def run_routing(args, say) -> int:
     return 0
 
 
+def run_watch(args, say) -> int:
+    """轮询 proxy_request_logs，有新行就打印（Ctrl+C 退出）。"""
+    interval = max(1, int(getattr(args, "interval", 3) or 3))
+    fails_only = getattr(args, "fails", False)
+    prov = getattr(args, "provider", None) or None
+    # 起点：当前最新 created_at（避免启动时刷屏历史）
+    bootstrap = query_proxy_logs(args.db, limit=1, fails_only=False, provider_substr=prov)
+    last_ts = bootstrap[0]["created_at"] if bootstrap else int(time.time())
+    seen_ids: set[str] = set()
+    if bootstrap:
+        rid = bootstrap[0].get("request_id")
+        if rid:
+            seen_ids.add(str(rid))
+    say(f"watch: 每 {interval}s 轮询 proxy_request_logs"
+        f"{'（仅失败）' if fails_only else ''}"
+        f"{' provider~' + prov if prov else ''}")
+    say(f"从 created_at>{last_ts} 开始；Ctrl+C 结束\n")
+    try:
+        while True:
+            # 多取一些，按 id 去重
+            rows = query_proxy_logs(
+                args.db, since_ts=int(last_ts) if last_ts else None,
+                limit=50, fails_only=fails_only, provider_substr=prov,
+            )
+            # query 是 DESC；反转让旧的先打
+            new_rows = []
+            for r in reversed(rows):
+                rid = str(r.get("request_id") or "")
+                cts = r.get("created_at") or 0
+                if cts < last_ts:
+                    continue
+                if rid and rid in seen_ids:
+                    continue
+                # 同一秒内的新行：允许 cts==last_ts 但 id 未见过
+                if cts == last_ts and rid and rid in seen_ids:
+                    continue
+                new_rows.append(r)
+            for r in new_rows:
+                rid = str(r.get("request_id") or "")
+                if rid:
+                    seen_ids.add(rid)
+                st = r.get("status_code")
+                ok = st == 200 and not r.get("error_message")
+                flag = "OK" if ok else "FAIL"
+                say(f"[{flag}] {r.get('created_at_fmt')}  {r.get('provider_name')}")
+                say(f"  {r.get('request_model')} -> {r.get('model')}  "
+                    f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms")
+                if r.get("routing_mismatch"):
+                    say(f"  !! 路由: {r.get('request_model')} => {r.get('model')}")
+                if r.get("error_message"):
+                    say(f"  [{r.get('error_category')}] {str(r.get('error_message'))[:160]}")
+                if r.get("created_at") and r["created_at"] > last_ts:
+                    last_ts = r["created_at"]
+            # 防止 seen 无限涨
+            if len(seen_ids) > 5000:
+                seen_ids = set(list(seen_ids)[-2000:])
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        say("\nwatch 已停止")
+        return 0
+
+
 def format_history_sidebar(db_path: str, provider_name: str, since: str = "24h") -> str:
     """给 check/inspect 附带的一行历史摘要。"""
     try:
@@ -2781,7 +2843,7 @@ def _inject_default_command(argv: list[str]) -> list[str]:
       prog --failover-only  →  prog check --failover-only
       prog                  →  prog check
     """
-    known = {"check", "list-models", "inspect", "history", "stats", "routing",
+    known = {"check", "list-models", "inspect", "history", "stats", "routing", "watch",
              "-h", "--help"}
     if len(argv) <= 1:
         return argv + ["check"]
@@ -2896,9 +2958,15 @@ def _build_parser():
     p_route.add_argument("--limit", type=int, default=20, help="显示条数（默认 20）")
     p_route.add_argument("--json", action="store_true", help="JSON 输出")
 
+    p_watch = sub.add_parser("watch", parents=[common],
+                             help="实时轮询 proxy_request_logs，有新记录就打印（Ctrl+C 结束）")
+    p_watch.add_argument("--interval", type=int, default=3, help="轮询间隔秒（默认 3）")
+    p_watch.add_argument("--fails", action="store_true", help="只显示失败")
+    p_watch.add_argument("--provider", default=None, help="按供应商名子串过滤")
+
     # 兜底默认（注入 check 后子解析器会覆盖这些）
     ap.set_defaults(command="check", type="claude", failover_only=False, json=False)
-    return ap, common, p_check, p_lm, p_inspect, p_hist, p_stats, p_route
+    return ap, common, p_check, p_lm, p_inspect, p_hist, p_stats, p_route, p_watch
 
 
 def main():
@@ -2929,6 +2997,8 @@ def main():
         return run_stats(args, say)
     if args.command == "routing":
         return run_routing(args, say)
+    if args.command == "watch":
+        return run_watch(args, say)
 
     types = ["claude", "codex", "openclaw"] if getattr(args, "type", "claude") == "all" else [getattr(args, "type", "claude")]
     providers = []

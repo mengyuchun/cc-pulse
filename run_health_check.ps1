@@ -265,7 +265,59 @@ function Menu-Inspect {
     return $code
 }
 
-# ── [5] 高级设置（进程内有效） ───────────────────────────────────
+# ── [5] 运行日志（只读 cc-switch 历史） ──────────────────────────
+function Menu-Logs {
+    if (-not (Show-Banner "运行日志 · 只读 cc-switch proxy 日志")) {
+        Read-Host "按回车返回主菜单"; return 1
+    }
+    Write-Host "请选择:" -ForegroundColor Yellow
+    Write-Host "  [1] 最近失败日志        history --fails" -ForegroundColor White
+    Write-Host "  [2] 最近全部日志        history"
+    Write-Host "  [3] 供应商统计          stats --since 7d"
+    Write-Host "  [4] 静默路由排行        routing --since 7d"
+    Write-Host "  [5] 实时监控（轮询）    watch · 有新日志就打印"
+    Write-Host "  [6] 返回主菜单"
+    $c = Read-Host "输入 1-6 (默认1)"
+    switch ($c) {
+        "2" {
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $cmdArgs.Add("--limit"); $cmdArgs.Add("30")
+            Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "history"
+            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        }
+        "3" {
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("stats"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
+            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        }
+        "4" {
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("routing"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $cmdArgs.Add("--since"); $cmdArgs.Add("7d"); $cmdArgs.Add("--limit"); $cmdArgs.Add("20")
+            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        }
+        "5" {
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("watch"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $cmdArgs.Add("--interval"); $cmdArgs.Add("3")
+            Write-Host "实时监控中，Ctrl+C 结束…" -ForegroundColor Cyan
+            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        }
+        "6" { return 0 }
+        default {
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $cmdArgs.Add("--fails"); $cmdArgs.Add("--limit"); $cmdArgs.Add("30")
+            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        }
+    }
+    Read-Host "按回车返回主菜单"
+    return 0
+}
+
+# ── [6] 高级设置（进程内有效） ───────────────────────────────────
 function Menu-AdvancedSettings {
     Show-Banner "高级设置（本进程有效，重开需重设）" | Out-Null
     Write-Host "当前设置:" -ForegroundColor Gray
@@ -314,14 +366,15 @@ function Menu-AdvancedSettings {
 function Show-MainMenu {
     Show-Banner | Out-Null
     Write-Host "请选择操作:" -ForegroundColor Yellow
-    Write-Host "  [1] 健康检测 · 快速体检   一键（claude/队列/不JSON/不thinking）" -ForegroundColor White
+    Write-Host "  [1] 健康检测 · 快速体检   一键（claude/队列）" -ForegroundColor White
     Write-Host "  [2] 健康检测 · 自定义     选类型/范围"
     Write-Host "  [3] 拉模型列表            GET /v1/models 目录"
-    Write-Host "  [4] 深度诊断 (inspect)    单一 (provider, model) 诊断"
-    Write-Host "  [5] 高级设置              JSON/thinking/UA/max-tokens/context/vision"
-    Write-Host "  [6] 退出" -ForegroundColor White
+    Write-Host "  [4] 深度诊断 (inspect)    单一 (provider, model)"
+    Write-Host "  [5] 运行日志              失败/统计/路由/实时监控" -ForegroundColor White
+    Write-Host "  [6] 高级设置              JSON/thinking/UA/max-tokens/context/vision"
+    Write-Host "  [7] 退出" -ForegroundColor White
     Write-Host ""
-    return (Read-Host "输入 1-6 (默认1)")
+    return (Read-Host "输入 1-7 (默认1)")
 }
 
 while ($true) {
@@ -332,8 +385,9 @@ while ($true) {
         "2" { $null = Menu-HealthCheckCustom }
         "3" { $null = Menu-ListModels }
         "4" { $null = Menu-Inspect }
-        "5" { $null = Menu-AdvancedSettings }
-        "6" { exit 0 }
+        "5" { $null = Menu-Logs }
+        "6" { $null = Menu-AdvancedSettings }
+        "7" { exit 0 }
         default {
             Write-Host "无效输入: '$choice'" -ForegroundColor Red
             Read-Host "按回车重试"
