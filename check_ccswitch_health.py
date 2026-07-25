@@ -21,6 +21,7 @@ CC-Pulse — cc-switch 供应商健康检测脚本（独立运行，不改 cc-sw
 """
 
 import json
+import os
 import sqlite3
 import re
 import argparse
@@ -1081,6 +1082,73 @@ def say(*a, **k):
     cleaned = [_sanitize_for_terminal(str(x)) for x in a]
     with _say_lock:
         print(*cleaned, file=_human_out, **k)
+
+
+# ---------- 颜色 / emoji ----------
+# 说明：所有外部内容（供应商名 / error_message 等）必须先经 _sanitize_for_terminal
+# 清洗，再由本模块拼上受控 ANSI 颜色码后通过 _say_colored 输出。
+# 这样既能高亮，又不给恶意供应商注入终端序列的机会。
+
+_ANSI = {
+    "reset": "\x1b[0m",
+    "bold": "\x1b[1m",
+    "dim": "\x1b[2m",
+    "red": "\x1b[31m",
+    "green": "\x1b[32m",
+    "yellow": "\x1b[33m",
+    "blue": "\x1b[34m",
+    "magenta": "\x1b[35m",
+    "cyan": "\x1b[36m",
+    "gray": "\x1b[90m",
+}
+
+
+def _use_color() -> bool:
+    """是否启用颜色。默认对 TTY 启用；NO_COLOR / --no-color / 非 TTY 时关闭。"""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("CCPULSE_NO_COLOR"):
+        return False
+    try:
+        return bool(_human_out.isatty())
+    except Exception:
+        return False
+
+
+def _c(text: str, *styles) -> str:
+    """给文本包一层 ANSI 样式；非 TTY 或禁用时返回原文。"""
+    if not _use_color():
+        return text
+    prefix = "".join(_ANSI[s] for s in styles if s in _ANSI)
+    return f"{prefix}{text}{_ANSI['reset']}"
+
+
+def _say_colored(text: str, **k) -> None:
+    """打印一行带颜色的文本：外部字段应事先 sanitize，颜色码由本模块拼上。"""
+    k.setdefault("flush", True)
+    with _say_lock:
+        print(text, file=_human_out, **k)
+
+
+def _status_badge(ok: bool, http_status: int | None, error_category: str | None) -> str:
+    """把 (ok / http_status / error_category) 映射成一个短状态徽标。"""
+    if ok:
+        return _c("✅ OK   ", "green", "bold")
+    cat = (error_category or "").lower()
+    st = http_status or 0
+    if cat in ("authentication",) or st in (401, 403):
+        return _c("🔒 AUTH ", "red", "bold")
+    if cat in ("rate_limit",) or st == 429:
+        return _c("⏳ RATE ", "yellow", "bold")
+    if cat in ("network",) or st in (502, 504, 522, 524):
+        return _c("📡 NET  ", "magenta", "bold")
+    if cat in ("model_not_found",) or st == 404:
+        return _c("❓ MODEL", "yellow", "bold")
+    if cat in ("protocol_incompatible",) or st == 400 or st == 413 or st == 422:
+        return _c("⚠  BAD ", "yellow", "bold")
+    if cat in ("server_error",) or (st and st >= 500):
+        return _c("💥 5XX ", "red", "bold")
+    return _c("❌ FAIL ", "red", "bold")
 
 
 def probe_tier(p: Provider, tier: ModelTier, timeout: int, skip_tls_verify: bool,
@@ -2687,14 +2755,21 @@ def run_history(args, say) -> int:
         for i, r in enumerate(rows, 1):
             st = r.get("status_code")
             ok = st == 200 and not r.get("error_message")
-            flag = "OK" if ok else "FAIL"
-            say(f"[{i:02d}] {flag} {r.get('created_at_fmt')}  {r.get('provider_name')}")
-            say(f"     {r.get('request_model')} -> {r.get('model')}  "
-                f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms")
+            badge = _status_badge(ok, st, r.get("error_category"))
+            pname = _sanitize_for_terminal(str(r.get("provider_name") or "?"))
+            ts = r.get("created_at_fmt") or "?"
+            _say_colored(f"[{i:02d}] {badge} {_c(ts, 'dim')}  {pname}")
+            req_m = _sanitize_for_terminal(str(r.get("request_model") or "?"))
+            act_m = _sanitize_for_terminal(str(r.get("model") or "?"))
+            model_line = f"     {req_m} -> {act_m}"
             if r.get("routing_mismatch"):
-                say(f"     !! 路由不一致: {r.get('request_model')} => {r.get('model')}")
+                model_line += _c("  ⚡路由不一致", "yellow")
+            _say_colored(f"{model_line}  "
+                         f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms")
             if r.get("error_message"):
-                say(f"     [{r.get('error_category')}] {str(r.get('error_message'))[:160]}")
+                cat = _sanitize_for_terminal(str(r.get("error_category") or ""))
+                msg = _sanitize_for_terminal(str(r.get("error_message") or ""))[:160]
+                _say_colored(f"     {_c('[' + cat + ']', 'red')} {msg}")
         if log_file and report.get("log_file_tail"):
             say(f"\n--- log file tail: {log_file} ---")
             for ln in report["log_file_tail"]:
@@ -2720,16 +2795,29 @@ def run_stats(args, say) -> int:
     else:
         say(f"stats: {len(stats)} 个供应商"
             f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}")
-        say(f"{'供应商':24} {'请求':>6} {'成功%':>7} {'失败':>5} {'主失败因':18} "
-            f"{'中位延迟':>8} {'路由≠%':>7}")
+        hdr = (f"{'供应商':24} {'请求':>6} {'成功%':>7} {'失败':>5} {'主失败因':18} "
+               f"{'中位延迟':>8} {'路由≠%':>7}")
+        _say_colored(_c(hdr, "bold"))
         say("-" * 90)
         for s in stats:
-            rate = f"{s['success_rate']*100:.0f}%"
+            sr = s["success_rate"]
+            rate_s = f"{sr*100:.0f}%"
+            if sr >= 0.95:
+                rate_c = _c(rate_s, "green")
+            elif sr >= 0.7:
+                rate_c = _c(rate_s, "yellow")
+            else:
+                rate_c = _c(rate_s, "red", "bold")
             med = f"{s['median_latency_ms']:.0f}ms" if s["median_latency_ms"] is not None else "-"
-            mm = f"{s['mismatch_rate']*100:.0f}%"
+            mm_r = s["mismatch_rate"]
+            mm_s = f"{mm_r*100:.0f}%"
+            mm_c = _c(mm_s, "yellow") if mm_r > 0.1 else mm_s
             cat = s.get("top_fail_category") or "-"
-            say(f"{s['provider_name'][:24]:24} {s['total']:6d} {rate:>7} {s['fail']:5d} "
-                f"{cat[:18]:18} {med:>8} {mm:>7}")
+            cat_c = _c(cat[:18], "red") if cat != "-" else cat[:18]
+            fail_c = _c(str(s["fail"]), "red") if s["fail"] > 0 else str(s["fail"])
+            pname = _sanitize_for_terminal(s["provider_name"][:24])
+            _say_colored(f"{pname:24} {s['total']:6d} {rate_c:>7} {fail_c:>5} "
+                         f"{cat_c:18} {med:>8} {mm_c:>7}")
     return 0
 
 
@@ -2800,14 +2888,21 @@ def run_watch(args, say) -> int:
                     seen_ids.add(rid)
                 st = r.get("status_code")
                 ok = st == 200 and not r.get("error_message")
-                flag = "OK" if ok else "FAIL"
-                say(f"[{flag}] {r.get('created_at_fmt')}  {r.get('provider_name')}")
-                say(f"  {r.get('request_model')} -> {r.get('model')}  "
-                    f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms")
+                badge = _status_badge(ok, st, r.get("error_category"))
+                pname = _sanitize_for_terminal(str(r.get("provider_name") or "?"))
+                ts = r.get("created_at_fmt") or "?"
+                _say_colored(f"{badge} {_c(ts, 'dim')}  {pname}")
+                req_m = _sanitize_for_terminal(str(r.get("request_model") or "?"))
+                act_m = _sanitize_for_terminal(str(r.get("model") or "?"))
+                model_line = f"  {req_m} -> {act_m}"
                 if r.get("routing_mismatch"):
-                    say(f"  !! 路由: {r.get('request_model')} => {r.get('model')}")
+                    model_line += _c("  ⚡路由", "yellow")
+                _say_colored(f"{model_line}  "
+                             f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms")
                 if r.get("error_message"):
-                    say(f"  [{r.get('error_category')}] {str(r.get('error_message'))[:160]}")
+                    cat = _sanitize_for_terminal(str(r.get("error_category") or ""))
+                    msg = _sanitize_for_terminal(str(r.get("error_message") or ""))[:160]
+                    _say_colored(f"  {_c('[' + cat + ']', 'red')} {msg}")
                 if r.get("created_at") and r["created_at"] > last_ts:
                     last_ts = r["created_at"]
             # 防止 seen 无限涨
