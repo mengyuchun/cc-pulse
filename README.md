@@ -10,7 +10,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-223%20pass-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-225%20pass-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -212,9 +212,9 @@ python check_ccswitch_health.py list-models
 python check_ccswitch_health.py list-models --failover-only --type all
 ```
 
-### `history` / `stats` / `routing` —— 只读 cc-switch 运行日志
+### `history` / `stats` / `routing` / `watch` —— 只读 cc-switch 运行日志
 
-不发 HTTP，只读 `~/.cc-switch/cc-switch.db` 里的 `proxy_request_logs`（及可选磁盘日志）。
+不发 HTTP，只读 `~/.cc-switch/cc-switch.db` 里的 `proxy_request_logs`（及可选磁盘日志）。失败条目用 emoji + 颜色高亮（🔒AUTH / ⏳RATE / 📡NET / ❓MODEL / ⚠BAD / 💥5XX / ❌FAIL）。
 
 ```bash
 # 最近 20 条（含路由不一致标记）
@@ -232,6 +232,10 @@ python check_ccswitch_health.py stats --since 7d
 # 静默路由排行（request_model => actual model）
 python check_ccswitch_health.py routing --since 24h --limit 20
 
+# 实时监控（每 3 秒轮询，有新日志就打印，Ctrl+C 结束）
+python check_ccswitch_health.py watch
+python check_ccswitch_health.py watch --fails --provider Fengwind --interval 5
+
 # 可选：附加磁盘日志尾部（大文件只读末尾约 512KB）
 python check_ccswitch_health.py history --fails \
   --log-file ~/.cc-switch/logs/cc-switch.log --log-lines 80
@@ -246,6 +250,7 @@ python check_ccswitch_health.py history --fails \
 | `--json` | JSON 输出 | 三个命令 |
 | `--log-file PATH` | 磁盘日志尾部 | history |
 | `--with-history` | check/inspect 后附 24h 摘要 | check / inspect |
+| `--interval N` | 轮询间隔秒（默认 3） | watch |
 
 失败原因会映射到与探测相同的 `error_category`（如 `authentication` / `rate_limit` / `network` / `model_not_found`）。
 
@@ -458,14 +463,14 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 # 运行全部测试（Python 主逻辑 + PS1 启动器）
 just test && just test-ps1
 
-# 仅 Python 主逻辑（177 个单元 + 端到端 mock）
+# 仅 Python 主逻辑（192 个单元 + 端到端 mock）
 just test
 
-# PS1 启动器端到端（31 个，需要 pwsh）
+# PS1 启动器端到端（33 个，需要 pwsh）
 just test-ps1
 ```
 
-测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **192 个 Python 测试 + 31 个 PS1 测试**。
+测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **192 个 Python 测试 + 33 个 PS1 测试**。
 
 ## 开发
 
@@ -483,7 +488,7 @@ just lint
 
 ```
 CC-Pulse/
-├── check_ccswitch_health.py   # 主脚本：check / list-models / inspect 三子命令（~2200 行）
+├── check_ccswitch_health.py   # 主脚本：7 个子命令（~2800 行）
 ├── run_health_check.ps1       # Windows 桌面交互菜单启动器
 ├── justfile                    # 常用任务（检查、格式化、lint、测试）
 ├── requirements.txt           # 声明：纯标准库，无运行时依赖

@@ -10,7 +10,7 @@ Don't trust "it connected". Trust "it works". With so many providers, see at a g
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-223%20pass-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/tests-225%20pass-brightgreen.svg)](#tests)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -210,9 +210,9 @@ python check_ccswitch_health.py list-models
 python check_ccswitch_health.py list-models --failover-only --type all
 ```
 
-### `history` / `stats` / `routing` — read-only cc-switch runtime logs
+### `history` / `stats` / `routing` / `watch` — read-only cc-switch runtime logs
 
-No HTTP: only reads `proxy_request_logs` in `~/.cc-switch/cc-switch.db` (optional on-disk log tail).
+No HTTP: only reads `proxy_request_logs` in `~/.cc-switch/cc-switch.db` (optional on-disk log tail). Failures are highlighted with emoji + color badges (🔒AUTH / ⏳RATE / 📡NET / ❓MODEL / ⚠BAD / 💥5XX / ❌FAIL).
 
 ```bash
 python check_ccswitch_health.py history
@@ -220,6 +220,8 @@ python check_ccswitch_health.py history --fails --limit 50
 python check_ccswitch_health.py history --provider Fengwind --since 24h
 python check_ccswitch_health.py stats --since 7d
 python check_ccswitch_health.py routing --since 24h --limit 20
+python check_ccswitch_health.py watch
+python check_ccswitch_health.py watch --fails --provider Fengwind --interval 5
 python check_ccswitch_health.py history --fails \
   --log-file ~/.cc-switch/logs/cc-switch.log --log-lines 80
 ```
@@ -233,6 +235,7 @@ python check_ccswitch_health.py history --fails \
 | `--json` | JSON output | all three |
 | `--log-file PATH` | Tail on-disk log | history |
 | `--with-history` | Attach 24h summary after check/inspect | check / inspect |
+| `--interval N` | Poll interval seconds (default 3) | watch |
 
 Failures map into the same `error_category` enum used by live probes.
 
@@ -445,14 +448,14 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 # Run all tests (Python core + PS1 launcher)
 just test && just test-ps1
 
-# Python core only (177 unit + end-to-end mocks)
+# Python core only (192 unit + end-to-end mocks)
 just test
 
-# PS1 launcher end-to-end (31 cases; requires pwsh)
+# PS1 launcher end-to-end (33 cases; requires pwsh)
 just test-ps1
 ```
 
-Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **192 Python tests + 31 PS1 tests**.
+Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **192 Python tests + 33 PS1 tests**.
 
 ## Development
 
@@ -470,7 +473,7 @@ Uses [ruff](https://github.com/astral-sh/ruff) for formatting and linting (dev-t
 
 ```
 CC-Pulse/
-├── check_ccswitch_health.py   # Main script: check / list-models / inspect (~2200 lines)
+├── check_ccswitch_health.py   # Main script: 7 subcommands (~2800 lines)
 ├── run_health_check.ps1       # Windows interactive menu launcher
 ├── justfile                   # Common tasks (check, format, lint, test)
 ├── requirements.txt           # Declares: stdlib only, no runtime deps

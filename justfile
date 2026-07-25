@@ -36,6 +36,10 @@ stats:
 routing:
     {{PYTHON}} {{SCRIPT}} routing --since 7d --limit 20
 
+# 实时监控 cc-switch 日志（Ctrl+C 结束）
+watch:
+    {{PYTHON}} {{SCRIPT}} watch --interval 3
+
 # JSON 健康报告（管道到 jq）
 check-json:
     {{PYTHON}} {{SCRIPT}} check --failover-only --json
