@@ -10,7 +10,7 @@ Don't trust "it connected". Trust "it works". With so many providers, see at a g
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-225%20pass-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/tests-280%20pass-brightgreen.svg)](#tests)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -90,10 +90,11 @@ In one line: **cc-switch answers "can it connect?"; CC-Pulse answers "can I use 
 ### 1. Health check `check` — multi-tier fallback + real answer verification
 
 - Probes in order `haiku → sonnet → opus → fable → default`, **stops at the first tier that answers correctly**
-- Sends `"2+3=?"` and requires the answer to be exactly `"5"` — **HTTP 200 ≠ usable**
+- Randomly picks a question from a pool (arithmetic, mixed EN/中文) and validates the answer leniently — **HTTP 200 ≠ usable**. The rotating pool + natural `max_tokens` (1024) makes probes look less like a fixed liveness-check script
 - Auth follows cc-switch config: `ANTHROPIC_AUTH_TOKEN` → `Bearer`, `ANTHROPIC_API_KEY` → `x-api-key`
 - **Live progress**: one line as soon as each tier finishes — no waiting until everything ends
 - Concurrent batching + full error text passthrough
+- **Stealth mode `--stealth`**: caps concurrency + adds random jitter between probes to soften the script-like traffic spike (slower, use when a provider is banning you for liveness-checking)
 - Structured JSON reports for jq / PowerShell / CI
 
 ### 2. Model catalog `list-models` — fetch provider-declared model lists
@@ -198,9 +199,11 @@ Progress: print each tier as it finishes; print a provider summary when that pro
 | `--json` | Structured JSON on stdout; human text on stderr | off |
 | `--workers N` | Concurrency | 6 |
 | `--timeout SEC` | Per-request timeout seconds | 30 |
-| `--probe-max-tokens N` | Probe token budget (raise for thinking models) | 20 |
+| `--probe-max-tokens N` | Probe token budget | 1024 |
 | `--probe-enable-thinking` | Allow thinking mode | off |
 | `--user-agent UA` | Override UA (default from local `claude --version`) | auto |
+| `--stainless-version V` | Override `x-stainless-package-version` header | auto |
+| `--stealth` | Stealth mode: cap concurrency (≤3) + per-request random delay, harder to flag as a liveness probe | off |
 | `--skip-tls-verify` | ⚠️ Skip TLS certificate verification | off |
 
 ### `list-models` — fetch model catalogs
@@ -238,6 +241,37 @@ python check_ccswitch_health.py history --fails \
 | `--interval N` | Poll interval seconds (default 3) | watch |
 
 Failures map into the same `error_category` enum used by live probes.
+
+### `analyze` — multi-dimension aggregation analytics
+
+No HTTP: reads `proxy_request_logs` for cross-dimensional aggregation. Includes ASCII sparkline trend charts.
+
+```bash
+# Full report (by day + by model + provider×day matrix)
+python check_ccswitch_health.py analyze --since 7d
+
+# Daily health trend only
+python check_ccswitch_health.py analyze --mode day --since 30d
+
+# Model latency percentiles (p50/p95/p99)
+python check_ccswitch_health.py analyze --mode model --since 7d
+
+# Provider × day success rate matrix
+python check_ccswitch_health.py analyze --mode provider-day --since 14d
+
+# Deep report for a single provider (day × model cross)
+python check_ccswitch_health.py analyze --provider Fengwind --since 30d
+
+# JSON output
+python check_ccswitch_health.py analyze --since 7d --json
+```
+
+| Flag | Meaning | Commands |
+|------|---------|----------|
+| `--mode all\|day\|model\|provider-day\|provider` | Analysis dimension | analyze |
+| `--provider substr` | Deep analysis for matched provider | analyze |
+| `--since` | Time window | analyze |
+| `--json` | JSON output | analyze |
 
 ### `inspect` — single-model deep diagnostics
 
@@ -416,7 +450,9 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 - **No path de-duplication**: always `base_url + /v1/messages`; a base ending with `/v1` becomes `/v1/v1/messages` — deliberately matching real Claude Code behavior
 - **Full error text passthrough**: JSON error `message` is not truncated; HTML / non-JSON shows the first 500 chars plus true length
 - **No file writes**: results go to the terminal / stdout only
-- **Claude Code fingerprint headers**: UA from local `claude --version` (overridable via `--user-agent`) to reduce Cloudflare 1010 false rejects
+- **Claude Code fingerprint headers**: UA from local `claude --version` (overridable via `--user-agent`; `x-stainless-*` version overridable via `--stainless-version`) to reduce Cloudflare 1010 false rejects
+- **Anti-detection by default**: the probe question is drawn at random from a pool (avoids fixed-prompt substring matching), `max_tokens` defaults to a natural `1024` (not the tell-tale `20`), and thinking-suppression fields are sent only to thinking-prone models (deepseek/glm etc.) — regular claude requests stay closer to real claude-cli
+- **`--stealth` timing camouflage**: caps concurrency at 3 and adds a random 0.3–1.5s delay before each probe to flatten script-like traffic spikes — off by default (slower); turn it on when a provider starts banning health-check traffic
 - **TLS verified by default**: `--skip-tls-verify` must be explicit (exposes credentials if abused)
 - **Terminal safety**: `say()` strips ANSI escapes and control characters to reduce malicious provider response injection
 
@@ -427,14 +463,15 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 - Claude Code fingerprint headers are not 100% complete; some strict validators may still reject the client
 - Models from `list-models` ≠ actually usable; they are only declared support lists
 - `inspect` never auto-runs cc-switch failover; it only emits **read-only diagnostics**
-- Thinking models may false-fail under default `max_tokens=20` — raise `--probe-max-tokens` or use `--probe-enable-thinking` to reduce false negatives
+- Anti-detection lowers but cannot eliminate the odds of being flagged: any "verify a correct answer" probe needs a checkable prompt, which is inherently a low-frequency, fixed-shape pattern in real traffic — a structural trade-off, not a bug
 
 ## Known scenarios and responses
 
 | Scenario | Symptom | Response |
 |----------|---------|----------|
-| Thinking model burns tokens | 200 with empty answer | `--probe-max-tokens 256` |
-| Provider validates client UA | 403 `client_restricted` | `--user-agent "codex_cli_rs/0.50.0"` etc. |
+| Thinking model burns tokens | 200 with empty answer | auto-suppressed for known thinking models; or raise `--probe-max-tokens` / use `--probe-enable-thinking` |
+| Provider bans probe scripts | Blocked / disabled after a scan | `--stealth` (concurrency ≤3 + random jitter); the question pool + natural `max_tokens` are always on |
+| Provider validates client UA | 403 `client_restricted` | `--user-agent "codex_cli_rs/0.50.0"` etc., or `--stainless-version` |
 | Provider only accepts x-api-key | 401 `Missing API key` | Use `ANTHROPIC_API_KEY` in cc-switch |
 | Silent model routing | Request / response model mismatch | `inspect` `model_consistency` marks `mismatch` |
 | OAuth token in wrong field | 401 `invalid x-api-key` | Use `ANTHROPIC_AUTH_TOKEN` (Bearer), not `ANTHROPIC_API_KEY` |
@@ -448,14 +485,14 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 # Run all tests (Python core + PS1 launcher)
 just test && just test-ps1
 
-# Python core only (192 unit + end-to-end mocks)
+# Python core only (247 unit + end-to-end mocks)
 just test
 
 # PS1 launcher end-to-end (33 cases; requires pwsh)
 just test-ps1
 ```
 
-Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **192 Python tests + 33 PS1 tests**.
+Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **247 Python tests + 33 PS1 tests**.
 
 ## Development
 
@@ -473,7 +510,7 @@ Uses [ruff](https://github.com/astral-sh/ruff) for formatting and linting (dev-t
 
 ```
 CC-Pulse/
-├── check_ccswitch_health.py   # Main script: 7 subcommands (~2800 lines)
+├── check_ccswitch_health.py   # Main script: 8 subcommands (~3600 lines)
 ├── run_health_check.ps1       # Windows interactive menu launcher
 ├── justfile                   # Common tasks (check, format, lint, test)
 ├── requirements.txt           # Declares: stdlib only, no runtime deps

@@ -10,7 +10,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-225%20pass-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-280%20pass-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -90,8 +90,10 @@ cc-switch 的基础检测若只覆盖连通性维度，可能只看到前半段�
 ### 1. 健康检测 `check` —— 多档回退 + 校验真实回答
 
 - 按 `haiku → sonnet → opus → fable → default` 顺序探测，**首个正确回答的档位即停**
-- 发 `"2+3=?"` 校验答案必须严格等于 `"5"`，**连通(200) ≠ 可用**
+- 从**问题池随机抽题**（算术为主，中英混合），答案宽松匹配（提取唯一数字），**连通(200) ≠ 可用**
 - 认证按 cc-switch 配置走：`ANTHROPIC_AUTH_TOKEN` → `Bearer`，`ANTHROPIC_API_KEY` → `x-api-key`
+- **弱指纹**：请求体贴近真实 claude-cli（`max_tokens=1024`、仅对 DeepSeek/GLM 等 thinking 模型发抑制字段），降低被中转站识别成「测活脚本」的概率
+- **`--stealth` 隐身模式**：降并发 + 请求间随机延迟，弱化脚本式流量尖峰（较慢，怀疑被封时用）
 - **实时进度**：每个档位完成立即显示一行，不必等全部结束（解决「全跑完才显示」的体验问题）
 - 批量并发 + 完整错误信息透传
 - 结构化 JSON 报告，可被 jq / PowerShell / CI 直接消费
@@ -198,8 +200,10 @@ python check_ccswitch_health.py check --failover-only --json  # 机器可读
 | `--json` | stdout 输出结构化 JSON，stderr 保留人类文本 | 关 |
 | `--workers N` | 并发数 | 6 |
 | `--timeout SEC` | 单请求超时秒 | 30 |
-| `--probe-max-tokens N` | 探测 token 预算（thinking 模型可调高） | 20 |
+| `--probe-max-tokens N` | 探测 token 预算（上限非实际消耗） | 1024 |
 | `--probe-enable-thinking` | 允许 thinking 模式 | 关 |
+| `--stealth` | 隐身模式：并发≤3 + 请求间随机延迟，弱化流量尖峰（较慢） | 关 |
+| `--stainless-version V` | 覆盖 `x-stainless-package-version` 指纹头 | 内置默认 |
 | `--user-agent UA` | 覆盖 UA（默认读本机 `claude --version`） | 自动 |
 | `--skip-tls-verify` | ⚠️ 跳过 TLS 证书验证 | 关 |
 | `--with-history` | 每个供应商后附加近 24h 日志摘要 | 关 |
@@ -241,13 +245,38 @@ python check_ccswitch_health.py history --fails \
   --log-file ~/.cc-switch/logs/cc-switch.log --log-lines 80
 ```
 
+### `analyze` —— 多维度聚合分析
+
+不发 HTTP，读 `proxy_request_logs` 做多维交叉聚合。自带 ASCII sparkline 趋势图。
+
+```bash
+# 全维度报表（按天 + 按模型 + 供应商×日期 交叉矩阵）
+python check_ccswitch_health.py analyze --since 7d
+
+# 只看按天健康趋势
+python check_ccswitch_health.py analyze --mode day --since 30d
+
+# 只看模型延迟分位数（p50/p95/p99）
+python check_ccswitch_health.py analyze --mode model --since 7d
+
+# 供应商×日期 成功率矩阵
+python check_ccswitch_health.py analyze --mode provider-day --since 14d
+
+# 单供应商深度报表（day × model 交叉）
+python check_ccswitch_health.py analyze --provider Fengwind --since 30d
+
+# JSON 输出
+python check_ccswitch_health.py analyze --since 7d --json
+```
+
 | 参数 | 说明 | 适用 |
 |------|------|------|
 | `--limit N` | 条数 | history / routing |
 | `--fails` | 只显示失败 | history |
-| `--since 24h\|7d\|30m\|秒` | 时间窗口 | history / stats / routing |
-| `--provider 子串` | 供应商名过滤 | history |
-| `--json` | JSON 输出 | 三个命令 |
+| `--since 24h\|7d\|30m\|秒` | 时间窗口 | history / stats / routing / analyze |
+| `--provider 子串` | 供应商名过滤 | history / analyze（深度模式） |
+| `--mode all\|day\|model\|provider-day\|provider` | 分析维度 | analyze |
+| `--json` | JSON 输出 | history / stats / routing / analyze |
 | `--log-file PATH` | 磁盘日志尾部 | history |
 | `--with-history` | check/inspect 后附 24h 摘要 | check / inspect |
 | `--interval N` | 轮询间隔秒（默认 3） | watch |
@@ -431,9 +460,11 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 - **路径不去重**：一律 `base_url + /v1/messages`，`xxx/v1` 会拼成 `/v1/v1/messages`——故意对齐真实 Claude Code 行为
 - **错误原文透传**：JSON 错误的 `message` 完整不截断；HTML/非 JSON 显示前 500 字符并标注真实长度
 - **不写文件**：结果只打印到终端 / stdout，不落盘
-- **Claude Code 指纹头**：附本机 `claude --version` 探测的 UA（可用 `--user-agent` 覆盖），降低 Cloudflare 1010 误判
+- **Claude Code 指纹头**：附本机 `claude --version` 探测的 UA（可用 `--user-agent` 覆盖），降低 Cloudflare 1010 误判；`x-stainless-*` 版本可用 `--stainless-version` 覆盖（无法从 `claude --version` 推导 SDK 版本）
 - **默认验证 TLS**：`--skip-tls-verify` 需显式开启（会暴露认证凭据）
 - **终端安全**：`say()` 输出自动剥离 ANSI 转义和控制字符，防止恶意供应商响应注入终端指令
+- **弱化测活指纹**（默认常开）：问题池随机抽题（避免固定 prompt 被子串匹配）、`max_tokens` 用自然值 1024、仅对 thinking-prone 模型（deepseek/glm 等）发思考抑制字段。这些是「更像真实客户端且不降速」的改进
+- **`--stealth` 时序伪装**（可选）：并发收敛到 ≤3 + 每请求随机延迟 0.3~1.5s，弱化脚本式流量尖峰。代价是全量体检慢 2~3 倍，仅在怀疑被识别时开
 
 ## 诚实的局限
 
@@ -442,13 +473,15 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 - Claude Code 指纹头并非 100% 完整，个别强校验站仍可能误判为非法客户端
 - `list-models` 列出的模型 ≠ 实际可用，只是供应商声称支持的清单
 - `inspect` 不会自动执行 cc-switch 故障转移，只输出**只读诊断**
-- thinking 模型在默认 `max_tokens=20` 下可能误判为不可用——提高 `--probe-max-tokens` 或开 `--probe-enable-thinking` 可减少误报
+- thinking 模型即便默认 `max_tokens=1024`，仍可能耗光预算无最终答案——脚本已对 deepseek/glm 等 thinking-prone 模型自动发思考抑制字段；仍误判时可开 `--probe-enable-thinking`
+- 弱化测活指纹只能**降低**被识别概率，不能消除：验证「能否正确回答」本质上需要答案可判定的 prompt，这类流量在真实用户中占比低、模式相对固定
 
 ## 已知场景与应对
 
 | 场景 | 现象 | 应对 |
 |------|------|------|
-| thinking 模型耗光 token | 200 但答案空 | `--probe-max-tokens 256` |
+| thinking 模型耗光 token | 200 但答案空 | 默认已对 deepseek/glm 自动抑制思考；仍空可 `--probe-enable-thinking` |
+| 站点识别测活脚本后封禁 | 突然大面积 401/403 | `--stealth`（降并发 + 随机延迟）；问题池/自然 max_tokens 已默认常开 |
 | 站点校验客户端 UA | 403 `client_restricted` | `--user-agent "codex_cli_rs/0.50.0"` 等 |
 | 站点只认 x-api-key | 401 `Missing API key` | cc-switch 改用 `ANTHROPIC_API_KEY` 字段 |
 | 模型被静默路由 | 请求与响应模型不一致 | inspect 的 `model_consistency` 会标 `mismatch` |
@@ -470,7 +503,7 @@ just test
 just test-ps1
 ```
 
-测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **192 个 Python 测试 + 33 个 PS1 测试**。
+测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **247 个 Python 测试 + 33 个 PS1 测试**。
 
 ## 开发
 
@@ -488,7 +521,7 @@ just lint
 
 ```
 CC-Pulse/
-├── check_ccswitch_health.py   # 主脚本：7 个子命令（~2800 行）
+├── check_ccswitch_health.py   # 主脚本：8 个子命令（~3600 行）
 ├── run_health_check.ps1       # Windows 桌面交互菜单启动器
 ├── justfile                    # 常用任务（检查、格式化、lint、测试）
 ├── requirements.txt           # 声明：纯标准库，无运行时依赖
