@@ -1574,6 +1574,132 @@ side = mod.format_history_sidebar(log_db, "Prov-A", since="24h")
 test("history sidebar contains Prov", "请求" in side, f"{side}")
 
 
+print("\n[Unit] analyze functions on temp sqlite")
+# 用已有的 log_db (3 条: r1 ok routed, r2 fail auth, r3 fail rate_limit)
+# 补几条不同日期的行来测试 by_day
+log_db2 = os.path.join(tmp, "logs2.db")
+conn2 = sqlite3.connect(log_db2)
+conn2.execute("""CREATE TABLE providers (
+    id TEXT, name TEXT, app_type TEXT, settings_config TEXT,
+    is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER
+)""")
+conn2.execute("INSERT INTO providers VALUES (?,?,?,?,?,?,?)",
+              ("pid-a", "Prov-A", "claude", "{}", 1, 1, 0))
+conn2.execute("INSERT INTO providers VALUES (?,?,?,?,?,?,?)",
+              ("pid-b", "Prov-B", "claude", "{}", 0, 1, 1))
+conn2.execute("""CREATE TABLE proxy_request_logs (
+    request_id TEXT, provider_id TEXT, app_type TEXT, model TEXT,
+    request_model TEXT, input_tokens INTEGER, output_tokens INTEGER,
+    cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
+    input_cost_usd TEXT, output_cost_usd TEXT, cache_read_cost_usd TEXT,
+    cache_creation_cost_usd TEXT, total_cost_usd TEXT,
+    latency_ms INTEGER, first_token_ms INTEGER, duration_ms INTEGER,
+    status_code INTEGER, error_message TEXT, session_id TEXT,
+    provider_type TEXT, is_streaming INTEGER, cost_multiplier TEXT,
+    created_at INTEGER, data_source TEXT, pricing_model TEXT,
+    input_token_semantics INTEGER
+)""")
+day1 = int(time.time()) - 86400 * 2  # 2天前
+day2 = int(time.time()) - 86400      # 1天前
+day0 = int(time.time())              # 今天
+_INS = "INSERT INTO proxy_request_logs VALUES (" + ",".join(["?"] * 27) + ")"
+def _log_row(rid, pid, mdl, it, ot, lat, ttft, st, err, ts):
+    """构建 27 列完整元组。"""
+    return (rid, pid, "claude", mdl, mdl, it, ot,
+            0, 0, "0", "0", "0", "0", "0",        # cache/cost
+            lat, ttft, None,                        # latency/ttft/duration
+            st, err, "s", None, 1, "1",            # status/err/session/prov_type/stream/cost_mult
+            ts, "proxy", "", 2)                     # created_at/data_source/pricing/token_sem
+# day1: 2 ok (Prov-A, model-x), 1 fail (Prov-B, model-y)
+for i, (pid, mdl, st, err, lat, ttft, it, ot) in enumerate([
+    ("pid-a", "model-x", 200, None, 800, 100, 50, 10),
+    ("pid-a", "model-x", 200, None, 1200, 150, 60, 12),
+    ("pid-b", "model-y", 401, "Invalid API key", 300, None, 0, 0),
+]):
+    conn2.execute(_INS, _log_row(f"a{i}", pid, mdl, it, ot, lat, ttft, st, err, day1 + i))
+# day2: 3 ok (Prov-A model-x, Prov-B model-y), 1 fail (Prov-A model-x 429)
+for i, (pid, mdl, st, err, lat, ttft, it, ot) in enumerate([
+    ("pid-a", "model-x", 200, None, 600, 80, 40, 8),
+    ("pid-b", "model-y", 200, None, 900, 120, 55, 11),
+    ("pid-a", "model-x", 200, None, 700, 90, 45, 9),
+    ("pid-a", "model-x", 429, "rate limit", 200, None, 0, 0),
+], start=10):
+    conn2.execute(_INS, _log_row(f"a{i}", pid, mdl, it, ot, lat, ttft, st, err, day2 + i))
+# day0: 1 ok (Prov-B model-y)
+conn2.execute(_INS, _log_row("a20", "pid-b", "model-y", 70, 15, 500, 60, 200, None, day0))
+conn2.commit()
+conn2.close()
+
+# _percentile
+test("percentile empty", mod._percentile([], 50) is None)
+test("percentile single", mod._percentile([10], 50) == 10.0)
+test("percentile p50 of 4", abs(mod._percentile([1, 2, 3, 4], 50) - 2.5) < 0.01)
+test("percentile p0", mod._percentile([10, 20], 0) == 10.0)
+test("percentile p100", mod._percentile([10, 20], 100) == 20.0)
+
+# _sparkline
+spark = mod._sparkline([1, 2, 3, 4, 5], width=5)
+test("sparkline length", len(spark) == 5, f"got {len(spark)} '{spark}'")
+test("sparkline monotone", spark[0] < spark[-1], f"'{spark}'")  # 字符递增
+
+# _day_key
+dk = mod._day_key(day1)
+test("day_key format", dk is not None and len(dk) == 10 and dk.count("-") == 2, f"dk={dk}")
+test("day_key None", mod._day_key(None) is None)
+
+# query_analyze_raw
+raw = mod.query_analyze_raw(log_db2)
+test("analyze raw count", len(raw) == 8, f"n={len(raw)}")
+test("analyze raw has day", all(r.get("day") is not None for r in raw))
+
+# analyze_by_day
+by_day = mod.analyze_by_day(raw)
+test("by_day has 3 days", len(by_day) == 3, f"n={len(by_day)}")
+test("by_day sorted", by_day[0]["date"] < by_day[-1]["date"])
+test("by_day totals match", sum(d["total"] for d in by_day) == 8)
+# day1: 2 ok + 1 fail = 3 total
+d1 = [d for d in by_day if d["date"] == mod._day_key(day1)]
+test("by_day day1 total=3", d1 and d1[0]["total"] == 3, f"{d1}")
+test("by_day day1 ok=2", d1 and d1[0]["ok"] == 2)
+test("by_day day1 top_fail=authentication", d1 and d1[0]["top_fail_category"] == "authentication")
+test("by_day has lat_p50", d1 and d1[0]["lat_p50"] is not None)
+
+# analyze_by_model
+by_model = mod.analyze_by_model(raw)
+test("by_model has 2 models", len(by_model) == 2, f"n={len(by_model)}")
+mx = [m for m in by_model if m["model"] == "model-x"]
+test("by_model model-x total=5", mx and mx[0]["total"] == 5)
+test("by_model model-x has p50", mx and mx[0]["lat_p50"] is not None)
+test("by_model model-x has p95", mx and mx[0]["lat_p95"] is not None)
+test("by_model model-x has p99", mx and mx[0]["lat_p99"] is not None)
+test("by_model model-x has ttft_p50", mx and mx[0]["ttft_p50"] is not None)
+test("by_model model-x avg tokens", mx and mx[0]["avg_input_tokens"] is not None)
+
+# analyze_by_provider_day
+id_map2 = mod.load_provider_id_map(log_db2)
+bpd = mod.analyze_by_provider_day(raw, id_map2)
+test("bpd has 3 days", len(bpd["days"]) == 3)
+test("bpd has 2 providers", len(bpd["providers"]) == 2, f"n={len(bpd['providers'])}")
+test("bpd day_summary", len(bpd["day_summary"]) == 3)
+# Prov-A 在 day0 没有记录 → None cell
+pa = [p for p in bpd["providers"] if p["provider_name"] == "Prov-A"]
+if pa:
+    d0_idx = bpd["days"].index(mod._day_key(day0))
+    test("bpd Prov-A day0 is None", pa[0]["days"][d0_idx] is None)
+
+# analyze_provider_deep
+pd = mod.analyze_provider_deep(raw, "Prov-A", id_map2)
+test("provider_deep not None", pd is not None)
+test("provider_deep total=5", pd and pd["total"] == 5)
+test("provider_deep has by_day", pd and len(pd["by_day"]) >= 1)
+test("provider_deep has by_model", pd and len(pd["by_model"]) >= 1)
+test("provider_deep has by_day_model", pd and len(pd["by_day_model"]) >= 1)
+
+# provider_deep miss
+pd_miss = mod.analyze_provider_deep(raw, "NoSuchProv", id_map2)
+test("provider_deep miss returns None", pd_miss is None)
+
+
 # 清理
 import shutil
 shutil.rmtree(tmp, ignore_errors=True)

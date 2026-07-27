@@ -2991,6 +2991,463 @@ def run_watch(args, say) -> int:
         return 0
 
 
+# ---------- analyze：多维聚合分析（只读，纯内存计算） ----------
+
+
+def _percentile(sorted_vals: list, p: float) -> float | None:
+    """线性插值分位数。p 取 0-100。sorted_vals 需已排序。"""
+    if not sorted_vals:
+        return None
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    k = (len(sorted_vals) - 1) * (p / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = k - lo
+    return float(sorted_vals[lo]) * (1 - frac) + float(sorted_vals[hi]) * frac
+
+
+def _sparkline(values: list, width: int = 20) -> str:
+    """ASCII sparkline：values 均匀采样到 width 个桶，每桶取平均。"""
+    if not values:
+        return "-" * width
+    ticks = "▁▂▃▄▅▆▇█"
+    n = len(values)
+    if n <= width:
+        buckets = [float(v) for v in values]
+    else:
+        buckets = []
+        for i in range(width):
+            lo = int(i * n / width)
+            hi = int((i + 1) * n / width)
+            seg = values[lo:hi] or [values[lo]]
+            buckets.append(sum(seg) / len(seg))
+    vmin, vmax = min(buckets), max(buckets)
+    span = vmax - vmin
+    if span <= 1e-9:
+        return ticks[len(ticks) // 2] * len(buckets)
+    out = []
+    for v in buckets:
+        idx = int((v - vmin) / span * (len(ticks) - 1))
+        idx = max(0, min(len(ticks) - 1, idx))
+        out.append(ticks[idx])
+    return "".join(out)
+
+
+def _day_key(ts) -> str | None:
+    """unix 秒 → 'YYYY-MM-DD'。None → None。"""
+    if ts is None:
+        return None
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+    except Exception:
+        return None
+
+
+def query_analyze_raw(db_path: str, *, since_ts: int | None = None) -> list:
+    """一次拉全分析用行；比 query_proxy_logs 更瘦（只取必要列）。"""
+    conn = _open_ro(db_path)
+    try:
+        if not _table_exists(conn, "proxy_request_logs"):
+            return []
+        where = ""
+        args: list = []
+        if since_ts is not None:
+            where = "WHERE created_at >= ?"
+            args.append(since_ts)
+        sql = (
+            "SELECT created_at, provider_id, status_code, error_message, "
+            "request_model, model, latency_ms, first_token_ms, "
+            "input_tokens, output_tokens "
+            f"FROM proxy_request_logs {where}"
+        )
+        rows = []
+        for r in conn.execute(sql, args):
+            rows.append({
+                "created_at": r[0],
+                "provider_id": r[1],
+                "status_code": r[2],
+                "error_message": r[3],
+                "request_model": r[4],
+                "model": r[5],
+                "latency_ms": r[6],
+                "first_token_ms": r[7],
+                "input_tokens": r[8],
+                "output_tokens": r[9],
+                "day": _day_key(r[0]),
+            })
+        return rows
+    finally:
+        conn.close()
+
+
+def _row_is_fail(r: dict) -> bool:
+    st = r.get("status_code")
+    err = r.get("error_message")
+    return st is None or st != 200 or (err is not None and err != "")
+
+
+def analyze_by_provider_day(rows: list, id_map: dict) -> dict:
+    """供应商 × 日期 成功率矩阵。返回 {providers, days, cells, day_totals}。"""
+    grid: dict[tuple, dict] = {}
+    day_totals: dict[str, dict] = {}
+    prov_totals: dict[str, dict] = {}
+    days_set: set[str] = set()
+    provs_set: set[str] = set()
+    for r in rows:
+        d = r.get("day")
+        pid = r.get("provider_id") or "?"
+        if not d:
+            continue
+        days_set.add(d)
+        provs_set.add(pid)
+        key = (pid, d)
+        cell = grid.setdefault(key, {"total": 0, "ok": 0, "fail": 0})
+        cell["total"] += 1
+        if _row_is_fail(r):
+            cell["fail"] += 1
+        else:
+            cell["ok"] += 1
+        dt = day_totals.setdefault(d, {"total": 0, "ok": 0, "fail": 0})
+        dt["total"] += 1
+        if _row_is_fail(r):
+            dt["fail"] += 1
+        else:
+            dt["ok"] += 1
+        pt = prov_totals.setdefault(pid, {"total": 0, "ok": 0, "fail": 0})
+        pt["total"] += 1
+        if _row_is_fail(r):
+            pt["fail"] += 1
+        else:
+            pt["ok"] += 1
+    days = sorted(days_set)
+    provs = sorted(provs_set, key=lambda p: -prov_totals[p]["total"])
+    cells = []
+    for pid in provs:
+        row_cells = []
+        for d in days:
+            c = grid.get((pid, d))
+            if c is None:
+                row_cells.append(None)
+            else:
+                sr = c["ok"] / c["total"] if c["total"] else 0.0
+                row_cells.append({
+                    "total": c["total"], "ok": c["ok"], "fail": c["fail"],
+                    "success_rate": round(sr, 4),
+                })
+        pt = prov_totals[pid]
+        cells.append({
+            "provider_id": pid,
+            "provider_name": resolve_provider_name(pid, id_map),
+            "row_totals": {
+                "total": pt["total"], "ok": pt["ok"], "fail": pt["fail"],
+                "success_rate": round(pt["ok"] / pt["total"], 4) if pt["total"] else 0.0,
+            },
+            "days": row_cells,
+        })
+    day_summary = []
+    for d in days:
+        t = day_totals[d]
+        sr = t["ok"] / t["total"] if t["total"] else 0.0
+        day_summary.append({
+            "date": d, "total": t["total"], "ok": t["ok"], "fail": t["fail"],
+            "success_rate": round(sr, 4),
+        })
+    return {"days": days, "day_summary": day_summary, "providers": cells}
+
+
+def analyze_by_model(rows: list) -> list:
+    """按 actual model 聚合：延迟分位数、成功率、平均 token。"""
+    buckets: dict[str, dict] = {}
+    for r in rows:
+        m = r.get("model") or "?"
+        b = buckets.setdefault(m, {
+            "model": m, "total": 0, "ok": 0, "fail": 0,
+            "latencies": [], "ttfts": [],
+            "input_tokens_sum": 0, "output_tokens_sum": 0, "tok_count": 0,
+        })
+        b["total"] += 1
+        if _row_is_fail(r):
+            b["fail"] += 1
+        else:
+            b["ok"] += 1
+            lat = r.get("latency_ms")
+            if isinstance(lat, (int, float)) and lat >= 0:
+                b["latencies"].append(float(lat))
+            ttft = r.get("first_token_ms")
+            if isinstance(ttft, (int, float)) and ttft >= 0:
+                b["ttfts"].append(float(ttft))
+            it = r.get("input_tokens")
+            ot = r.get("output_tokens")
+            if isinstance(it, (int, float)) or isinstance(ot, (int, float)):
+                b["input_tokens_sum"] += int(it or 0)
+                b["output_tokens_sum"] += int(ot or 0)
+                b["tok_count"] += 1
+    out = []
+    for b in buckets.values():
+        lats = sorted(b["latencies"])
+        ttfts = sorted(b["ttfts"])
+        total = b["total"] or 1
+        avg_in = b["input_tokens_sum"] / b["tok_count"] if b["tok_count"] else None
+        avg_out = b["output_tokens_sum"] / b["tok_count"] if b["tok_count"] else None
+        out.append({
+            "model": b["model"],
+            "total": b["total"],
+            "ok": b["ok"],
+            "fail": b["fail"],
+            "success_rate": round(b["ok"] / total, 4),
+            "lat_p50": _percentile(lats, 50),
+            "lat_p95": _percentile(lats, 95),
+            "lat_p99": _percentile(lats, 99),
+            "ttft_p50": _percentile(ttfts, 50),
+            "ttft_p95": _percentile(ttfts, 95),
+            "avg_input_tokens": round(avg_in, 1) if avg_in is not None else None,
+            "avg_output_tokens": round(avg_out, 1) if avg_out is not None else None,
+        })
+    out.sort(key=lambda x: -x["total"])
+    return out
+
+
+def analyze_by_day(rows: list) -> list:
+    """按天：总请求、成功率、主失败因、独立供应商数、延迟 p50/p95。"""
+    by_day: dict[str, dict] = {}
+    for r in rows:
+        d = r.get("day")
+        if not d:
+            continue
+        b = by_day.setdefault(d, {
+            "date": d, "total": 0, "ok": 0, "fail": 0,
+            "latencies": [], "fail_cats": {}, "provs": set(),
+        })
+        b["total"] += 1
+        if r.get("provider_id"):
+            b["provs"].add(r["provider_id"])
+        if _row_is_fail(r):
+            b["fail"] += 1
+            cat = classify_log_error(r.get("status_code"), r.get("error_message"))
+            b["fail_cats"][cat] = b["fail_cats"].get(cat, 0) + 1
+        else:
+            b["ok"] += 1
+            lat = r.get("latency_ms")
+            if isinstance(lat, (int, float)) and lat >= 0:
+                b["latencies"].append(float(lat))
+    out = []
+    for b in sorted(by_day.values(), key=lambda x: x["date"]):
+        lats = sorted(b["latencies"])
+        total = b["total"] or 1
+        top_cat = None
+        if b["fail_cats"]:
+            top_cat = max(b["fail_cats"].items(), key=lambda x: x[1])[0]
+        out.append({
+            "date": b["date"],
+            "total": b["total"],
+            "ok": b["ok"],
+            "fail": b["fail"],
+            "success_rate": round(b["ok"] / total, 4),
+            "unique_providers": len(b["provs"]),
+            "lat_p50": _percentile(lats, 50),
+            "lat_p95": _percentile(lats, 95),
+            "top_fail_category": top_cat,
+        })
+    return out
+
+
+def analyze_provider_deep(rows: list, provider_substr: str, id_map: dict) -> dict | None:
+    """单供应商深度：过滤后按 (day, model) 交叉。"""
+    if not provider_substr:
+        return None
+    sub = provider_substr.lower()
+    pids = {pid for pid, n in id_map.items() if sub in (n or "").lower()}
+    if not pids:
+        return None
+    filtered = [r for r in rows if r.get("provider_id") in pids]
+    if not filtered:
+        return {"provider_substr": provider_substr, "match_provider_ids": sorted(pids),
+                "total": 0, "by_day": [], "by_model": [], "by_day_model": []}
+    by_day = analyze_by_day(filtered)
+    by_model = analyze_by_model(filtered)
+    # (day, actual_model) 交叉
+    cross: dict[tuple, dict] = {}
+    for r in filtered:
+        d = r.get("day")
+        m = r.get("model") or "?"
+        if not d:
+            continue
+        c = cross.setdefault((d, m), {"date": d, "model": m, "total": 0, "ok": 0, "fail": 0})
+        c["total"] += 1
+        if _row_is_fail(r):
+            c["fail"] += 1
+        else:
+            c["ok"] += 1
+    dm = []
+    for c in cross.values():
+        total = c["total"] or 1
+        dm.append({**c, "success_rate": round(c["ok"] / total, 4)})
+    dm.sort(key=lambda x: (x["date"], -x["total"]))
+    prov_names = sorted({resolve_provider_name(pid, id_map) for pid in pids})
+    return {
+        "provider_substr": provider_substr,
+        "match_provider_names": prov_names,
+        "match_provider_ids": sorted(pids),
+        "total": len(filtered),
+        "by_day": by_day,
+        "by_model": by_model,
+        "by_day_model": dm,
+    }
+
+
+def _color_rate(rate: float) -> str:
+    """成功率带色：≥0.95 绿 / ≥0.80 黄 / <0.80 红。"""
+    s = f"{rate*100:.0f}%"
+    if rate >= 0.95:
+        return _c(s, "green")
+    if rate >= 0.80:
+        return _c(s, "yellow")
+    return _c(s, "red", "bold")
+
+
+def _fmt_ms(v) -> str:
+    return f"{v:.0f}ms" if isinstance(v, (int, float)) else "-"
+
+
+def run_analyze(args, say) -> int:
+    """analyze 子命令：默认全维度报表，可用 --mode 选单个维度。"""
+    try:
+        since_ts = _parse_since(getattr(args, "since", None))
+    except ValueError as e:
+        say(str(e))
+        return 2
+    id_map = load_provider_id_map(args.db)
+    rows = query_analyze_raw(args.db, since_ts=since_ts)
+    mode = getattr(args, "mode", "all") or "all"
+    prov = getattr(args, "provider", None) or None
+
+    report: dict = {
+        "schema_version": 1,
+        "command": "analyze",
+        "since": getattr(args, "since", None),
+        "mode": mode,
+        "provider": prov,
+        "row_count": len(rows),
+    }
+    if mode in ("all", "provider-day"):
+        report["by_provider_day"] = analyze_by_provider_day(rows, id_map)
+    if mode in ("all", "model"):
+        report["by_model"] = analyze_by_model(rows)
+    if mode in ("all", "day"):
+        report["by_day"] = analyze_by_day(rows)
+    if prov and mode in ("all", "provider"):
+        report["provider_deep"] = analyze_provider_deep(rows, prov, id_map)
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str), flush=True)
+        return 0
+
+    say(f"analyze: {len(rows)} 条记录"
+        f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}"
+        f"  mode={mode}"
+        f"{'  provider~' + prov if prov else ''}")
+    if not rows:
+        say("（该时间窗内无记录）")
+        return 0
+
+    # ---- by_day ----
+    if "by_day" in report:
+        by_day = report["by_day"]
+        _say_colored(_c("\n[按天] 日期 · 请求 · 成功率 · 独立供应商 · p50/p95 延迟 · 主失败因", "bold"))
+        say("-" * 90)
+        rates = [d["success_rate"] for d in by_day]
+        p50s = [d["lat_p50"] or 0 for d in by_day]
+        for d in by_day:
+            rate_c = _color_rate(d["success_rate"])
+            cat = d.get("top_fail_category") or "-"
+            cat_c = _c(cat[:20], "red") if cat != "-" else cat[:20]
+            _say_colored(
+                f"  {d['date']}  {d['total']:5d}  {rate_c:>7}  "
+                f"prov={d['unique_providers']:2d}  "
+                f"p50={_fmt_ms(d['lat_p50']):>7}  p95={_fmt_ms(d['lat_p95']):>7}  {cat_c}"
+            )
+        if len(by_day) >= 2:
+            spark_rate = _sparkline(rates, width=min(30, len(rates)))
+            spark_lat = _sparkline(p50s, width=min(30, len(p50s)))
+            say(f"  成功率趋势 {spark_rate}   p50 延迟 {spark_lat}")
+
+    # ---- by_model ----
+    if "by_model" in report:
+        by_model = report["by_model"][:20]
+        _say_colored(_c("\n[按模型] 模型 · 请求 · 成功率 · p50/p95/p99 延迟 · 平均 tokens(in/out)", "bold"))
+        say("-" * 100)
+        for m in by_model:
+            rate_c = _color_rate(m["success_rate"])
+            mname = _sanitize_for_terminal(str(m["model"])[:36])
+            avg_in = m.get("avg_input_tokens")
+            avg_out = m.get("avg_output_tokens")
+            tok = (f"{avg_in:.0f}/{avg_out:.0f}"
+                   if avg_in is not None and avg_out is not None else "-")
+            _say_colored(
+                f"  {mname:36} {m['total']:6d}  {rate_c:>7}  "
+                f"p50={_fmt_ms(m['lat_p50']):>7} p95={_fmt_ms(m['lat_p95']):>7} p99={_fmt_ms(m['lat_p99']):>7}  "
+                f"tok={tok}"
+            )
+
+    # ---- by_provider_day ----
+    if "by_provider_day" in report:
+        bpd = report["by_provider_day"]
+        _say_colored(_c("\n[供应商 × 日期] 每格显示成功率；(总/失败) 汇总在最右列", "bold"))
+        say("-" * 100)
+        days = bpd["days"]
+        if len(days) > 14:
+            days_show = days[-14:]
+        else:
+            days_show = days
+        head_days = " ".join(f"{d[-5:]:>7}" for d in days_show)  # MM-DD
+        _say_colored(_c(f"  {'供应商':24} {head_days}   {'总计':>10}", "dim"))
+        for pcell in bpd["providers"]:
+            pname = _sanitize_for_terminal(pcell["provider_name"][:24])
+            cells_str = []
+            for d in days_show:
+                idx = days.index(d)
+                c = pcell["days"][idx]
+                if c is None:
+                    cells_str.append(f"{_c('  -  ', 'dim'):>7}")
+                else:
+                    cells_str.append(f"{_color_rate(c['success_rate']):>7}")
+            rt = pcell["row_totals"]
+            tot_c = _color_rate(rt["success_rate"])
+            _say_colored(
+                f"  {pname:24} {' '.join(cells_str)}   {rt['total']:5d}/{rt['fail']:<3d} {tot_c}"
+            )
+        if len(days) > len(days_show):
+            say(f"  （仅显示最近 {len(days_show)} 天；全量共 {len(days)} 天，见 --json）")
+
+    # ---- provider_deep ----
+    if "provider_deep" in report and report["provider_deep"]:
+        pd = report["provider_deep"]
+        _say_colored(_c(f"\n[供应商深度] provider~'{prov}'  匹配={len(pd['match_provider_ids'])}"
+                        f"  总请求={pd['total']}", "bold"))
+        if pd["match_provider_names"]:
+            say(f"  命中: {', '.join(pd['match_provider_names'])}")
+        say("-" * 90)
+        if pd["by_model"]:
+            _say_colored(_c("  · 按模型", "dim"))
+            for m in pd["by_model"][:10]:
+                rate_c = _color_rate(m["success_rate"])
+                mname = _sanitize_for_terminal(str(m["model"])[:36])
+                _say_colored(
+                    f"    {mname:36} {m['total']:5d}  {rate_c:>7}  "
+                    f"p50={_fmt_ms(m['lat_p50']):>7} p95={_fmt_ms(m['lat_p95']):>7}"
+                )
+        if pd["by_day"]:
+            _say_colored(_c("  · 按天", "dim"))
+            for d in pd["by_day"]:
+                _say_colored(
+                    f"    {d['date']}  {d['total']:5d}  {_color_rate(d['success_rate']):>7}  "
+                    f"p50={_fmt_ms(d['lat_p50']):>7}"
+                )
+
+    return 0
+
+
 def format_history_sidebar(db_path: str, provider_name: str, since: str = "24h") -> str:
     """给 check/inspect 附带的一行历史摘要。"""
     try:
@@ -3016,7 +3473,7 @@ def _inject_default_command(argv: list[str]) -> list[str]:
       prog                  →  prog check
     """
     known = {"check", "list-models", "inspect", "history", "stats", "routing", "watch",
-             "-h", "--help"}
+             "analyze", "-h", "--help"}
     if len(argv) <= 1:
         return argv + ["check"]
     head = argv[1]
@@ -3140,6 +3597,15 @@ def _build_parser():
     p_watch.add_argument("--fails", action="store_true", help="只显示失败")
     p_watch.add_argument("--provider", default=None, help="按供应商名子串过滤")
 
+    p_analyze = sub.add_parser("analyze", parents=[common],
+                               help="多维度聚合分析（按天/模型/供应商交叉）")
+    p_analyze.add_argument("--since", default="7d", help="时间窗口（默认 7d）")
+    p_analyze.add_argument("--mode", default="all",
+                           choices=["all", "day", "model", "provider-day", "provider"],
+                           help="分析维度（默认 all 全部）")
+    p_analyze.add_argument("--provider", default=None, help="单供应商深度（--mode provider 或 all 时生效）")
+    p_analyze.add_argument("--json", action="store_true", help="JSON 输出")
+
     # 兜底默认（注入 check 后子解析器会覆盖这些）
     ap.set_defaults(command="check", type="claude", failover_only=False, json=False)
     return ap, common, p_check, p_lm, p_inspect, p_hist, p_stats, p_route, p_watch
@@ -3175,6 +3641,8 @@ def main():
         return run_routing(args, say)
     if args.command == "watch":
         return run_watch(args, say)
+    if args.command == "analyze":
+        return run_analyze(args, say)
 
     types = ["claude", "codex", "openclaw"] if getattr(args, "type", "claude") == "all" else [getattr(args, "type", "claude")]
     providers = []

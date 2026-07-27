@@ -210,7 +210,7 @@ test("inspect 命令含 vision include", "vision" in combined.lower(),
 
 
 print("\n[PS1] 运行日志入口 - 选项 5")
-rc, out, err = run_pwsh("5\n6\n7\n", timeout=60)
+rc, out, err = run_pwsh("5\n7\n7\n", timeout=60)
 combined = out + err
 test("运行日志菜单可见", "运行日志" in combined or "history" in combined.lower() or "失败日志" in combined)
 test("运行日志菜单可返回", rc == 0, f"rc={rc}")

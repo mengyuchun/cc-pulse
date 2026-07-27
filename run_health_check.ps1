@@ -276,8 +276,9 @@ function Menu-Logs {
     Write-Host "  [3] 供应商统计          stats --since 7d"
     Write-Host "  [4] 静默路由排行        routing --since 7d"
     Write-Host "  [5] 实时监控（轮询）    watch · 有新日志就打印"
-    Write-Host "  [6] 返回主菜单"
-    $c = Read-Host "输入 1-6 (默认1)"
+    Write-Host "  [6] 分析报表            analyze · 按天/模型/供应商交叉"
+    Write-Host "  [7] 返回主菜单"
+    $c = Read-Host "输入 1-7 (默认1)"
     switch ($c) {
         "2" {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
@@ -305,7 +306,13 @@ function Menu-Logs {
             Write-Host "实时监控中，Ctrl+C 结束…" -ForegroundColor Cyan
             $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
-        "6" { return 0 }
+        "6" {
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("analyze"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
+            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        }
+        "7" { return 0 }
         default {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)

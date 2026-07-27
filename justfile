@@ -44,6 +44,18 @@ routing:
 watch:
     {{PYTHON}} {{SCRIPT}} watch --interval 3
 
+# 多维分析报表（全维度，7 天）
+analyze:
+    {{PYTHON}} {{SCRIPT}} analyze --since 7d
+
+# 按模型延迟分析
+analyze-model:
+    {{PYTHON}} {{SCRIPT}} analyze --mode model --since 7d
+
+# 按天健康趋势
+analyze-daily:
+    {{PYTHON}} {{SCRIPT}} analyze --mode day --since 30d
+
 # JSON 健康报告（管道到 jq）
 check-json:
     {{PYTHON}} {{SCRIPT}} check --failover-only --json
