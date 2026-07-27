@@ -2082,176 +2082,81 @@ def compare_models(requested: str, responded: str | None) -> dict:
             "warning": f"模型路由不一致：请求 {requested!r}，实际响应 {responded!r}"}
 
 
-def run_inspect(args, providers, say) -> int:
-    """单一模型深度检测（阶段 3 仅实现 text；阶段 4+ 续上 streaming/metadata/...）。"""
-    p, model_id, err = resolve_inspect_target(args, providers, say)
-    if p is None:
-        say(err)
-        print(json.dumps({
-            "schema_version": 1,
-            "command": "inspect",
-            "error": err,
-            "provider": getattr(args, "provider", None),
-            "model": getattr(args, "model", None),
-            "source": getattr(args, "source", None),
-        }, ensure_ascii=False, indent=2))
-        return 2
+def _inspect_text(p, tier, timeout, skip_tls, *, max_tokens, disable_thinking, user_agent):
+    """文本探测 → (result_dict, raw_probe_dict)。"""
+    r = probe_tier(p, tier, timeout, skip_tls,
+                   max_tokens=max_tokens, disable_thinking=disable_thinking, user_agent=user_agent)
+    result = {
+        "status": ("pass" if r.get("status") == 200 and r.get("correct") else
+                   "fail" if r.get("status") == 200 else "error"),
+        "elapsed_seconds": r.get("elapsed", 0),
+        "answer": r.get("answer", ""),
+        "correct": r.get("correct", False),
+        "http_status": r.get("status", 0),
+        "error_category": r.get("error_category", ErrorCategory.UNKNOWN.value),
+        "error": r.get("error", ""),
+    }
+    return result, r
 
-    # 仅当 source=listed 时 resolve 阶段已经发了网络请求；其它 source 此处不需要
-    inspect_p = rebuild_provider_for_inspect(p, model_id)
-    protocol = detect_protocol(p)
 
-    include = set(x.strip() for x in args.include.split(",") if x.strip())
-    _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
-    _dt = not getattr(args, "probe_enable_thinking", False)
-    _ua = getattr(args, "user_agent", None)
-
-    # --with-metadata 废弃兼容
-    if getattr(args, "with_metadata", False):
-        say("提示: --with-metadata 已废弃，metadata 默认包含在 --include 中")
-
-    # 文本探测（阶段 3 必含项）
-    text_result = None
-    text_raw = None
-    if "text" in include:
-        r = probe_tier(inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
-                       max_tokens=_mt, disable_thinking=_dt, user_agent=_ua)
-        text_raw = r
-        text_result = {
-            "status": "pass" if r.get("status") == 200 and r.get("correct") else
-                      "fail" if r.get("status") == 200 else
-                      "error",
-            "elapsed_seconds": r.get("elapsed", 0),
-            "answer": r.get("answer", ""),
-            "correct": r.get("correct", False),
-            "http_status": r.get("status", 0),
-            "error_category": r.get("error_category", ErrorCategory.UNKNOWN.value),
-            "error": r.get("error", ""),
-        }
-
-    # 流式探测（阶段 4）
-    streaming_result = None
-    if "streaming" in include:
-        ttft = getattr(args, "ttft_timeout", None)
-        sr = probe_stream(inspect_p, inspect_p.tiers[0], args.timeout,
-                          args.skip_tls_verify, ttft_timeout=ttft,
-                          max_tokens=_mt, disable_thinking=_dt, user_agent=_ua)
-        streaming_result = sr
-
-    # 元数据探测（默认纳入）
-    metadata_result = {"status": "skipped"}
-    if "metadata" in include:
-        model_for_meta = re.sub(r"\[.*?\]$", "", model_id)
-        metadata_result = probe_model_metadata(inspect_p, model_for_meta,
-                                              args.timeout, args.skip_tls_verify,
-                                              user_agent=getattr(args, "user_agent", None))
-
-    # 上下文窗口探测：无声明时按档位触发
-    context_result = {"status": "skipped"}
-    if "metadata" in include:
-        has_declared = (metadata_result.get("declared_context_window") is not None
-                        and metadata_result.get("status") == "available")
-        if not has_declared:
-            _ctx_chars = {"512k": 524288, "1m": 1048576}.get(
-                getattr(args, "probe_context", "512k"), 524288)
-            context_result = probe_context_smoke(inspect_p, model_id, _ctx_chars,
-                                                  args.timeout, args.skip_tls_verify,
-                                                  user_agent=getattr(args, "user_agent", None))
-
-    # thinking 探测（复用 text 的 disable 结果 + 再发一次 enable）
-    thinking_result = {"status": "skipped"}
-    if "thinking" in include and text_raw is not None:
-        # disable 结果来自 text 探测
-        disable_ok = (text_raw.get("status") == 200)
-    elif "thinking" in include:
-        # text 未跑但用户要求 thinking → 报告依赖缺失
-        thinking_result = {
+def _inspect_thinking(p, tier, text_raw, timeout, skip_tls, *, max_tokens, user_agent):
+    """thinking 双发探测（disable 复用 text_raw + enable 新发）→ result dict。"""
+    if text_raw is None:
+        return {
             "status": "dependency_missing",
             "error": "thinking 需要 text 在 --include 中（复用 disable 结果）",
         }
-    if "thinking" in include and text_raw is not None:
-        # enable 探测（允许 thinking，提高 max_tokens）
-        r_en = probe_tier(inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
-                          max_tokens=max(_mt, 256), disable_thinking=False, user_agent=_ua)
-        thinking_result = {
-            "disabled": {
-                "status": "pass" if disable_ok else "error",
-                "http_status": text_raw.get("status"),
-                "has_answer": text_raw.get("correct", False),
-                "has_thinking_signal": text_raw.get("has_thinking_signal", False),
-            },
-            "enabled": {
-                "status": "pass" if r_en.get("status") == 200 else "error",
-                "http_status": r_en.get("status"),
-                "has_answer": r_en.get("correct", False),
-                "has_thinking_signal": r_en.get("has_thinking_signal", False),
-            },
-            "verdict": "unknown",
-        }
-        # 判定 verdict
-        if r_en.get("status") == 400:
-            thinking_result["verdict"] = "rejects_thinking_field"
-        elif not disable_ok and r_en.get("status") == 200:
-            thinking_result["verdict"] = "forces_thinking"
-        elif disable_ok and r_en.get("status") == 200:
-            if r_en.get("has_thinking_signal"):
-                thinking_result["verdict"] = "supports_disable_and_emits_thinking"
-            else:
-                thinking_result["verdict"] = "supports_disable"
-        elif not disable_ok and not r_en.get("correct"):
-            thinking_result["verdict"] = "breaks_on_short_budget"
+    disable_ok = text_raw.get("status") == 200
+    r_en = probe_tier(p, tier, timeout, skip_tls,
+                      max_tokens=max(max_tokens, 256), disable_thinking=False, user_agent=user_agent)
+    result = {
+        "disabled": {
+            "status": "pass" if disable_ok else "error",
+            "http_status": text_raw.get("status"),
+            "has_answer": text_raw.get("correct", False),
+            "has_thinking_signal": text_raw.get("has_thinking_signal", False),
+        },
+        "enabled": {
+            "status": "pass" if r_en.get("status") == 200 else "error",
+            "http_status": r_en.get("status"),
+            "has_answer": r_en.get("correct", False),
+            "has_thinking_signal": r_en.get("has_thinking_signal", False),
+        },
+        "verdict": "unknown",
+    }
+    if r_en.get("status") == 400:
+        result["verdict"] = "rejects_thinking_field"
+    elif not disable_ok and r_en.get("status") == 200:
+        result["verdict"] = "forces_thinking"
+    elif disable_ok and r_en.get("status") == 200:
+        if r_en.get("has_thinking_signal"):
+            result["verdict"] = "supports_disable_and_emits_thinking"
         else:
-            thinking_result["verdict"] = "unknown"
+            result["verdict"] = "supports_disable"
+    elif not disable_ok and not r_en.get("correct"):
+        result["verdict"] = "breaks_on_short_budget"
+    return result
 
-    # tool use 探测（默认开）
-    tools_result = {"status": "skipped"}
-    if "tools" in include:
-        tools_result = _probe_tools(inspect_p, model_id, args.timeout, args.skip_tls_verify, _ua)
 
-    # vision 探测（默认关，仅 include 时跑）
-    vision_result = {"status": "skipped"}
-    if "vision" in include:
-        vision_result = _probe_vision(inspect_p, model_id, args.timeout, args.skip_tls_verify, _ua)
+def _inspect_model_consistency(requested: str, responded: str | None, include: set) -> dict:
+    """模型一致性判定。"""
+    if "model-consistency" not in include:
+        return {"requested": requested, "responded": responded, "match": "not_run", "warning": None}
+    result = {
+        "requested": requested,
+        "responded": responded,
+        "match": "not_run" if responded is None else "pending",
+        "warning": None,
+    }
+    if responded:
+        cmp = compare_models(requested, responded)
+        result["match"] = cmp["match"]
+        result["warning"] = cmp["warning"]
+    return result
 
-    # 协议置信度升级：仅在文本探测成功时升级
-    if text_result and text_result["status"] == "pass":
-        protocol["confidence"] = "confirmed"
 
-    # 模型一致性：仅当 include 含 model-consistency 时计算，否则 not_run
-    requested_model = model_id
-    responded_model = None
-    if streaming_result and streaming_result.get("response_model"):
-        responded_model = streaming_result["response_model"]
-    elif text_result and text_result.get("http_status") == 200:
-        # 非流式：extract_answer 没有返回 model 字段，留 None
-        pass
-
-    if "model-consistency" in include:
-        model_consistency = {
-            "requested": requested_model,
-            "responded": responded_model,
-            "match": "not_run" if responded_model is None else "pending",
-            "warning": None,
-        }
-        if responded_model:
-            cmp = compare_models(requested_model, responded_model)
-            model_consistency["match"] = cmp["match"]
-            model_consistency["warning"] = cmp["warning"]
-    else:
-        model_consistency = {
-            "requested": requested_model,
-            "responded": responded_model,
-            "match": "not_run",
-            "warning": None,
-        }
-
-    # usage：从 text 探测结果提取（若 text 跑了）
-    usage = {"present": False, "input_tokens": None, "output_tokens": None,
-             "source": None, "missing_fields": ["input_tokens", "output_tokens"]}
-    if text_raw and text_raw.get("usage"):
-        usage = text_raw["usage"]
-
-    # 整体结论
+def _inspect_verdict(text_result, model_consistency, thinking_result, tools_result):
+    """汇总结论 + 推荐操作 → (verdict, anomaly, recommended)。"""
     if text_result:
         if text_result["status"] == "pass":
             verdict = "healthy"
@@ -2261,8 +2166,7 @@ def run_inspect(args, providers, say) -> int:
             verdict = "unavailable"
     else:
         verdict = "skipped"
-
-    anomaly = (model_consistency.get("match") == "mismatch")
+    anomaly = model_consistency.get("match") == "mismatch"
     recommended = []
     if model_consistency.get("match") == "mismatch":
         recommended.append("检查供应商是否将模型别名静默路由到其它模型")
@@ -2278,6 +2182,92 @@ def run_inspect(args, providers, say) -> int:
         recommended.append("供应商拒绝 thinking/reasoning 相关字段；可尝试 --probe-enable-thinking 跳过")
     if tools_result.get("status") == "error":
         recommended.append("Tool use 探测失败；Claude Code 的 tool 调用可能不可用")
+    return verdict, anomaly, recommended
+
+
+def run_inspect(args, providers, say) -> int:
+    """单一模型深度检测（7 维度：text/streaming/metadata/context/thinking/tools/vision）。"""
+    p, model_id, err = resolve_inspect_target(args, providers, say)
+    if p is None:
+        say(err)
+        print(json.dumps({
+            "schema_version": 1,
+            "command": "inspect",
+            "error": err,
+            "provider": getattr(args, "provider", None),
+            "model": getattr(args, "model", None),
+            "source": getattr(args, "source", None),
+        }, ensure_ascii=False, indent=2))
+        return 2
+
+    inspect_p = rebuild_provider_for_inspect(p, model_id)
+    protocol = detect_protocol(p)
+    include = set(x.strip() for x in args.include.split(",") if x.strip())
+    _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
+    _dt = not getattr(args, "probe_enable_thinking", False)
+    _ua = getattr(args, "user_agent", None)
+
+    if getattr(args, "with_metadata", False):
+        say("提示: --with-metadata 已废弃，metadata 默认包含在 --include 中")
+
+    # ---- 7 维度探测 ----
+    text_result, text_raw = (None, None)
+    if "text" in include:
+        text_result, text_raw = _inspect_text(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            max_tokens=_mt, disable_thinking=_dt, user_agent=_ua)
+
+    streaming_result = None
+    if "streaming" in include:
+        streaming_result = probe_stream(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            ttft_timeout=getattr(args, "ttft_timeout", None),
+            max_tokens=_mt, disable_thinking=_dt, user_agent=_ua)
+
+    metadata_result = {"status": "skipped"}
+    if "metadata" in include:
+        metadata_result = probe_model_metadata(
+            inspect_p, re.sub(r"\[.*?\]$", "", model_id),
+            args.timeout, args.skip_tls_verify, user_agent=_ua)
+
+    context_result = {"status": "skipped"}
+    if "metadata" in include:
+        has_declared = (metadata_result.get("declared_context_window") is not None
+                        and metadata_result.get("status") == "available")
+        if not has_declared:
+            _ctx = {"512k": 524288, "1m": 1048576}.get(
+                getattr(args, "probe_context", "512k"), 524288)
+            context_result = probe_context_smoke(
+                inspect_p, model_id, _ctx, args.timeout, args.skip_tls_verify, user_agent=_ua)
+
+    thinking_result = {"status": "skipped"}
+    if "thinking" in include:
+        thinking_result = _inspect_thinking(
+            inspect_p, inspect_p.tiers[0], text_raw,
+            args.timeout, args.skip_tls_verify, max_tokens=_mt, user_agent=_ua)
+
+    tools_result = {"status": "skipped"}
+    if "tools" in include:
+        tools_result = _probe_tools(inspect_p, model_id, args.timeout, args.skip_tls_verify, _ua)
+
+    vision_result = {"status": "skipped"}
+    if "vision" in include:
+        vision_result = _probe_vision(inspect_p, model_id, args.timeout, args.skip_tls_verify, _ua)
+
+    # ---- 汇总 ----
+    if text_result and text_result["status"] == "pass":
+        protocol["confidence"] = "confirmed"
+
+    responded_model = (streaming_result or {}).get("response_model")
+    model_consistency = _inspect_model_consistency(model_id, responded_model, include)
+
+    usage = {"present": False, "input_tokens": None, "output_tokens": None,
+             "source": None, "missing_fields": ["input_tokens", "output_tokens"]}
+    if text_raw and text_raw.get("usage"):
+        usage = text_raw["usage"]
+
+    verdict, anomaly, recommended = _inspect_verdict(
+        text_result, model_consistency, thinking_result, tools_result)
 
     report = {
         "schema_version": 1,
@@ -2314,7 +2304,6 @@ def run_inspect(args, providers, say) -> int:
             report["history"] = {"error": f"{type(e).__name__}: {e}"}
 
     if args.human:
-        # 人类可读输出到 stdout（即使 JSON 模式，也走 stdout）
         text = format_inspect_human(report)
         if report.get("history") and not report["history"].get("error"):
             h = report["history"]
