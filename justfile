@@ -16,6 +16,10 @@ check:
 check-all:
     {{PYTHON}} {{SCRIPT}} check --workers 8 --timeout 45
 
+# 健康检测：隐身模式（降并发+随机延迟，被站点识别为测活时改用，较慢）
+check-stealth:
+    {{PYTHON}} {{SCRIPT}} check --failover-only --stealth --timeout 45
+
 # 拉模型列表：故障转移队列 + 当前激活
 models:
     {{PYTHON}} {{SCRIPT}} list-models --failover-only

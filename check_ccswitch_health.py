@@ -25,6 +25,7 @@ import os
 import sqlite3
 import re
 import argparse
+import random
 import subprocess
 import sys
 import threading
@@ -86,25 +87,83 @@ def _user_agent(override: str | None = None) -> str:
     return f"claude-cli/{_claude_cli_version()} (external, sdk-cli)"
 
 
-def _claude_code_headers(user_agent: str | None = None) -> dict:
-    """构造 Claude Code 指纹头（User-Agent 动态）。"""
+def _claude_code_headers(user_agent: str | None = None,
+                         stainless_version: str | None = None) -> dict:
+    """构造 Claude Code 指纹头（User-Agent 动态，stainless 版本可覆盖）。"""
     return {
         "User-Agent": _user_agent(user_agent),
         "x-app": "cli",
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
         "x-stainless-lang": "js",
-        "x-stainless-package-version": "0.74.0",
+        "x-stainless-package-version": stainless_version or _STAINLESS_PACKAGE_VERSION,
         "x-stainless-runtime": "node",
         "x-stainless-runtime-version": "v24.3.0",
         "x-stainless-arch": "x64",
         "x-stainless-os": "Windows",
     }
 
+
+def _is_thinking_prone_model(model_id: str) -> bool:
+    """模型是否倾向走 thinking/reasoning（据此决定是否发思考抑制字段）。"""
+    return bool(model_id and _THINKING_PRONE_RE.search(model_id))
+
+
+def _answer_correct(answer: str, expected: str) -> bool:
+    """宽松校验回答是否正确。
+
+    max_tokens 提到 1024 后，话痨模型可能回「答案是 5」而非纯「5」，
+    精确匹配会误判。策略：先 strip 精确匹配；否则当期望为纯数字时，
+    从回答里提取所有数字，唯一且相等即通过。
+    """
+    a = (answer or "").strip()
+    exp = (expected or "").strip()
+    if a == exp:
+        return True
+    if exp.lstrip("-").isdigit():
+        nums = re.findall(r"-?\d+", a)
+        if len(nums) == 1 and nums[0] == exp:
+            return True
+    return False
+
 # 探测用的真实问题（验证模型能否真正回答，而非只测连通）
+# 兜底默认（问题池不可用/显式指定时用）
 PROBE_QUESTION = "What is 2+3? Reply with only the number, nothing else."
-PROBE_MAX_TOKENS = 20
 EXPECTED_ANSWER = "5"
+
+# 问题池：每次探测随机抽一条，避免固定 prompt 被中转站按子串识别成测活脚本。
+# 答案均为单一确定值（数字/单词），配合 _answer_correct 宽松匹配。
+PROBE_PROMPTS = [
+    {"q": "What is 2+3? Reply with only the number, nothing else.", "a": "5"},
+    {"q": "What is 7+6? Reply with only the number.", "a": "13"},
+    {"q": "计算 4 加 5，只回答数字。", "a": "9"},
+    {"q": "What is 9 minus 4? Answer with the number only.", "a": "5"},
+    {"q": "What is 3 times 4? Just the number.", "a": "12"},
+    {"q": "8 加 7 等于多少？只回数字。", "a": "15"},
+    {"q": "What is 20 divided by 5? Number only.", "a": "4"},
+    {"q": "What is 6+8? Reply with just the number.", "a": "14"},
+    {"q": "计算 12 减 7，只给数字。", "a": "5"},
+    {"q": "What is 5 times 3? Only the number, please.", "a": "15"},
+]
+
+# max_tokens：设为自然值（1024）而非刺眼的 20。这是上限非实际消耗，
+# 回答一个数字仍只按实际输出计费；避免「20」这一测活脚本典型信号。
+PROBE_MAX_TOKENS = 1024
+
+# 会走 thinking/reasoning 的模型（保守匹配）：仅对这些模型发思考抑制字段，
+# 普通 claude 模型不发（更贴近真实 claude-cli，减少指纹）。
+_THINKING_PRONE_RE = re.compile(
+    r"deepseek|glm|qwq|reasoner|(?:^|[-_/])r1(?:$|[-_])|qwen.*(?:think|reason)",
+    re.IGNORECASE,
+)
+
+# stealth 时序伪装参数
+STEALTH_MAX_WORKERS = 3          # 隐身模式并发上限
+STEALTH_JITTER_MIN = 0.3         # 每档请求前随机延迟下界（秒）
+STEALTH_JITTER_MAX = 1.5         # 上界
+
+# x-stainless-* 指纹头版本（无法从 claude --version 推导 SDK 版本，可 --stainless-version 覆盖）
+_STAINLESS_PACKAGE_VERSION = "0.74.0"
 
 # 模型档位回退顺序（与用户指定一致：haiku→sonnet→opus→fable，default 兜底）
 TIER_ORDER = ["haiku", "sonnet", "opus", "fable", "default"]
@@ -224,15 +283,19 @@ def build_auth_headers(p: Provider) -> dict:
 def build_probe_request(p: Provider, tier: ModelTier, stream: bool = False,
                        max_tokens: int = PROBE_MAX_TOKENS,
                        disable_thinking: bool = True,
-                       user_agent: str | None = None) -> tuple:
+                       user_agent: str | None = None,
+                       question: str = PROBE_QUESTION,
+                       stainless_version: str | None = None) -> tuple:
     """构造 (url, method, headers, body)，发真实问题，路径不去重。
 
     stream=True 时为协议体加 stream 字段（Anthropic/OpenAI 兼容）。
-    disable_thinking=True（默认）请求体加 "thinking": {"type": "disabled"}，
-    避免 DeepSeek 等中转/模型走 thinking 模式耗光 max_tokens 而无最终答案。
-    max_tokens 允许调高预算（默认 PROBE_MAX_TOKENS）。
+    disable_thinking=True（默认）仅对 thinking-prone 模型（DeepSeek/GLM 等，
+    见 _is_thinking_prone_model）发思考抑制字段，避免其耗光 max_tokens 而无
+    最终答案；普通 claude 模型不发该字段，更贴近真实 claude-cli，减少指纹。
+    question 为实际探测问题（来自问题池随机抽取）；max_tokens 允许调高预算。
     """
     auth_h = build_auth_headers(p)
+    suppress = disable_thinking and _is_thinking_prone_model(tier.model)
 
     if p.app_type == "claude":
         if p.is_openrouter:
@@ -240,11 +303,11 @@ def build_probe_request(p: Provider, tier: ModelTier, stream: bool = False,
             payload = {
                 "model": tier.raw_model or tier.model,
                 "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": PROBE_QUESTION}],
+                "messages": [{"role": "user", "content": question}],
             }
             if stream:
                 payload["stream"] = True
-            if disable_thinking:
+            if suppress:
                 payload["thinking"] = {"type": "disabled"}
             body = json.dumps(payload).encode()
             return url, "POST", {**auth_h, "Content-Type": "application/json"}, body
@@ -253,14 +316,15 @@ def build_probe_request(p: Provider, tier: ModelTier, stream: bool = False,
         payload = {
             "model": tier.model,
             "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": PROBE_QUESTION}],
+            "messages": [{"role": "user", "content": question}],
         }
         if stream:
             payload["stream"] = True
-        if disable_thinking:
+        if suppress:
             payload["thinking"] = {"type": "disabled"}
         body = json.dumps(payload).encode()
-        headers = {**_claude_code_headers(user_agent), **auth_h, "Content-Type": "application/json"}
+        headers = {**_claude_code_headers(user_agent, stainless_version),
+                   **auth_h, "Content-Type": "application/json"}
         return url, "POST", headers, body
 
     if p.app_type == "codex":
@@ -268,12 +332,12 @@ def build_probe_request(p: Provider, tier: ModelTier, stream: bool = False,
         url = p.base_url.rstrip("/") + "/responses"
         payload = {
             "model": tier.model,
-            "input": PROBE_QUESTION,
+            "input": question,
             "max_output_tokens": max_tokens,
         }
         if stream:
             payload["stream"] = True
-        if disable_thinking:
+        if suppress:
             # Responses API 用 reasoning.effort="minimal" 最大限度抑制思考
             # （取值 minimal/low/medium/high；无 disabled 档）
             payload["reasoning"] = {"effort": "minimal"}
@@ -287,11 +351,11 @@ def build_probe_request(p: Provider, tier: ModelTier, stream: bool = False,
         payload = {
             "model": tier.model,
             "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": PROBE_QUESTION}],
+            "messages": [{"role": "user", "content": question}],
         }
         if stream:
             payload["stream"] = True
-        if disable_thinking:
+        if suppress:
             # OpenAI 兼容站常用 reasoning_effort 抑制思考（DeepSeek-R1 等）
             payload["reasoning_effort"] = "none"
         body = json.dumps(payload).encode()
@@ -1154,18 +1218,31 @@ def _status_badge(ok: bool, http_status: int | None, error_category: str | None)
 def probe_tier(p: Provider, tier: ModelTier, timeout: int, skip_tls_verify: bool,
                max_tokens: int = PROBE_MAX_TOKENS,
                disable_thinking: bool = True,
-               user_agent: str | None = None) -> dict:
-    """探测单个档位，返回结果字典（含 usage / raw_body 供 inspect 复用）。"""
+               user_agent: str | None = None,
+               stainless_version: str | None = None,
+               stealth: bool = False) -> dict:
+    """探测单个档位，返回结果字典（含 usage / raw_body 供 inspect 复用）。
+
+    问题从 PROBE_PROMPTS 随机抽取（避免固定 prompt 被识别），按配对答案宽松校验。
+    stealth=True 时请求前随机延迟 STEALTH_JITTER_MIN~MAX 秒，弱化脚本式流量尖峰。
+    """
+    prompt = random.choice(PROBE_PROMPTS)
+    question, expected = prompt["q"], prompt["a"]
     url, method, headers, body = build_probe_request(p, tier,
                                                      max_tokens=max_tokens,
                                                      disable_thinking=disable_thinking,
-                                                     user_agent=user_agent)
+                                                     user_agent=user_agent,
+                                                     question=question,
+                                                     stainless_version=stainless_version)
     empty_usage = extract_usage("")
     if not url:
         return {"tier": tier.tier, "model": tier.model, "status": -1,
                 "elapsed": 0, "error": "无法构造请求 URL", "answer": "",
+                "question": question,
                 "usage": empty_usage, "raw_body": "", "has_thinking_signal": False}
 
+    if stealth:
+        time.sleep(random.uniform(STEALTH_JITTER_MIN, STEALTH_JITTER_MAX))
     start = time.time()
     resp = _http_request(url, method, headers, body, timeout, skip_tls_verify)
     elapsed = round(time.time() - start, 2)
@@ -1175,20 +1252,21 @@ def probe_tier(p: Provider, tier: ModelTier, timeout: int, skip_tls_verify: bool
         return {"tier": tier.tier, "model": tier.model, "status": 0,
                 "elapsed": elapsed, "error": resp.error_msg,
                 "error_category": resp.error_category, "answer": "",
+                "question": question,
                 "usage": empty_usage, "raw_body": "", "has_thinking_signal": False}
 
     if resp.status != 200:
         category, display = classify_error(resp.body, resp.status)
         return {"tier": tier.tier, "model": tier.model, "status": resp.status,
                 "elapsed": elapsed, "error": display, "error_category": category.value,
-                "answer": "", "usage": extract_usage(resp.body),
+                "answer": "", "question": question, "usage": extract_usage(resp.body),
                 "raw_body": resp.body[:4000], "has_thinking_signal": False}
 
     answer = extract_answer(p, resp.body)
-    correct = answer.strip() == EXPECTED_ANSWER
+    correct = _answer_correct(answer, expected)
     return {"tier": tier.tier, "model": tier.model, "status": 200,
             "elapsed": elapsed, "error": "", "answer": answer[:80],
-            "correct": correct,
+            "correct": correct, "question": question,
             "error_category": ErrorCategory.NONE.value if correct else ErrorCategory.ANSWER_MISMATCH.value,
             "usage": extract_usage(resp.body),
             "raw_body": resp.body[:8000],
@@ -1199,18 +1277,22 @@ def probe(p: Provider, timeout: int, skip_tls_verify: bool,
           max_tokens: int = PROBE_MAX_TOKENS,
           disable_thinking: bool = True,
           user_agent: str | None = None,
-          on_attempt=None) -> dict:
+          on_attempt=None,
+          stainless_version: str | None = None,
+          stealth: bool = False) -> dict:
     """按回退顺序探测档位，首个正确回答的档位即为可用档位。
 
     on_attempt: 可选回调 (provider, attempt_result) -> None，每档结束后立刻调用，
     用于健康检测增量进度（不等整个 provider 的全部档位跑完）。
+    stealth: 透传给 probe_tier，请求前加随机延迟弱化流量尖峰。
     """
     attempts = []
     best_tier = None
     for tier in p.tiers:
         r = probe_tier(p, tier, timeout, skip_tls_verify,
                        max_tokens=max_tokens, disable_thinking=disable_thinking,
-                       user_agent=user_agent)
+                       user_agent=user_agent,
+                       stainless_version=stainless_version, stealth=stealth)
         attempts.append(r)
         if on_attempt is not None:
             try:
@@ -1736,9 +1818,12 @@ def run_health_check(args, providers, say) -> int:
       - say() 默认 flush，配合启动器 -u，避免管道块缓冲导致「全部结束才显示」
     """
     scope = "故障转移队列" if getattr(args, "failover_only", False) else "全部"
+    _stealth = getattr(args, "stealth", False)
+    _workers = min(args.workers, STEALTH_MAX_WORKERS) if _stealth else args.workers
     say(f"从 {args.db} 加载 {len(providers)} 个供应商 ({scope})")
-    say(f"并发: {args.workers}  超时: {args.timeout}s")
-    say(f"探测问题: \"{PROBE_QUESTION}\"  期望回答为 \"{EXPECTED_ANSWER}\"")
+    _mode = f"  隐身: 开(并发≤{STEALTH_MAX_WORKERS}+随机延迟)" if _stealth else ""
+    say(f"并发: {_workers}  超时: {args.timeout}s{_mode}")
+    say(f"探测问题: 问题池随机抽取（{len(PROBE_PROMPTS)} 条，答案宽松匹配）")
     say(f"档位回退: {' → '.join(TIER_ORDER)}  认证: 按配置  路径: 不去重")
     say("进度: 每档完成立即显示，供应商完成显示汇总\n")
 
@@ -1747,6 +1832,7 @@ def run_health_check(args, providers, say) -> int:
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
     _ua = getattr(args, "user_agent", None)
+    _sv = getattr(args, "stainless_version", None)
 
     def _on_attempt(p: Provider, r: dict) -> None:
         # 档位级增量：多线程下可能交错，但每行原子且带供应商名
@@ -1761,10 +1847,11 @@ def run_health_check(args, providers, say) -> int:
             err = (r.get("error") or "")[:40]
             say(f"  · {p.name[:22]:22} {r['tier']:6} [{st}] {r.get('elapsed', 0)}s {err}")
 
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+    with ThreadPoolExecutor(max_workers=_workers) as ex:
         futs = {
             ex.submit(probe, p, args.timeout, args.skip_tls_verify,
-                      _mt, _dt, _ua, _on_attempt): p
+                      _mt, _dt, _ua, _on_attempt,
+                      stainless_version=_sv, stealth=_stealth): p
             for p in providers
         }
         for i, fut in enumerate(as_completed(futs), 1):
@@ -1822,13 +1909,14 @@ def run_health_check(args, providers, say) -> int:
             key=lambda r: order.get((r.get("type"), r.get("name")), 1_000_000),
         )
         json_report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "db_path": args.db,
             "scope": "failover" if getattr(args, "failover_only", False) else "all",
             "type": getattr(args, "type", "claude"),
-            "probe_question": PROBE_QUESTION,
-            "expected_answer": EXPECTED_ANSWER,
+            "probe_question": "randomized",
+            "probe_pool_size": len(PROBE_PROMPTS),
+            "stealth": _stealth,
             "tier_order": TIER_ORDER,
             "elapsed_seconds": round(time.time() - health_started, 2),
             "summary": {
@@ -2961,10 +3049,14 @@ def _build_parser():
     common.add_argument("--workers", type=int, default=6, help="并发数 (默认: 6)")
     common.add_argument("--user-agent", default=None,
                         help="覆盖 User-Agent（默认用本机 claude --version 探测的版本）")
-    common.add_argument("--probe-max-tokens", type=int, default=20,
-                        help="探测请求 max_tokens 预算（默认 20；提高可避免 thinking 模型耗光预算）")
+    common.add_argument("--probe-max-tokens", type=int, default=PROBE_MAX_TOKENS,
+                        help=f"探测请求 max_tokens 预算（默认 {PROBE_MAX_TOKENS}，自然值；这是上限非实际消耗）")
     common.add_argument("--probe-enable-thinking", action="store_true",
                         help="允许探测请求走 thinking 模式（默认禁用，避免 DeepSeek 等 thinking 模型耗光 max_tokens）")
+    common.add_argument("--stealth", action="store_true",
+                        help=f"隐身模式：并发降至≤{STEALTH_MAX_WORKERS} 且每档请求前随机延迟，弱化脚本式流量尖峰（较慢）")
+    common.add_argument("--stainless-version", default=None,
+                        help="覆盖 x-stainless-package-version 指纹头（无法从 claude --version 推导 SDK 版本）")
 
     ap = argparse.ArgumentParser(
         description="CC-Pulse：cc-switch 供应商健康检测与单模型深度诊断",

@@ -34,6 +34,28 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
 
+# 问题池 → 答案映射：mock 按实际收到的问题回对应答案（问题池随机化后不能写死 "5"）
+_POOL_ANSWER = {p["q"]: p["a"] for p in mod.PROBE_PROMPTS}
+
+
+def _answer_for_body(j: dict) -> str:
+    """从请求体（Anthropic messages / Responses input）取问题，回配对答案，默认 "5"。"""
+    q = ""
+    msgs = j.get("messages") or []
+    if msgs and isinstance(msgs[0], dict):
+        c = msgs[0].get("content")
+        if isinstance(c, str):
+            q = c
+        elif isinstance(c, list):
+            for x in c:
+                if isinstance(x, dict) and x.get("type") == "text":
+                    q = x.get("text", "")
+                    break
+    if not q and isinstance(j.get("input"), str):
+        q = j["input"]
+    return _POOL_ANSWER.get(q, "5")
+
+
 PASSED = []
 FAILED = []
 
@@ -184,28 +206,63 @@ test("Codex path", url3 == "https://example.com/responses")
 test("Codex body.stream=True", json.loads(body3).get("stream") is True)
 
 
-print("\n[Unit] build_probe_request disable_thinking 字段")
-# claude: disable_thinking=True -> thinking:{type:disabled}
+print("\n[Unit] build_probe_request 思考抑制仅对 thinking-prone 模型")
+# 普通模型（claude-sonnet / gpt-5）即便 disable_thinking=True 也不发抑制字段，
+# 更贴近真实 claude-cli，减少指纹。
 _, _, _, b_cl_off = mod.build_probe_request(p, p.tiers[0], disable_thinking=True)
-test("claude 禁用 thinking -> thinking.type=disabled",
-     json.loads(b_cl_off).get("thinking") == {"type": "disabled"})
-_, _, _, b_cl_on = mod.build_probe_request(p, p.tiers[0], disable_thinking=False)
-test("claude 允许 thinking -> 无 thinking 字段",
-     "thinking" not in json.loads(b_cl_on))
-# codex: disable_thinking=True -> reasoning.effort=minimal
+test("claude 普通模型 disable=True -> 无 thinking 字段",
+     "thinking" not in json.loads(b_cl_off))
 _, _, _, b_cx_off = mod.build_probe_request(p3, p3.tiers[0], disable_thinking=True)
-test("codex 禁用 thinking -> reasoning.effort=minimal",
-     json.loads(b_cx_off).get("reasoning") == {"effort": "minimal"})
-_, _, _, b_cx_on = mod.build_probe_request(p3, p3.tiers[0], disable_thinking=False)
-test("codex 允许 thinking -> 无 reasoning 字段",
-     "reasoning" not in json.loads(b_cx_on))
-# openclaw: disable_thinking=True -> reasoning_effort=none
+test("codex 普通模型 disable=True -> 无 reasoning 字段",
+     "reasoning" not in json.loads(b_cx_off))
 _, _, _, b_oc_off = mod.build_probe_request(p2, p2.tiers[0], disable_thinking=True)
-test("openclaw 禁用 thinking -> reasoning_effort=none",
-     json.loads(b_oc_off).get("reasoning_effort") == "none")
-_, _, _, b_oc_on = mod.build_probe_request(p2, p2.tiers[0], disable_thinking=False)
-test("openclaw 允许 thinking -> 无 reasoning_effort 字段",
-     "reasoning_effort" not in json.loads(b_oc_on))
+test("openclaw 普通模型 disable=True -> 无 reasoning_effort 字段",
+     "reasoning_effort" not in json.loads(b_oc_off))
+
+# thinking-prone 模型（deepseek/glm 等）才发抑制字段
+p_dsc = mod.Provider(name="D", app_type="claude", base_url="https://x.com/v1",
+                     api_key="k", auth_mode="authtoken",
+                     tiers=[mod.ModelTier("default", "deepseek-r1", "deepseek-r1")],
+                     is_current=False, in_failover=False, is_openrouter=False)
+p_dsx = mod.Provider(name="D", app_type="codex", base_url="https://x.com",
+                     api_key="k", auth_mode="bearer",
+                     tiers=[mod.ModelTier("default", "deepseek-reasoner", "deepseek-reasoner")],
+                     is_current=False, in_failover=False, is_openrouter=False)
+p_dso = mod.Provider(name="D", app_type="openclaw", base_url="https://x.com",
+                     api_key="k", auth_mode="bearer",
+                     tiers=[mod.ModelTier("default", "glm-4.6", "glm-4.6")],
+                     is_current=False, in_failover=False, is_openrouter=False)
+_, _, _, b_ds1 = mod.build_probe_request(p_dsc, p_dsc.tiers[0], disable_thinking=True)
+test("claude thinking-prone disable=True -> thinking.type=disabled",
+     json.loads(b_ds1).get("thinking") == {"type": "disabled"})
+_, _, _, b_ds1n = mod.build_probe_request(p_dsc, p_dsc.tiers[0], disable_thinking=False)
+test("claude thinking-prone disable=False -> 无 thinking 字段",
+     "thinking" not in json.loads(b_ds1n))
+_, _, _, b_ds2 = mod.build_probe_request(p_dsx, p_dsx.tiers[0], disable_thinking=True)
+test("codex thinking-prone disable=True -> reasoning.effort=minimal",
+     json.loads(b_ds2).get("reasoning") == {"effort": "minimal"})
+_, _, _, b_ds3 = mod.build_probe_request(p_dso, p_dso.tiers[0], disable_thinking=True)
+test("openclaw thinking-prone disable=True -> reasoning_effort=none",
+     json.loads(b_ds3).get("reasoning_effort") == "none")
+
+# _is_thinking_prone_model 判定
+test("_is_thinking_prone_model: deepseek-r1 -> True",
+     mod._is_thinking_prone_model("deepseek-r1") is True)
+test("_is_thinking_prone_model: glm-4.6 -> True",
+     mod._is_thinking_prone_model("glm-4.6") is True)
+test("_is_thinking_prone_model: claude-sonnet-4-5 -> False",
+     mod._is_thinking_prone_model("claude-sonnet-4-5") is False)
+test("_is_thinking_prone_model: gpt-5 -> False",
+     mod._is_thinking_prone_model("gpt-5") is False)
+
+# _answer_correct 宽松匹配
+test("_answer_correct: 精确 '5'==‘5’", mod._answer_correct("5", "5") is True)
+test("_answer_correct: 话痨 '答案是 13' 提取唯一数字",
+     mod._answer_correct("答案是 13", "13") is True)
+test("_answer_correct: 多个数字不匹配",
+     mod._answer_correct("5 or 6", "5") is False)
+test("_answer_correct: 数字不等",
+     mod._answer_correct("The answer is 7", "5") is False)
 # max_tokens 透传
 _, _, _, b_mt = mod.build_probe_request(p, p.tiers[0], max_tokens=1024)
 test("max_tokens 透传到 body", json.loads(b_mt).get("max_tokens") == 1024)
@@ -360,7 +417,7 @@ class MockAnthropicHandler(BaseHTTPRequestHandler):
                 resp = {
                     "id": "msg_mock", "type": "message", "role": "assistant",
                     "model": "claude-sonnet-4-5",
-                    "content": [{"type": "text", "text": "5"}],
+                    "content": [{"type": "text", "text": _answer_for_body(j)}],
                     "stop_reason": "end_turn",
                     "usage": {"input_tokens": 20, "output_tokens": 3},
                 }
@@ -436,7 +493,7 @@ class MockChatHandler(BaseHTTPRequestHandler):
                 }
             else:
                 resp = {"id": "c1", "object": "chat.completion", "model": "gpt-5",
-                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "5"}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": _answer_for_body(j)}, "finish_reason": "stop"}],
                         "usage": {"prompt_tokens": 8, "completion_tokens": 1}}
             self.wfile.write(json.dumps(resp).encode())
             return
@@ -550,8 +607,9 @@ try:
          j.get("streaming", {}).get("ttft_seconds") is not None)
     test("text.status == pass",
          j.get("text", {}).get("status") == "pass")
-    test("text.answer == 5",
-         j.get("text", {}).get("answer") == "5")
+    test("text.correct is True（问题池随机，宽松匹配）",
+         j.get("text", {}).get("correct") is True,
+         f"text={j.get('text')}")
     test("model_consistency.match == exact_match",
          j.get("model_consistency", {}).get("match") == "exact_match")
     test("summary.verdict == healthy",
@@ -628,7 +686,7 @@ class MockMetadataHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({
                 "id": "msg", "type": "message", "model": "claude-sonnet-4-5",
-                "content": [{"type": "text", "text": "5"}],
+                "content": [{"type": "text", "text": _answer_for_body(j)}],
                 "stop_reason": "end_turn"
             }).encode())
             return
@@ -775,7 +833,10 @@ try:
     j = json.loads(out) if out else {}
     test("check JSON 顶层含 summary", "summary" in j)
     test("check JSON 顶层含 providers", "providers" in j)
-    test("check JSON schema_version == 1", j.get("schema_version") == 1)
+    test("check JSON schema_version == 2", j.get("schema_version") == 2)
+    test("check JSON probe_pool_size == len(PROBE_PROMPTS)",
+         j.get("probe_pool_size") == len(mod.PROBE_PROMPTS))
+    test("check JSON stealth == False（默认）", j.get("stealth") is False)
     test("check JSON providers 至少 1 个", len(j.get("providers", [])) >= 1)
     if j.get("providers"):
         att = j["providers"][0]["attempts"][0]
@@ -808,7 +869,7 @@ try:
     j = json.loads(out) if out else {}
     test("OpenRouter exit 0", rc == 0, f"rc={rc} stderr={err[:200]}")
     test("OpenRouter text.status == pass", j.get("text", {}).get("status") == "pass")
-    test("OpenRouter text.answer == 5", j.get("text", {}).get("answer") == "5")
+    test("OpenRouter text.correct == True", j.get("text", {}).get("correct") is True)
 finally:
     srv.shutdown()
 
@@ -988,12 +1049,19 @@ class MockListedHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404); self.end_headers()
     def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b""
+        try:
+            j = json.loads(body) if body else {}
+        except Exception:
+            j = {}
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps({
             "id": "msg", "type": "message", "model": "claude-sonnet-4-5",
-            "content": [{"type": "text", "text": "5"}], "stop_reason": "end_turn"
+            "content": [{"type": "text", "text": _answer_for_body(j)}],
+            "stop_reason": "end_turn"
         }).encode())
 
 srv, port = start_server(MockListedHandler)
@@ -1152,7 +1220,8 @@ orig_probe_tier = mod.probe_tier
 events = []
 
 def fake_probe_tier(p, tier, timeout, skip_tls_verify, max_tokens=20,
-                    disable_thinking=True, user_agent=None):
+                    disable_thinking=True, user_agent=None,
+                    stainless_version=None, stealth=False):
     # 第 1 档失败，第 2 档成功
     if tier.tier == "haiku":
         return {"tier": "haiku", "model": tier.model, "status": 429,
@@ -1181,6 +1250,103 @@ try:
     test("probe 未探测 opus", len(r["attempts"]) == 2)
 finally:
     mod.probe_tier = orig_probe_tier
+
+
+print("\n[Unit] probe_tier 从问题池抽题 + 宽松校验")
+# 捕获实际发出的问题，验证来自 PROBE_PROMPTS；mock 按题回配对答案
+class PoolCaptureHandler(BaseHTTPRequestHandler):
+    seen_q: list[str] = []
+    def log_message(self, *a, **k): pass
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b""
+        j = json.loads(body) if body else {}
+        ans = _answer_for_body(j)
+        msgs = j.get("messages") or []
+        q = ""
+        if msgs and isinstance(msgs[0], dict):
+            q = msgs[0].get("content") or ""
+        PoolCaptureHandler.seen_q.append(q)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "id": "m", "type": "message", "model": "claude-sonnet-4-5",
+            "content": [{"type": "text", "text": ans}], "stop_reason": "end_turn",
+        }).encode())
+
+srv, port = start_server(PoolCaptureHandler)
+try:
+    PoolCaptureHandler.seen_q = []
+    prov = mod.Provider(name="P", app_type="claude",
+                        base_url=f"http://127.0.0.1:{port}/v1",
+                        api_key="k", auth_mode="authtoken",
+                        tiers=[mod.ModelTier("default", "claude-sonnet-4-5",
+                                             "claude-sonnet-4-5")])
+    _pool_q = {p["q"] for p in mod.PROBE_PROMPTS}
+    # 多跑几次，抽到的问题都应来自池，且都能宽松校验通过
+    oks = []
+    for _ in range(6):
+        r = mod.probe_tier(prov, prov.tiers[0], 3, False)
+        oks.append(r.get("correct"))
+    test("probe_tier 问题均来自 PROBE_PROMPTS",
+         all(q in _pool_q for q in PoolCaptureHandler.seen_q),
+         f"seen={PoolCaptureHandler.seen_q}")
+    test("probe_tier 池内问题宽松校验全通过", all(oks), f"oks={oks}")
+    test("probe_tier 结果记录实际 question",
+         mod.probe_tier(prov, prov.tiers[0], 3, False).get("question") in _pool_q)
+finally:
+    srv.shutdown()
+
+
+print("\n[Unit] --stealth 收敛并发 + 报告标记")
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    rc, out, err = run_cli(["check", "--failover-only", "--json",
+                            "--stealth", "--workers", "8"])
+    j = json.loads(out) if out else {}
+    test("stealth check 退出码 0", rc == 0, f"rc={rc} stderr={err[:200]}")
+    test("stealth JSON stealth==True", j.get("stealth") is True)
+    test("stealth 报告标记隐身模式", "隐身: 开" in err, f"stderr={err[:200]}")
+finally:
+    srv.shutdown()
+# 并发收敛为纯函数逻辑，直接单测（run_cli 固定 --workers 1，无法从 CLI 覆盖）
+test("stealth 收敛 workers=8 -> STEALTH_MAX_WORKERS",
+     min(8, mod.STEALTH_MAX_WORKERS) == mod.STEALTH_MAX_WORKERS)
+test("stealth 不放大 workers=1", min(1, mod.STEALTH_MAX_WORKERS) == 1)
+
+
+print("\n[Unit] --stainless-version 覆盖进指纹头")
+class StainlessCaptureHandler(BaseHTTPRequestHandler):
+    seen: list[str] = []
+    def log_message(self, *a, **k): pass
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b""
+        j = json.loads(body) if body else {}
+        StainlessCaptureHandler.seen.append(
+            self.headers.get("x-stainless-package-version", ""))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "id": "m", "type": "message", "model": "claude-sonnet-4-5",
+            "content": [{"type": "text", "text": _answer_for_body(j)}],
+            "stop_reason": "end_turn",
+        }).encode())
+
+srv, port = start_server(StainlessCaptureHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    StainlessCaptureHandler.seen = []
+    rc, _, err = run_cli(["check", "--failover-only",
+                          "--stainless-version", "0.99.9"])
+    test("--stainless-version 覆盖进 x-stainless-package-version",
+         "0.99.9" in StainlessCaptureHandler.seen,
+         f"seen={StainlessCaptureHandler.seen}")
+finally:
+    srv.shutdown()
 
 
 print("\n[Unit] say() 默认 flush + ANSI 清理")
