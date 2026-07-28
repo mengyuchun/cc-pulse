@@ -193,14 +193,33 @@ function Menu-ListModels {
     Write-Host "  [1] 故障转移队列 + 当前激活"
     Write-Host "  [2] 全部供应商"
     $scope = Read-Host "输入 1-2 (默认1)"
+    Write-Host ""
+    Write-Host "探测模式:" -ForegroundColor Yellow
+    Write-Host "  [1] 只拉列表（默认，最快）"
+    Write-Host "  [2] 轻量探测每个模型（2+3 题）"
+    Write-Host "  [3] 深度探测（text/streaming/metadata/thinking/tools）"
+    $probeMode = Read-Host "输入 1-3 (默认1)"
+    $src = "listed"
+    if ($probeMode -eq "2" -or $probeMode -eq "3") {
+        Write-Host ""
+        Write-Host "探测哪些模型:" -ForegroundColor Yellow
+        Write-Host "  [1] listed     - /v1/models 列表（默认）"
+        Write-Host "  [2] configured - cc-switch 配置档位"
+        Write-Host "  [3] both       - 合并去重"
+        $srcChoice = Read-Host "输入 1-3 (默认1)"
+        $src = switch ($srcChoice) { "2" { "configured" } "3" { "both" } default { "listed" } }
+    }
+    $lmTimeout = if ($probeMode -eq "3") { "60" } else { "30" }
 
     $cmdArgs = [System.Collections.Generic.List[string]]::new()
     $cmdArgs.Add("list-models")
     $cmdArgs.Add("--type"); $cmdArgs.Add($type)
     $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
     $cmdArgs.Add("--workers"); $cmdArgs.Add("6")
-    $cmdArgs.Add("--timeout"); $cmdArgs.Add("30")
+    $cmdArgs.Add("--timeout"); $cmdArgs.Add($lmTimeout)
     if ($scope -ne "2") { $cmdArgs.Add("--failover-only") }
+    if ($probeMode -eq "2") { $cmdArgs.Add("--probe"); $cmdArgs.Add("--source"); $cmdArgs.Add($src) }
+    elseif ($probeMode -eq "3") { $cmdArgs.Add("--deep"); $cmdArgs.Add("--source"); $cmdArgs.Add($src) }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "list-models"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Read-Host "按回车返回主菜单"
@@ -216,17 +235,31 @@ function Menu-Inspect {
     Write-Host ""
 
     Write-Host "[1/3] 选择供应商" -ForegroundColor Yellow
-    Write-Host "  [L] 列出当前所有供应商（按 type=$type）" -ForegroundColor White
-    Write-Host "  [M] 手动输入供应商名" -ForegroundColor White
-    $provChoice = Read-Host "输入 L 或 M（默认 L）"
-    if ($provChoice -eq "M" -or $provChoice -eq "m") {
-        $provider = Read-Host "  供应商名（与 cc-switch 中一致）"
+    Write-Host "正在拉取供应商列表…" -ForegroundColor DarkGray
+    $names = @()
+    try {
+        $rawJson = & $Python -u $MainScript list-models --type $type --db $DB --workers 6 --timeout 20 --json 2>$null
+        $parsed = ($rawJson -join "`n") | ConvertFrom-Json
+        $names = @($parsed.providers | ForEach-Object { $_.name })
+    } catch {
+        $names = @()
+    }
+    $provider = ""
+    if ($names.Count -gt 0) {
+        for ($i = 0; $i -lt $names.Count; $i++) {
+            Write-Host "  [$($i + 1)] $($names[$i])"
+        }
+        $sel = Read-Host "输入序号选择，或直接输入供应商名（默认 1）"
+        if ([string]::IsNullOrWhiteSpace($sel)) {
+            $provider = $names[0]
+        } elseif ($sel -match '^\d+$' -and [int]$sel -ge 1 -and [int]$sel -le $names.Count) {
+            $provider = $names[[int]$sel - 1]
+        } else {
+            $provider = $sel
+        }
     } else {
-        $la = @("list-models", "--type", $type, "--db", $DB,
-                "--workers", "6", "--timeout", "20", "--failover-only")
-        Invoke-Ccpulse -CmdArgs $la | Out-Null
-        Write-Host ""
-        $provider = Read-Host "  供应商名（从上面列表复制）"
+        Write-Host "未能拉取供应商列表，请手动输入。" -ForegroundColor Yellow
+        $provider = Read-Host "  供应商名（与 cc-switch 中一致）"
     }
     if ([string]::IsNullOrWhiteSpace($provider)) {
         Write-Host "未提供供应商名，返回主菜单。" -ForegroundColor Yellow

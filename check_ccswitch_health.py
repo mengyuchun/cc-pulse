@@ -1775,6 +1775,60 @@ def extract_model_ids(resp_body: str) -> list:
     return ids
 
 
+def _collect_models_for_probe(p, fetch_result, source):
+    """按 source 汇总要探测的模型 id 列表（去重保序）。
+
+    configured: cc-switch 里配置的档位模型（p.tiers）
+    listed:     GET /v1/models 返回的模型（fetch_result['models']）
+    both:       两者合并
+    """
+    configured = [t.model for t in p.tiers]
+    listed = fetch_result.get("models", []) if fetch_result.get("status") == 200 else []
+    if source == "configured":
+        picked = configured
+    elif source == "listed":
+        picked = listed if listed else configured  # 拉不到列表则降级
+    else:  # both
+        picked = configured + listed
+    seen = set()
+    out = []
+    for m in picked:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _probe_one_model(p, model_id, args, deep):
+    """对单个模型做轻量或深度探测，返回结构化 dict。
+
+    轻量: 仅 text（probe_tier，2+3 题）
+    深度: text + streaming + metadata + thinking + tools（12356，跳过 context/vision）
+    """
+    mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
+    dt = not getattr(args, "probe_enable_thinking", False)
+    ua = getattr(args, "user_agent", None)
+    to = args.timeout
+    tls = args.skip_tls_verify
+    ip = rebuild_provider_for_inspect(p, model_id)
+    tier = ip.tiers[0]
+
+    text_result, text_raw = _inspect_text(ip, tier, to, tls,
+                                          max_tokens=mt, disable_thinking=dt, user_agent=ua)
+    out = {"model": model_id, "text": text_result}
+    if not deep:
+        return out
+
+    out["streaming"] = probe_stream(ip, tier, to, tls,
+                                    max_tokens=mt, disable_thinking=dt, user_agent=ua)
+    out["metadata"] = probe_model_metadata(ip, re.sub(r"\[.*?\]$", "", model_id),
+                                          to, tls, user_agent=ua)
+    out["thinking"] = _inspect_thinking(ip, tier, text_raw, to, tls,
+                                        max_tokens=mt, user_agent=ua)
+    out["tools"] = _probe_tools(ip, re.sub(r"\[.*?\]$", "", model_id), to, tls, user_agent=ua)
+    return out
+
+
 def run_list_models(args, providers, say) -> int:
     """拉取每个供应商的 /v1/models 模型目录（不进行健康探测）。"""
     if getattr(args, "current_only", False):
@@ -1811,6 +1865,60 @@ def run_list_models(args, providers, say) -> int:
         say(f"\n未返回模型列表的供应商（{len(fail)} 个）:")
         for r in fail:
             say(f"  ❌ {r['name'][:24]:24} [{r['status']}] {r['error']}")
+
+    # --probe / --deep：拉列表后逐模型探测（轻量或深度 12356）
+    probe_reports = []
+    if getattr(args, "probe", False) or getattr(args, "deep", False):
+        deep = getattr(args, "deep", False)
+        source = getattr(args, "source", "listed")
+        result_by_name = {r["name"]: r for r in results}
+        say(f"\n{'='*60}")
+        say(f"探测模式: {'深度(text/streaming/metadata/thinking/tools)' if deep else '轻量(text)'}"
+            f"  来源: {source}")
+        say(f"{'='*60}")
+        for p in providers:
+            fr = result_by_name.get(p.name, {"status": 0, "models": []})
+            model_ids = _collect_models_for_probe(p, fr, source)
+            if not model_ids:
+                say(f"\n■ {p.name}: 无可探测模型（source={source}）")
+                continue
+            say(f"\n■ {p.name}  待探测 {len(model_ids)} 个模型")
+            model_reports = []
+            for j, mid in enumerate(model_ids, 1):
+                rep = _probe_one_model(p, mid, args, deep)
+                model_reports.append(rep)
+                tr = rep["text"]
+                badge = "✅" if tr["status"] == "pass" else (
+                    "⚠" if tr["status"] == "fail" else "❌")
+                line = (f"  [{j:>2}/{len(model_ids)}] {badge} {mid[:32]:32} "
+                        f"[{tr['http_status']}] {tr['elapsed_seconds']}s")
+                if deep:
+                    sm = rep["streaming"].get("status")
+                    tk = rep["thinking"].get("verdict", "?")
+                    to = rep["tools"].get("protocol_support", "?")
+                    line += f"  stream:{sm} think:{tk} tools:{to}"
+                else:
+                    line += f'  "{tr["answer"][:20]}"'
+                say(line)
+            probe_reports.append({"provider": p.name, "app_type": p.app_type,
+                                  "base_url": p.base_url, "models": model_reports})
+
+    if getattr(args, "json", False):
+        report = {
+            "schema_version": 1,
+            "command": "list-models",
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "scope": scope,
+            "type": args_type,
+            "providers": results,
+        }
+        if getattr(args, "probe", False) or getattr(args, "deep", False):
+            report["probe"] = {
+                "deep": getattr(args, "deep", False),
+                "source": getattr(args, "source", "listed"),
+                "reports": probe_reports,
+            }
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     return 0
 
 
@@ -3549,6 +3657,14 @@ def _build_parser():
                       help="只测故障转移队列里的供应商（含当前激活的）")
     p_lm.add_argument("--current-only", action="store_true",
                       help="只测当前激活的供应商（最窄；与 --failover-only 同时设时本项优先）")
+    p_lm.add_argument("--probe", action="store_true",
+                      help="对每个模型发轻量探测（2+3 算术题），验证是否真能用")
+    p_lm.add_argument("--deep", action="store_true",
+                      help="深度探测每个模型（text/streaming/metadata/thinking/tools 五维度；较慢）")
+    p_lm.add_argument("--source", default="listed", choices=["configured", "listed", "both"],
+                      help="探测哪些模型：configured=配置档位 / listed=GET /v1/models / both=合并（默认 listed）")
+    p_lm.add_argument("--json", action="store_true",
+                      help="以 JSON 输出模型目录（含 --probe/--deep 探测结果）")
 
     # inspect：单一模型深度检测
     p_inspect = sub.add_parser("inspect", parents=[common],
