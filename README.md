@@ -196,7 +196,8 @@ python check_ccswitch_health.py check --failover-only --json  # 机器可读
 | 参数 | 说明 | 默认 |
 |------|------|------|
 | `--type claude\|codex\|openclaw\|all` | 检测哪类供应商 | `claude` |
-| `--failover-only` | 只测故障转移队列 + 当前激活 | 关 |
+| `--failover-only` | 只测故障转移队列里的供应商（含当前激活） | 关 |
+| `--current-only` | 只测当前激活的 1 个供应商（最窄；与 `--failover-only` 同时设时本项优先） | 关 |
 | `--json` | stdout 输出结构化 JSON，stderr 保留人类文本 | 关 |
 | `--workers N` | 并发数 | 6 |
 | `--timeout SEC` | 单请求超时秒 | 30 |

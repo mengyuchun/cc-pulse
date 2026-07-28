@@ -1777,7 +1777,12 @@ def extract_model_ids(resp_body: str) -> list:
 
 def run_list_models(args, providers, say) -> int:
     """拉取每个供应商的 /v1/models 模型目录（不进行健康探测）。"""
-    scope = "故障转移队列" if getattr(args, "failover_only", False) else "全部"
+    if getattr(args, "current_only", False):
+        scope = "仅当前激活"
+    elif getattr(args, "failover_only", False):
+        scope = "故障转移队列"
+    else:
+        scope = "全部"
     args_type = getattr(args, "type", "claude")
     say(f"从 {args.db} 加载 {len(providers)} 个供应商 ({scope})")
     say(f"拉取模型列表: GET /v1/models  并发: {args.workers}  超时: {args.timeout}s (type={args_type})\n")
@@ -1817,7 +1822,12 @@ def run_health_check(args, providers, say) -> int:
       - 每个供应商全部档位结束后再打印汇总行
       - say() 默认 flush，配合启动器 -u，避免管道块缓冲导致「全部结束才显示」
     """
-    scope = "故障转移队列" if getattr(args, "failover_only", False) else "全部"
+    if getattr(args, "current_only", False):
+        scope = "仅当前激活"
+    elif getattr(args, "failover_only", False):
+        scope = "故障转移队列"
+    else:
+        scope = "全部"
     _stealth = getattr(args, "stealth", False)
     _workers = min(args.workers, STEALTH_MAX_WORKERS) if _stealth else args.workers
     say(f"从 {args.db} 加载 {len(providers)} 个供应商 ({scope})")
@@ -1912,7 +1922,9 @@ def run_health_check(args, providers, say) -> int:
             "schema_version": 2,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "db_path": args.db,
-            "scope": "failover" if getattr(args, "failover_only", False) else "all",
+            "scope": ("current" if getattr(args, "current_only", False)
+                      else "failover" if getattr(args, "failover_only", False)
+                      else "all"),
             "type": getattr(args, "type", "claude"),
             "probe_question": "randomized",
             "probe_pool_size": len(PROBE_PROMPTS),
@@ -3516,6 +3528,8 @@ def _build_parser():
                          help="检测哪类供应商 (默认: claude)")
     p_check.add_argument("--failover-only", action="store_true",
                          help="只测故障转移队列里的供应商（含当前激活的）")
+    p_check.add_argument("--current-only", action="store_true",
+                         help="只测当前激活的供应商（最窄；与 --failover-only 同时设时本项优先）")
     p_check.add_argument("--stealth", action="store_true",
                          help=f"隐身模式：并发降至≤{STEALTH_MAX_WORKERS} 且每档请求前随机延迟，弱化脚本式流量尖峰（较慢；仅 check）")
     p_check.add_argument("--json", action="store_true",
@@ -3533,6 +3547,8 @@ def _build_parser():
                       help="检测哪类供应商 (默认: claude)")
     p_lm.add_argument("--failover-only", action="store_true",
                       help="只测故障转移队列里的供应商（含当前激活的）")
+    p_lm.add_argument("--current-only", action="store_true",
+                      help="只测当前激活的供应商（最窄；与 --failover-only 同时设时本项优先）")
 
     # inspect：单一模型深度检测
     p_inspect = sub.add_parser("inspect", parents=[common],
@@ -3649,7 +3665,11 @@ def main():
     for t in types:
         providers.extend(load_providers(args.db, t))
 
-    if getattr(args, "failover_only", False) and providers:
+    if getattr(args, "current_only", False) and providers:
+        before = len(providers)
+        providers = [p for p in providers if p.is_current]
+        say(f"--current-only: {before} → {len(providers)}（只保留当前激活）")
+    elif getattr(args, "failover_only", False) and providers:
         before = len(providers)
         providers = [p for p in providers if p.in_failover or p.is_current]
         say(f"--failover-only: {before} → {len(providers)}（只保留队列内+当前激活）")

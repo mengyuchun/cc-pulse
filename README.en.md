@@ -195,7 +195,8 @@ Progress: print each tier as it finishes; print a provider summary when that pro
 | Flag | Meaning | Default |
 |------|---------|---------|
 | `--type claude\|codex\|openclaw\|all` | Provider type | `claude` |
-| `--failover-only` | Only failover queue + current provider | off |
+| `--failover-only` | Only failover queue + current provider |
+| `--current-only` | Only the active provider (narrowest; takes priority over `--failover-only` if both are set) | off |
 | `--json` | Structured JSON on stdout; human text on stderr | off |
 | `--workers N` | Concurrency | 6 |
 | `--timeout SEC` | Per-request timeout seconds | 30 |

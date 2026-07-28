@@ -165,7 +165,8 @@ function Menu-HealthCheckCustom {
     Write-Host "请选择范围:" -ForegroundColor Yellow
     Write-Host "  [1] 只测故障转移队列 + 当前激活  (快)" -ForegroundColor White
     Write-Host "  [2] 测全部供应商                   (完整)" -ForegroundColor White
-    $scope = Read-Host "输入 1-2 (默认1)"
+    Write-Host "  [3] 只测当前激活的 1 个供应商      (最快)" -ForegroundColor White
+    $scope = Read-Host "输入 1-3 (默认1)"
 
     $cmdArgs = [System.Collections.Generic.List[string]]::new()
     $cmdArgs.Add("check")
@@ -173,7 +174,8 @@ function Menu-HealthCheckCustom {
     $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
     $cmdArgs.Add("--workers"); $cmdArgs.Add("8")
     $cmdArgs.Add("--timeout"); $cmdArgs.Add((Get-Timeout))
-    if ($scope -ne "2") { $cmdArgs.Add("--failover-only") }
+    if ($scope -eq "3") { $cmdArgs.Add("--current-only") }
+    elseif ($scope -ne "2") { $cmdArgs.Add("--failover-only") }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Read-Host "按回车返回主菜单"

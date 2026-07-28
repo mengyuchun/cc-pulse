@@ -1214,6 +1214,26 @@ finally:
     srv.shutdown()
 
 
+print("\n[Unit] --current-only provider 过滤")
+P = mod.Provider
+ps = [
+    P("A", "claude", "http://a", "k", "authtoken",
+      [mod.ModelTier("default","x","x")], is_current=False, in_failover=True,  is_openrouter=False),
+    P("B", "claude", "http://b", "k", "authtoken",
+      [mod.ModelTier("default","x","x")], is_current=True,  in_failover=True,  is_openrouter=False),
+    P("C", "claude", "http://c", "k", "authtoken",
+      [mod.ModelTier("default","x","x")], is_current=False, in_failover=False, is_openrouter=False),
+]
+def fs(cur, fo):
+    if cur: return [p.name for p in ps if p.is_current]
+    if fo: return [p.name for p in ps if p.in_failover or p.is_current]
+    return [p.name for p in ps]
+test("全部 → A,B,C", fs(False, False) == ["A","B","C"])
+test("--failover-only → A,B", fs(False, True) == ["A","B"])
+test("--current-only → B", fs(True, False) == ["B"])
+test("current 优先于 failover", fs(True, True) == ["B"])
+
+
 print("\n[Unit] probe on_attempt 档位级进度回调")
 # 不依赖网络：用假 probe_tier 替换验证回调顺序
 orig_probe_tier = mod.probe_tier
