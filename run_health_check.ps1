@@ -37,6 +37,9 @@ $script:AdvEnableThinking = $false
 $script:AdvUserAgent = ""
 $script:AdvProbeContext = "512k"   # inspect 无声明窗口时的上下文冒烟：512k | 1m
 $script:AdvVision = $false        # inspect 是否附带 vision
+$script:AdvStealth = $false       # check 隐身模式：降并发 + 请求间随机延迟
+$script:AdvType = "claude"        # check 默认供应商类型：claude/codex/openclaw/all
+$script:AdvScope = "failover"     # check 默认范围：failover(队列+当前) / all(全部)
 
 function Show-Banner {
     param([string]$Title = "CC-Pulse · cc-switch 供应商健康检测与单模型深度诊断")
@@ -78,6 +81,8 @@ function Apply-AdvancedArgs {
     )
     # --json 只有 check 子命令支持
     if ($script:AdvJson -and $SubCommand -eq "check") { $CmdArgs.Add("--json") }
+    # --stealth 只对 check 生效（降并发 + 随机延迟，弱化流量尖峰）
+    if ($script:AdvStealth -and $SubCommand -eq "check") { $CmdArgs.Add("--stealth") }
     # --probe-max-tokens / --probe-enable-thinking 只有 check 和 inspect 用得到
     $probeCmds = @("check", "inspect")
     if ($probeCmds -contains $SubCommand) {
@@ -130,18 +135,20 @@ function Get-Timeout {
     if ($env:CC_PULSE_TIMEOUT) { return $env:CC_PULSE_TIMEOUT } else { return "45" }
 }
 
-# ── [1] 健康检测 · 快速体检（零子提示） ──────────────────────────
+# ── [1] 健康检测 · 快速体检（读高级设置里的类型/范围，默认 claude/队列） ──
 function Menu-HealthCheckQuick {
-    if (-not (Show-Banner "健康检测 · 快速体检（claude / 故障转移队列）")) {
+    $typeLabel = $script:AdvType
+    $scopeLabel = if ($script:AdvScope -eq "all") { "全部" } else { "队列+当前" }
+    if (-not (Show-Banner "健康检测 · 快速体检（$typeLabel / $scopeLabel）")) {
         Read-Host "按回车返回主菜单"; return 1
     }
     $cmdArgs = [System.Collections.Generic.List[string]]::new()
     $cmdArgs.Add("check")
-    $cmdArgs.Add("--type"); $cmdArgs.Add("claude")
+    $cmdArgs.Add("--type"); $cmdArgs.Add($script:AdvType)
     $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
     $cmdArgs.Add("--workers"); $cmdArgs.Add("8")
     $cmdArgs.Add("--timeout"); $cmdArgs.Add((Get-Timeout))
-    $cmdArgs.Add("--failover-only")
+    if ($script:AdvScope -ne "all") { $cmdArgs.Add("--failover-only") }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Read-Host "按回车返回主菜单"
@@ -329,11 +336,14 @@ function Menu-AdvancedSettings {
     Show-Banner "高级设置（本进程有效，重开需重设）" | Out-Null
     Write-Host "当前设置:" -ForegroundColor Gray
     Write-Host "  JSON 输出:        $(if ($script:AdvJson) {'开'} else {'关（默认）'})" -ForegroundColor Gray
-    Write-Host "  probe-max-tokens: $(if ($script:AdvMaxTokens) {$script:AdvMaxTokens} else {'20（默认）'})" -ForegroundColor Gray
+    Write-Host "  probe-max-tokens: $(if ($script:AdvMaxTokens) {$script:AdvMaxTokens} else {'1024（默认）'})" -ForegroundColor Gray
     Write-Host "  允许 thinking:    $(if ($script:AdvEnableThinking) {'开'} else {'关（默认）'})" -ForegroundColor Gray
     Write-Host "  user-agent:       $(if ($script:AdvUserAgent) {$script:AdvUserAgent} else {'本机版本（默认）'})" -ForegroundColor Gray
     Write-Host "  上下文档位:       $($script:AdvProbeContext)（inspect 无声明时冒烟）" -ForegroundColor Gray
     Write-Host "  vision 探测:      $(if ($script:AdvVision) {'开'} else {'关（默认）'})" -ForegroundColor Gray
+    Write-Host "  stealth 隐身:     $(if ($script:AdvStealth) {'开'} else {'关（默认）'})" -ForegroundColor Gray
+    Write-Host "  快速体检类型:     $($script:AdvType)" -ForegroundColor Gray
+    Write-Host "  快速体检范围:     $(if ($script:AdvScope -eq 'all') {'全部'} else {'队列+当前（默认）'})" -ForegroundColor Gray
     Write-Host ""
     Write-Host "回车保留当前值。" -ForegroundColor DarkGray
     Write-Host ""
@@ -342,7 +352,7 @@ function Menu-AdvancedSettings {
     if (-not [string]::IsNullOrWhiteSpace($j)) {
         $script:AdvJson = ($j -eq "y" -or $j -eq "Y")
     }
-    $mt = Read-Host "probe-max-tokens（留空=20；thinking 模型可填 1024）"
+    $mt = Read-Host "probe-max-tokens（留空=1024；thinking 模型可调高）"
     if (-not [string]::IsNullOrWhiteSpace($mt)) { $script:AdvMaxTokens = $mt }
     $th = Read-Host "允许 thinking？(y/N)"
     if (-not [string]::IsNullOrWhiteSpace($th)) {
@@ -363,9 +373,33 @@ function Menu-AdvancedSettings {
     if (-not [string]::IsNullOrWhiteSpace($vi)) {
         $script:AdvVision = ($vi -eq "y" -or $vi -eq "Y")
     }
+    $st = Read-Host "check 开启 stealth 隐身？(y/N)"
+    if (-not [string]::IsNullOrWhiteSpace($st)) {
+        $script:AdvStealth = ($st -eq "y" -or $st -eq "Y")
+    }
+    Write-Host "  快速体检类型: [1] claude(默认) [2] codex [3] openclaw [4] all" -ForegroundColor Yellow
+    $ty = Read-Host "输入 1-4（留空保留 $($script:AdvType)）"
+    if (-not [string]::IsNullOrWhiteSpace($ty)) {
+        switch ($ty.Trim()) {
+            "1" { $script:AdvType = "claude" }
+            "2" { $script:AdvType = "codex" }
+            "3" { $script:AdvType = "openclaw" }
+            "4" { $script:AdvType = "all" }
+            default { Write-Host "  无效类型 '$ty'，保留 $($script:AdvType)" -ForegroundColor Yellow }
+        }
+    }
+    Write-Host "  快速体检范围: [1] 队列+当前(默认,快) [2] 全部(完整)" -ForegroundColor Yellow
+    $sc = Read-Host "输入 1-2（留空保留 $(if ($script:AdvScope -eq 'all') {'全部'} else {'队列+当前'})）"
+    if (-not [string]::IsNullOrWhiteSpace($sc)) {
+        switch ($sc.Trim()) {
+            "1" { $script:AdvScope = "failover" }
+            "2" { $script:AdvScope = "all" }
+            default { Write-Host "  无效范围 '$sc'，保留 $($script:AdvScope)" -ForegroundColor Yellow }
+        }
+    }
 
     Write-Host ""
-    Write-Host "已保存。JSON/max-tokens/thinking/UA 作用于 check/inspect；上下文档位与 vision 仅 inspect。" -ForegroundColor Green
+    Write-Host "已保存。JSON/stealth/max-tokens/thinking/UA 作用于 check(及 inspect)；类型/范围作用于快速体检；上下文档位与 vision 仅 inspect。" -ForegroundColor Green
     Read-Host "按回车返回主菜单"
 }
 
@@ -378,7 +412,7 @@ function Show-MainMenu {
     Write-Host "  [3] 拉模型列表            GET /v1/models 目录"
     Write-Host "  [4] 深度诊断 (inspect)    单一 (provider, model)"
     Write-Host "  [5] 运行日志              失败/统计/路由/实时监控" -ForegroundColor White
-    Write-Host "  [6] 高级设置              JSON/thinking/UA/max-tokens/context/vision"
+    Write-Host "  [6] 高级设置              JSON/stealth/thinking/UA/类型/范围"
     Write-Host "  [7] 退出" -ForegroundColor White
     Write-Host ""
     return (Read-Host "输入 1-7 (默认1)")
