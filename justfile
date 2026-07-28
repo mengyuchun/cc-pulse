@@ -28,6 +28,18 @@ models:
 models-all:
     {{PYTHON}} {{SCRIPT}} list-models
 
+# 拉列表 + 轻量探测每个模型（2+3 题验证真实可用）
+models-probe:
+    {{PYTHON}} {{SCRIPT}} list-models --failover-only --probe
+
+# 拉列表 + 轻量探测全部供应商（configured + listed 合并）
+models-probe-all:
+    {{PYTHON}} {{SCRIPT}} list-models --probe --source both
+
+# 拉列表 + 深度探测每个模型（text/streaming/metadata/thinking/tools）
+models-deep:
+    {{PYTHON}} {{SCRIPT}} list-models --failover-only --deep --timeout 60
+
 # 最近失败日志
 history-fails:
     {{PYTHON}} {{SCRIPT}} history --fails --limit 30

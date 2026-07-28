@@ -823,6 +823,85 @@ finally:
     srv.shutdown()
 
 
+print("\n[End-to-end] list-models --probe 轻量探测每个模型")
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    rc, out, err = run_cli(["list-models", "--probe", "--json"])
+    j = json.loads(out) if out else {}
+    test("list-models --probe 退出码 0", rc == 0, f"rc={rc} stderr={err[:200]}")
+    reports = (j.get("probe") or {}).get("reports") or []
+    test("list-models --probe probe.reports 非空", len(reports) > 0,
+         f"reports={reports}")
+    models = [m for rep in reports for m in rep.get("models", [])]
+    test("list-models --probe 每个模型有 text 维度",
+         len(models) > 0 and all("text" in m for m in models),
+         f"models={models}")
+    test("list-models --probe 轻量不含 streaming 维度",
+         all("streaming" not in m for m in models))
+    test("list-models --probe deep 标记为 False",
+         (j.get("probe") or {}).get("deep") is False)
+finally:
+    srv.shutdown()
+
+
+print("\n[End-to-end] list-models --deep 深度探测（12356 五维度）")
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    rc, out, err = run_cli(["list-models", "--deep", "--json"], timeout=30)
+    j = json.loads(out) if out else {}
+    test("list-models --deep 退出码 0", rc == 0, f"rc={rc} stderr={err[:200]}")
+    reports = (j.get("probe") or {}).get("reports") or []
+    models = [m for rep in reports for m in rep.get("models", [])]
+    test("list-models --deep 非空", len(models) > 0, f"models={len(models)}")
+    test("list-models --deep 含 5 维度 text/streaming/metadata/thinking/tools",
+         all(all(k in m for k in ("text", "streaming", "metadata", "thinking", "tools"))
+             for m in models),
+         f"keys={[list(m.keys()) for m in models]}")
+    test("list-models --deep 跳过 context/vision",
+         all("context" not in m and "vision" not in m for m in models))
+    test("list-models --deep deep 标记为 True",
+         (j.get("probe") or {}).get("deep") is True)
+finally:
+    srv.shutdown()
+
+
+print("\n[End-to-end] list-models --probe --source 三态（configured/listed/both）")
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    # configured：仅 cc-switch 配置档位（haiku + sonnet）
+    rc, out, _ = run_cli(["list-models", "--probe", "--source", "configured", "--json", "--timeout", "15"], timeout=30)
+    j = json.loads(out) if out else {}
+    cfg_models = [m["model"] for rep in (j.get("probe") or {}).get("reports", [])
+                  for m in rep.get("models", [])]
+    test("--source configured 只测配置档位",
+         set(cfg_models) == {"claude-haiku-4-5", "claude-sonnet-4-5"},
+         f"cfg_models={cfg_models}")
+    # listed：仅 /v1/models 返回（sonnet + haiku 3-5）
+    rc, out, _ = run_cli(["list-models", "--probe", "--source", "listed", "--json", "--timeout", "15"], timeout=30)
+    j = json.loads(out) if out else {}
+    listed_models = [m["model"] for rep in (j.get("probe") or {}).get("reports", [])
+                     for m in rep.get("models", [])]
+    test("--source listed 测 /v1/models 列表",
+         set(listed_models) == {"claude-3-5-sonnet", "claude-3-5-haiku"},
+         f"listed_models={listed_models}")
+    # both：合并去重
+    rc, out, _ = run_cli(["list-models", "--probe", "--source", "both", "--json", "--timeout", "15"], timeout=30)
+    j = json.loads(out) if out else {}
+    both_models = [m["model"] for rep in (j.get("probe") or {}).get("reports", [])
+                   for m in rep.get("models", [])]
+    test("--source both 合并两者",
+         set(both_models) == {"claude-haiku-4-5", "claude-sonnet-4-5",
+                              "claude-3-5-sonnet", "claude-3-5-haiku"},
+         f"both_models={both_models}")
+    test("--source both 去重保序（无重复）",
+         len(both_models) == len(set(both_models)))
+finally:
+    srv.shutdown()
+
+
 print("\n[End-to-end] check 子命令 JSON 模式")
 # 准备一个真实场景：用 Mock-Provider
 srv, port = start_server(MockAnthropicHandler)

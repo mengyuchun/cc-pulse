@@ -151,7 +151,11 @@ function Menu-HealthCheckQuick {
     if ($script:AdvScope -ne "all") { $cmdArgs.Add("--failover-only") }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-    Read-Host "按回车返回主菜单"
+    Write-Host ""
+    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
+    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择"
+    if ($again -eq "1") { return (Menu-HealthCheckQuick) }
     return $code
 }
 
@@ -178,7 +182,11 @@ function Menu-HealthCheckCustom {
     elseif ($scope -ne "2") { $cmdArgs.Add("--failover-only") }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-    Read-Host "按回车返回主菜单"
+    Write-Host ""
+    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
+    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择"
+    if ($again -eq "1") { return (Menu-HealthCheckCustom) }
     return $code
 }
 
@@ -222,7 +230,11 @@ function Menu-ListModels {
     elseif ($probeMode -eq "3") { $cmdArgs.Add("--deep"); $cmdArgs.Add("--source"); $cmdArgs.Add($src) }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "list-models"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-    Read-Host "按回车返回主菜单"
+    Write-Host ""
+    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
+    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择"
+    if ($again -eq "1") { return (Menu-ListModels) }
     return $code
 }
 
@@ -267,17 +279,42 @@ function Menu-Inspect {
     }
     Write-Host ""
 
-    Write-Host "[2/3] 选择模型来源" -ForegroundColor Yellow
-    Write-Host "  [1] configured  - cc-switch 已配置的模型档位（默认）" -ForegroundColor White
-    Write-Host "  [2] listed      - 先拉 /v1/models 再查找"
-    Write-Host "  [3] manual      - 强制使用下面的 model id"
-    $sc = Read-Host "输入 1-3 (默认1)"
-    $source = switch ($sc) { "2" { "listed" } "3" { "manual" } default { "configured" } }
-    Write-Host ""
-
-    Write-Host "[3/3] 输入模型 ID" -ForegroundColor Yellow
-    Write-Host "  例如: claude-sonnet-4-5 / claude-haiku-4-5 / gpt-5" -ForegroundColor Gray
-    $model = Read-Host "  模型 ID"
+    Write-Host "[2/3] 选择模型（配置档位优先，其余来自 /v1/models）" -ForegroundColor Yellow
+    $curProv = if ($parsed) { $parsed.providers | Where-Object { $_.name -eq $provider } | Select-Object -First 1 } else { $null }
+    $modelChoices = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    if ($curProv) {
+        foreach ($cm in @($curProv.configured_models)) {
+            if ($cm -and $cm.model -and -not $seen.ContainsKey($cm.model)) {
+                $seen[$cm.model] = $true
+                $modelChoices.Add([pscustomobject]@{ id = $cm.model; label = "[$($cm.tier) 档位]" })
+            }
+        }
+        foreach ($mid in @($curProv.models)) {
+            if ($mid -and -not $seen.ContainsKey($mid)) {
+                $seen[$mid] = $true
+                $modelChoices.Add([pscustomobject]@{ id = $mid; label = "" })
+            }
+        }
+    }
+    if ($modelChoices.Count -gt 0) {
+        for ($i = 0; $i -lt $modelChoices.Count; $i++) {
+            $mc = $modelChoices[$i]
+            $lab = if ($mc.label) { "  $($mc.label)" } else { "" }
+            Write-Host ("  [{0}] {1}{2}" -f ($i + 1), $mc.id, $lab)
+        }
+        $msel = Read-Host "输入序号选择，或直接输入模型 ID（默认 1）"
+        if ([string]::IsNullOrWhiteSpace($msel)) {
+            $model = $modelChoices[0].id
+        } elseif ($msel -match '^\d+$' -and [int]$msel -ge 1 -and [int]$msel -le $modelChoices.Count) {
+            $model = $modelChoices[[int]$msel - 1].id
+        } else {
+            $model = $msel
+        }
+    } else {
+        Write-Host "  （未获取到模型列表，请手动输入）" -ForegroundColor Yellow
+        $model = Read-Host "  模型 ID"
+    }
     if ([string]::IsNullOrWhiteSpace($model)) {
         Write-Host "未提供模型 ID，返回主菜单。" -ForegroundColor Yellow
         Read-Host "按回车"; return 1
@@ -287,6 +324,7 @@ function Menu-Inspect {
         $k = Read-Host "  模型 ID 含 [1M] 后缀，保留？(y/N)"
         if ($k -eq "y" -or $k -eq "Y") { $keepSuffix = $true }
     }
+    $source = "manual"
     Write-Host ""
 
     $cmdArgs = [System.Collections.Generic.List[string]]::new()
@@ -303,7 +341,11 @@ function Menu-Inspect {
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "inspect"
 
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-    Read-Host "按回车返回主菜单"
+    Write-Host ""
+    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
+    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择"
+    if ($again -eq "1") { return (Menu-Inspect) }
     return $code
 }
 
@@ -362,7 +404,11 @@ function Menu-Logs {
             $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
     }
-    Read-Host "按回车返回主菜单"
+    Write-Host ""
+    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
+    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择"
+    if ($again -eq "1") { return (Menu-Logs) }
     return 0
 }
 

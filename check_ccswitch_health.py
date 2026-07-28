@@ -1904,6 +1904,12 @@ def run_list_models(args, providers, say) -> int:
                                   "base_url": p.base_url, "models": model_reports})
 
     if getattr(args, "json", False):
+        # 给每个 provider 附配置档位（带档位名），供启动器标注「[haiku 档位]」
+        by_name = {p.name: p for p in providers}
+        for r in results:
+            r["configured_models"] = ([{"tier": t.tier, "model": t.model}
+                                       for t in by_name[r["name"]].tiers]
+                                      if r["name"] in by_name else [])
         report = {
             "schema_version": 1,
             "command": "list-models",
