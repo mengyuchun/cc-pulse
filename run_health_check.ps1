@@ -399,7 +399,7 @@ function Menu-AdvancedSettings {
     }
 
     Write-Host ""
-    Write-Host "已保存。JSON/stealth/max-tokens/thinking/UA 作用于 check(及 inspect)；类型/范围作用于快速体检；上下文档位与 vision 仅 inspect。" -ForegroundColor Green
+    Write-Host "已保存。JSON/stealth/max-tokens/thinking/UA 作用于 check；类型/范围作用于快速体检；上下文档位与 vision 仅 inspect。" -ForegroundColor Green
     Read-Host "按回车返回主菜单"
 }
 

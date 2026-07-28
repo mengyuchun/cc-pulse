@@ -3499,8 +3499,6 @@ def _build_parser():
                         help=f"探测请求 max_tokens 预算（默认 {PROBE_MAX_TOKENS}，自然值；这是上限非实际消耗）")
     common.add_argument("--probe-enable-thinking", action="store_true",
                         help="允许探测请求走 thinking 模式（默认禁用，避免 DeepSeek 等 thinking 模型耗光 max_tokens）")
-    common.add_argument("--stealth", action="store_true",
-                        help=f"隐身模式：并发降至≤{STEALTH_MAX_WORKERS} 且每档请求前随机延迟，弱化脚本式流量尖峰（较慢）")
     common.add_argument("--stainless-version", default=None,
                         help="覆盖 x-stainless-package-version 指纹头（无法从 claude --version 推导 SDK 版本）")
 
@@ -3518,6 +3516,8 @@ def _build_parser():
                          help="检测哪类供应商 (默认: claude)")
     p_check.add_argument("--failover-only", action="store_true",
                          help="只测故障转移队列里的供应商（含当前激活的）")
+    p_check.add_argument("--stealth", action="store_true",
+                         help=f"隐身模式：并发降至≤{STEALTH_MAX_WORKERS} 且每档请求前随机延迟，弱化脚本式流量尖峰（较慢；仅 check）")
     p_check.add_argument("--json", action="store_true",
                          help="输出结构化 JSON 报告到 stdout（人类可读文本保留到 stderr）")
     p_check.add_argument("--with-history", action="store_true",
