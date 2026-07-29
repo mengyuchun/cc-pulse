@@ -368,6 +368,16 @@ class MockAnthropicHandler(BaseHTTPRequestHandler):
                 "capabilities": {"thinking": {"supported": True}},
             }).encode())
             return
+        # 模型列表：与配置档位（claude-*-4-5）故意不同，用于区分 --source listed/configured
+        if self.path.rstrip("/").endswith("/v1/models"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"data": [
+                {"id": "claude-3-5-sonnet"},
+                {"id": "claude-3-5-haiku"},
+            ]}).encode())
+            return
         self.send_response(404); self.end_headers()
 
     def do_POST(self):

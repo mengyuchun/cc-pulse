@@ -118,22 +118,20 @@ combined = out + err
 test("输出含 '拉模型' 标识", "拉模型" in combined or "list-models" in combined)
 
 
-print("\n[PS1] inspect - 选项 4 -> 精简 3 步交互")
-# 主菜单4 -> type默认 -> M手动 -> provider -> source1 -> model -> 回车返回 -> 6退出
+print("\n[PS1] inspect - 选项 4 -> 精简 2 步交互")
+# 主菜单4 -> type默认 -> provider(直接输名) -> model(直接输 ID) -> 回车返回 -> 7退出
 stdin_text = (
     "4\n"                 # 主菜单: inspect
     "\n"                  # type: 默认 claude
-    "M\n"                 # 手动输入 provider
-    "Mock-Provider\n"     # provider 名
-    "1\n"                 # source: configured
-    "claude-haiku-4-5\n"  # model
+    "Mock-Provider\n"     # provider：直接输名（非序号）
+    "claude-haiku-4-5\n"  # model：直接输 ID
     "\n"                  # 返回主菜单
     "7\n"                 # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=180)
 combined = out + err
 test("退出码 0 或 1 或 2", rc in (0, 1, 2), f"rc={rc} stderr_tail={err[-300:]}")
-test("输出含 inspect 三步", "1/3" in combined and "2/3" in combined and "3/3" in combined)
+test("输出含 inspect 两步", "1/2" in combined and "2/2" in combined)
 test("输出含 Provider 提示", "Provider" in combined or "Mock-Provider" in combined)
 test("输出含模型名", "claude-haiku-4-5" in combined)
 test("输出含 inspect 结果",
@@ -162,13 +160,13 @@ print("\n[PS1] 高级设置端到端：开启 JSON 后快速体检输出 JSON")
 # [6] 开启 JSON -> 其余默认回车 -> [1] 快速体检 -> [6] 退出
 stdin_text = (
     "6\n"           # 主菜单: 高级设置
-    "\n"            # stealth: 默认关
     "y\n"           # JSON 输出: 开
     "\n"            # max-tokens: 默认
     "\n"            # thinking: 默认
     "\n"            # user-agent: 默认
     "\n"            # context: 默认 512k
     "\n"            # vision: 默认关
+    "\n"            # stealth: 默认关
     "\n"            # 默认类型: claude
     "\n"            # 默认范围: 队列
     "\n"            # 回车返回主菜单
@@ -186,23 +184,23 @@ test("stdout 含 JSON 报告", '"schema_version"' in combined or '"providers"' i
 print("\n[PS1] 高级设置：上下文档位 1m + vision 后 inspect 带参")
 # 高级设置设 1m + vision，再跑 inspect（手动 provider），检查命令行含新参数
 stdin_text = (
+    # 高级设置提问顺序：JSON→max-tokens→thinking→UA→context→vision→stealth→type→scope
     "6\n"
-    "\n"            # stealth 默认关
     "\n"            # JSON 默认
     "\n"            # max-tokens
     "\n"            # thinking
     "\n"            # UA
     "1m\n"          # context 1m
     "y\n"           # vision 开
+    "\n"            # stealth 默认关
     "\n"            # 默认类型: claude
     "\n"            # 默认范围: 队列
     "\n"            # 返回主菜单
+    # inspect：type → provider(序号/名) → model(序号/名)
     "4\n"           # inspect
     "\n"            # type 默认 claude
-    "M\n"           # 手动 provider
-    "Mock-Provider\n"
-    "1\n"           # source configured
-    "claude-haiku-4-5\n"
+    "Mock-Provider\n"  # provider 名（直接输名，非序号）
+    "claude-haiku-4-5\n"  # model ID
     "\n"            # 返回主菜单
     "7\n"
 )

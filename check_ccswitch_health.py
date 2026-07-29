@@ -3591,46 +3591,79 @@ def format_history_sidebar(db_path: str, provider_name: str, since: str = "24h")
             f" 主因={cat} 中位延迟={med} 路由≠{mm}")
 
 
+SUBCOMMANDS = ("check", "list-models", "inspect", "history", "stats", "routing",
+               "watch", "analyze")
+# 主解析器上带值的全局选项：扫描子命令时要连它的值一起跳过，
+# 否则 `--db list-models` 这类会把选项的值误认成子命令。
+_GLOBAL_VALUE_OPTS = ("--db", "--timeout", "--workers", "--user-agent",
+                      "--stainless-version")
+
+
 def _inject_default_command(argv: list[str]) -> list[str]:
     """无子命令时注入 check，兼容文档中的「可省略 check」用法。
 
+    只看 argv[1] 不够：全局选项可以写在子命令前面，
+    `--timeout 5 list-models` 的 argv[1] 是选项，但子命令确实存在。
+    因此要跳过前导的全局选项（含其值）再判断。
+
     例：
-      prog --failover-only  →  prog check --failover-only
-      prog                  →  prog check
+      prog --failover-only            →  prog check --failover-only
+      prog --timeout 5 list-models    →  原样返回（子命令已存在）
+      prog                            →  prog check
     """
-    known = {"check", "list-models", "inspect", "history", "stats", "routing", "watch",
-             "analyze", "-h", "--help"}
     if len(argv) <= 1:
         return argv + ["check"]
-    head = argv[1]
-    if head in known:
-        return argv
-    # 以 - 开头的选项 → 默认 check 子命令
-    if head.startswith("-"):
-        return [argv[0], "check"] + argv[1:]
-    return argv
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok in SUBCOMMANDS or tok in ("-h", "--help"):
+            return argv          # 子命令已存在，不注入
+        if tok in _GLOBAL_VALUE_OPTS:
+            i += 2               # 跳过选项及其值
+            continue
+        if tok.startswith("-"):
+            i += 1               # 开关型选项或 --opt=value
+            continue
+        return argv              # 位置参数但不是已知子命令，交给 argparse 报错
+    # 全程只有全局选项，没有子命令 → 注入 check
+    return [argv[0], "check"] + argv[1:]
+
+
+def _make_common(suppress_defaults: bool):
+    """公共选项。子解析器版用 SUPPRESS 作 default，避免覆盖主解析器已解析的前置值。
+
+    全局选项可写在子命令前（`--timeout 5 check`）或后（`check --timeout 5`）。
+    两处都带 default 时，子解析器会用自己的 default 盖掉前置传入的值，
+    造成 `--timeout 5 check` 静默失效；子解析器改用 SUPPRESS 后只在显式传参时赋值。
+    """
+    def dflt(v):
+        return argparse.SUPPRESS if suppress_defaults else v
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--db", default=dflt(DB_PATH), help=f"cc-switch.db 路径 (默认: {DB_PATH})")
+    common.add_argument("--skip-tls-verify", action="store_true", default=dflt(False),
+                        help="危险：跳过 TLS 证书验证，仅用于信任的自签名中转站")
+    common.add_argument("--timeout", type=int, default=dflt(30), help="单请求超时秒 (默认: 30)")
+    common.add_argument("--workers", type=int, default=dflt(6), help="并发数 (默认: 6)")
+    common.add_argument("--user-agent", default=dflt(None),
+                        help="覆盖 User-Agent（默认用本机 claude --version 探测的版本）")
+    # 注意：--probe-max-tokens / --probe-enable-thinking 故意不放进 common。
+    # common 会被主解析器继承，若把这两个加进去，主解析器会跟 list-models 的
+    # --probe 撞前缀歧义（--probe could match --probe-max-tokens, --probe-enable-thinking）。
+    # 这两个选项只对 check/inspect/list-models 有意义，挂在各子解析器上即可。
+    common.add_argument("--stainless-version", default=dflt(None),
+                        help="覆盖 x-stainless-package-version 指纹头（无法从 claude --version 推导 SDK 版本）")
+    return common
 
 
 def _build_parser():
     """构造 argparse，公共选项 + 三个子命令：check / list-models / inspect。"""
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--db", default=DB_PATH, help=f"cc-switch.db 路径 (默认: {DB_PATH})")
-    common.add_argument("--skip-tls-verify", action="store_true",
-                        help="危险：跳过 TLS 证书验证，仅用于信任的自签名中转站")
-    common.add_argument("--timeout", type=int, default=30, help="单请求超时秒 (默认: 30)")
-    common.add_argument("--workers", type=int, default=6, help="并发数 (默认: 6)")
-    common.add_argument("--user-agent", default=None,
-                        help="覆盖 User-Agent（默认用本机 claude --version 探测的版本）")
-    common.add_argument("--probe-max-tokens", type=int, default=PROBE_MAX_TOKENS,
-                        help=f"探测请求 max_tokens 预算（默认 {PROBE_MAX_TOKENS}，自然值；这是上限非实际消耗）")
-    common.add_argument("--probe-enable-thinking", action="store_true",
-                        help="允许探测请求走 thinking 模式（默认禁用，避免 DeepSeek 等 thinking 模型耗光 max_tokens）")
-    common.add_argument("--stainless-version", default=None,
-                        help="覆盖 x-stainless-package-version 指纹头（无法从 claude --version 推导 SDK 版本）")
+    common = _make_common(suppress_defaults=True)    # 子解析器共用
+    root_common = _make_common(suppress_defaults=False)  # 主解析器，提供真实默认值
 
     ap = argparse.ArgumentParser(
         description="CC-Pulse：cc-switch 供应商健康检测与单模型深度诊断",
-        parents=[common],
+        parents=[root_common],
     )
     sub = ap.add_subparsers(dest="command")
 
@@ -3652,6 +3685,11 @@ def _build_parser():
                          help="每个供应商探测结果后附加 cc-switch 近 24h 日志摘要")
     p_check.add_argument("--history-since", default="24h",
                          help="--with-history 时间窗口（默认 24h；如 7d / 30m）")
+    # 探测 token 预算：故意挂在 check 子解析器，不放 common（见 common 定义处说明）
+    p_check.add_argument("--probe-max-tokens", type=int, default=PROBE_MAX_TOKENS,
+                         help=f"探测请求 max_tokens 预算（默认 {PROBE_MAX_TOKENS}，自然值；这是上限非实际消耗）")
+    p_check.add_argument("--probe-enable-thinking", action="store_true",
+                         help="允许探测请求走 thinking 模式（默认禁用，避免 DeepSeek 等 thinking 模型耗光 max_tokens）")
 
     # list-models：拉取供应商 /v1/models
     p_lm = sub.add_parser("list-models", parents=[common],
@@ -3671,6 +3709,10 @@ def _build_parser():
                       help="探测哪些模型：configured=配置档位 / listed=GET /v1/models / both=合并（默认 listed）")
     p_lm.add_argument("--json", action="store_true",
                       help="以 JSON 输出模型目录（含 --probe/--deep 探测结果）")
+    p_lm.add_argument("--probe-max-tokens", type=int, default=PROBE_MAX_TOKENS,
+                      help=f"探测请求 max_tokens 预算（默认 {PROBE_MAX_TOKENS}，自然值；这是上限非实际消耗）")
+    p_lm.add_argument("--probe-enable-thinking", action="store_true",
+                      help="允许探测请求走 thinking 模式（默认禁用，避免 DeepSeek 等 thinking 模型耗光 max_tokens）")
 
     # inspect：单一模型深度检测
     p_inspect = sub.add_parser("inspect", parents=[common],
@@ -3704,6 +3746,10 @@ def _build_parser():
                            help="报告中附加该供应商近 24h 日志摘要")
     p_inspect.add_argument("--history-since", default="24h",
                            help="--with-history 时间窗口（默认 24h）")
+    p_inspect.add_argument("--probe-max-tokens", type=int, default=PROBE_MAX_TOKENS,
+                           help=f"探测请求 max_tokens 预算（默认 {PROBE_MAX_TOKENS}，自然值；这是上限非实际消耗）")
+    p_inspect.add_argument("--probe-enable-thinking", action="store_true",
+                           help="允许探测请求走 thinking 模式（默认禁用，避免 DeepSeek 等 thinking 模型耗光 max_tokens）")
 
     # history / stats / routing：只读日志，不发 HTTP
     p_hist = sub.add_parser("history", parents=[common],

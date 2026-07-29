@@ -83,8 +83,8 @@ function Apply-AdvancedArgs {
     if ($script:AdvJson -and $SubCommand -eq "check") { $CmdArgs.Add("--json") }
     # --stealth 只对 check 生效（降并发 + 随机延迟，弱化流量尖峰）
     if ($script:AdvStealth -and $SubCommand -eq "check") { $CmdArgs.Add("--stealth") }
-    # --probe-max-tokens / --probe-enable-thinking 只有 check 和 inspect 用得到
-    $probeCmds = @("check", "inspect")
+    # --probe-max-tokens / --probe-enable-thinking 作用于会发探测请求的子命令
+    $probeCmds = @("check", "inspect", "list-models")
     if ($probeCmds -contains $SubCommand) {
         if (-not [string]::IsNullOrWhiteSpace($script:AdvMaxTokens)) {
             $CmdArgs.Add("--probe-max-tokens"); $CmdArgs.Add($script:AdvMaxTokens)
@@ -238,7 +238,7 @@ function Menu-ListModels {
     return $code
 }
 
-# ── [4] 深度诊断 inspect（精简：type/provider/source/model） ─────
+# ── [4] 深度诊断 inspect（精简：type → provider → model） ─────
 function Menu-Inspect {
     if (-not (Show-Banner "深度诊断 (inspect)")) {
         Read-Host "按回车返回主菜单"; return 1
@@ -246,7 +246,7 @@ function Menu-Inspect {
     $type = Get-AppType
     Write-Host ""
 
-    Write-Host "[1/3] 选择供应商" -ForegroundColor Yellow
+    Write-Host "[1/2] 选择供应商" -ForegroundColor Yellow
     Write-Host "正在拉取供应商列表…" -ForegroundColor DarkGray
     $names = @()
     try {
@@ -279,7 +279,7 @@ function Menu-Inspect {
     }
     Write-Host ""
 
-    Write-Host "[2/3] 选择模型（配置档位优先，其余来自 /v1/models）" -ForegroundColor Yellow
+    Write-Host "[2/2] 选择模型（配置档位优先，其余来自 /v1/models）" -ForegroundColor Yellow
     $curProv = if ($parsed) { $parsed.providers | Where-Object { $_.name -eq $provider } | Select-Object -First 1 } else { $null }
     $modelChoices = [System.Collections.Generic.List[object]]::new()
     $seen = @{}
@@ -496,12 +496,16 @@ function Show-MainMenu {
     Write-Host "  [6] 高级设置              JSON/stealth/thinking/UA/类型/范围"
     Write-Host "  [7] 退出" -ForegroundColor White
     Write-Host ""
-    return (Read-Host "输入 1-7 (默认1)")
+    # 用 ReadLine 而非 Read-Host：EOF（stdin 关闭/管道结束）返回 $null，
+    # 直接敲回车返回 ""，Read-Host 两者都给 ""，无法区分会导致主菜单死循环。
+    Write-Host "输入 1-7 (默认1): " -NoNewline
+    return [Console]::In.ReadLine()
 }
 
 while ($true) {
     $choice = Show-MainMenu
-    switch ($choice) {
+    if ($null -eq $choice) { exit 0 }   # stdin 结束，退出而非重绘
+    switch ($choice.Trim()) {
         ""  { $null = Menu-HealthCheckQuick }
         "1" { $null = Menu-HealthCheckQuick }
         "2" { $null = Menu-HealthCheckCustom }
