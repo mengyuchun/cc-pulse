@@ -36,7 +36,7 @@ models-probe:
 models-probe-all:
     {{PYTHON}} {{SCRIPT}} list-models --probe --source both
 
-# 拉列表 + 深度探测每个模型（text/streaming/metadata/thinking/tools）
+# 拉列表 + 深度探测每个模型（7 维度：text/streaming/metadata/context/thinking/tools/vision）
 models-deep:
     {{PYTHON}} {{SCRIPT}} list-models --failover-only --deep --timeout 60
 
@@ -89,6 +89,10 @@ test-all:
 lint:
     ruff check .
     ruff format --check .
+
+# 文档与代码一致性守卫：禁止 README 中出现 4 维 / 6 维等过时说法
+lint-docs:
+    {{PYTHON}} tests/test_docs_consistency.py
 
 # Format with ruff
 format:

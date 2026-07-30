@@ -423,6 +423,10 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 | 0 | 全部健康（`check` 至少一个供应商可用 / `inspect` healthy 或 skipped / `list-models` 完成） |
 | 1 | 健康检查全部失败 / `inspect` 不可用 / 答案错误 |
 | 2 | 数据库不存在、没有符合条件供应商、resolve 失败（inspect 找不到目标） |
+| 3 | `inspect --all-models` / `--models` **批量模式：部分失败**（至少一个 healthy，至少一个 fail） |
+| 4 | `inspect --all-models` / `--models` **批量模式：全部失败** |
+
+> 批量模式（`--all-models` / `--models`）用 3/4 区分粒度，方便 CI 与 `&&` 链判断。配 `--quiet` 输出纯 NDJSON，每模型一行 JSON 到 stdout，关闭所有进度提示。
 
 ---
 

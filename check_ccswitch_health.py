@@ -2632,7 +2632,12 @@ def _run_inspect_all(args, providers, say) -> int:
             v = (r.get("summary") or {}).get("verdict", "error")
             m = r.get("model", "?")
             print(f"{i:>3}  {m[:40]:<42}  {v}")
-    return 1 if fail_count > 0 else 0
+    # 退出码粒度：0 全成功 / 3 部分失败 / 4 全部失败（仅批量模式）
+    if fail_count == 0:
+        return 0
+    if fail_count < len(models):
+        return 3  # 部分失败
+    return 4  # 全部失败
 
 
 def format_inspect_human(r: dict) -> str:
@@ -3938,6 +3943,9 @@ def _build_parser():
     p_inspect.add_argument("--format", default=None, choices=["human", "json"],
                            dest="output_format",
                            help="输出格式：human / json（默认 json；--human 等价于 human）")
+    p_inspect.add_argument("--quiet", action="store_true",
+                           help="静默模式：只输出 NDJSON（每模型一行 JSON 到 stdout），关闭所有进度提示；"
+                                "与 --human 互斥。退出码：0 全成功 / 3 部分失败 / 4 全部失败")
     p_inspect.add_argument("--probe-delay", type=float, default=3.0,
                            help="批量模式模型间延迟秒（默认 3.0，防 429）")
     p_inspect.add_argument("--max-retries", type=int, default=1,
@@ -4006,6 +4014,19 @@ def main():
             args.command == "inspect" and not getattr(args, "human", False)):
         _human_out = sys.stderr
 
+    # --quiet：只输出 NDJSON，关闭所有 say() 进度
+    quiet = getattr(args, "quiet", False)
+    if quiet:
+        if getattr(args, "human", False) or getattr(args, "output_format", None) == "human":
+            say("--quiet 与 --human 互斥；忽略 --human，强制 JSON", file=sys.stderr)
+        args.output_format = "json"
+        args.human = False
+
+    def _say_silent(*a, **k):
+        pass
+
+    out_say = _say_silent if quiet else say
+
     if getattr(args, "user_agent", None):
         say(f"User-Agent 已覆盖: {args.user_agent}")
 
@@ -4055,7 +4076,7 @@ def main():
         return run_health_check(args, providers, say)
 
     if args.command == "inspect":
-        return run_inspect(args, providers, say)
+        return run_inspect(args, providers, out_say)
 
     say(f"未知子命令: {args.command}")
     return 2

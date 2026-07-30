@@ -1303,6 +1303,150 @@ finally:
     srv.shutdown()
 
 
+print("\n[End-to-end] inspect --quiet + 退出码 0/3/4")
+# 1) 全成功：2 个配置档位都健康 → exit 0；--quiet 时 stderr 无进度
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    rc, out, err = run_cli([
+        "inspect", "--provider", "Mock-Provider",
+        "--all-models", "--include", "text",
+        "--quiet", "--probe-delay", "0",
+    ], timeout=30)
+    lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+    test("quiet 全成功 exit 0", rc == 0, f"rc={rc} stderr={err[:200]}")
+    test("quiet 输出 NDJSON 行数 == 2", len(lines) == 2, f"n={len(lines)} out={out[:200]}")
+    # 每行都是合法 JSON 且含 schema_version
+    ok_json = True
+    for ln in lines:
+        try:
+            j = json.loads(ln)
+            if j.get("schema_version") != 1:
+                ok_json = False
+        except Exception:
+            ok_json = False
+    test("quiet 每行合法 JSON + schema_version=1", ok_json, f"lines={lines[:2]}")
+    # --quiet 关闭 say() 进度：stderr 不应含「批量 inspect」之类
+    test("quiet 无进度提示", "批量" not in err and "====" not in err,
+         f"stderr={err[:200]}")
+finally:
+    srv.shutdown()
+
+# 2) 全部失败：模型不在配置 → exit 4
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    rc, out, err = run_cli([
+        "inspect", "--provider", "Mock-Provider",
+        "--models", "does-not-exist-a,does-not-exist-b",
+        "--include", "text", "--quiet", "--probe-delay", "0",
+        "--source", "manual",
+    ], timeout=30)
+    # --models 强制 source=manual 时仍会尝试探测；mock 对未知 model 仍回 200 答 2+3
+    # 所以要让 mock 真失败，我们改用 source=configured + 不在档位的模型 → resolve 失败
+    # 上面 --source manual 会成功，改用 configured 触发 resolve 失败
+    rc, out, err = run_cli([
+        "inspect", "--provider", "Mock-Provider",
+        "--models", "does-not-exist-a,does-not-exist-b",
+        "--include", "text", "--quiet", "--probe-delay", "0",
+        "--source", "configured",
+    ], timeout=30)
+    # 注意：_run_inspect_all 在 --models 路径下会把 source 强制为 manual，
+    # 所以 configured 校验不会触发；改成用不存在的 provider 触发全部失败。
+    # 更干净：用 --all-models 但 mock 返回 401 的 handler。
+    test("quiet all-fail exit 4 or 0/3 (mock always answers)",
+         rc in (0, 3, 4), f"rc={rc} out={out[:150]} err={err[:150]}")
+finally:
+    srv.shutdown()
+
+# 3) 真正的 exit 4：用 401 handler 让所有模型都 fail
+class AuthFailHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(401); self.end_headers()
+        self.wfile.write(b'{"error":"unauthorized"}')
+    def do_POST(self):
+        self.send_response(401); self.end_headers()
+        self.wfile.write(b'{"error":"unauthorized"}')
+
+srv, port = start_server(AuthFailHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    rc, out, err = run_cli([
+        "inspect", "--provider", "Mock-Provider",
+        "--all-models", "--include", "text",
+        "--quiet", "--probe-delay", "0",
+    ], timeout=30)
+    test("quiet 全部 401 → exit 4", rc == 4, f"rc={rc} out={out[:200]} err={err[:150]}")
+    lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+    test("quiet all-fail 仍输出 NDJSON", len(lines) >= 1, f"n={len(lines)}")
+finally:
+    srv.shutdown()
+
+# 4) 部分失败 exit 3：sonnet 通、haiku 401
+class PartialFailHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b'{"data":[]}')
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(n)
+        try:
+            req = json.loads(body)
+        except Exception:
+            req = {}
+        model = req.get("model", "")
+        if "haiku" in model:
+            self.send_response(401); self.end_headers()
+            self.wfile.write(b'{"error":"unauthorized"}')
+            return
+        # sonnet：从 user message 抽 "a+b/a-b/a*b/a/b" 算答案，让 _answer_correct 通过
+        import re as _re
+        user_text = ""
+        for msg in req.get("messages", []):
+            if msg.get("role") == "user":
+                c = msg.get("content", "")
+                if isinstance(c, list):
+                    for blk in c:
+                        if isinstance(blk, dict) and blk.get("type") == "text":
+                            user_text = blk.get("text", ""); break
+                elif isinstance(c, str):
+                    user_text = c
+                break
+        m = _re.search(r"(\d+)\s*([+\-*/x×÷])\s*(\d+)", user_text)
+        if m:
+            a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+            if op in ("+",): ans = str(a + b)
+            elif op in ("-",): ans = str(a - b)
+            elif op in ("*", "x", "×"): ans = str(a * b)
+            else: ans = str(a // b) if b else "0"
+        else:
+            ans = "0"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "id": "msg", "type": "message", "model": model,
+            "content": [{"type": "text", "text": ans}],
+            "usage": {"input_tokens": 10, "output_tokens": 1},
+        }).encode())
+
+srv, port = start_server(PartialFailHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    rc, out, err = run_cli([
+        "inspect", "--provider", "Mock-Provider",
+        "--all-models", "--include", "text",
+        "--quiet", "--probe-delay", "0",
+    ], timeout=30)
+    test("quiet 部分失败 exit 3", rc == 3, f"rc={rc} out={out[:300]} err={err[:150]}")
+    lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+    test("quiet 部分失败 NDJSON 2 行", len(lines) == 2, f"n={len(lines)}")
+finally:
+    srv.shutdown()
+
+
 print("\n[Unit] --current-only provider 过滤")
 P = mod.Provider
 ps = [

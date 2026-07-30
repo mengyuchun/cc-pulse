@@ -413,6 +413,10 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 | 0 | Healthy (`check` has at least one usable provider / `inspect` healthy or skipped / `list-models` finished) |
 | 1 | All health checks failed / `inspect` unusable / wrong answer |
 | 2 | DB missing, no matching providers, or resolve failed (`inspect` target not found) |
+| 3 | `inspect --all-models` / `--models` **batch mode: partial failure** (≥1 healthy and ≥1 fail) |
+| 4 | `inspect --all-models` / `--models` **batch mode: all failed** |
+
+> Batch mode (`--all-models` / `--models`) uses 3/4 for finer granularity so CI and `&&` chains can branch. Pair with `--quiet` for pure NDJSON output — one JSON object per model on stdout, all progress messages silenced.
 
 ---
 
