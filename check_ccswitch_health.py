@@ -2313,6 +2313,12 @@ def _inspect_verdict(text_result, model_consistency, thinking_result, tools_resu
 
 def run_inspect(args, providers, say) -> int:
     """单一模型深度检测（7 维度：text/streaming/metadata/context/thinking/tools/vision）。"""
+    # --format 与 --human 合并：--format human 优先，否则 --human 为 True 时 human，否则 json
+    _fmt = getattr(args, "output_format", None)
+    if _fmt is None:
+        args.output_format = "human" if getattr(args, "human", False) else "json"
+    if getattr(args, "all_models", False) or getattr(args, "models", None):
+        return _run_inspect_all(args, providers, say)
     p, model_id, err = resolve_inspect_target(args, providers, say)
     if p is None:
         say(err)
@@ -2429,7 +2435,7 @@ def run_inspect(args, providers, say) -> int:
         except Exception as e:
             report["history"] = {"error": f"{type(e).__name__}: {e}"}
 
-    if args.human:
+    if args.output_format == "human" or args.human:
         text = format_inspect_human(report)
         if report.get("history") and not report["history"].get("error"):
             h = report["history"]
@@ -2444,6 +2450,189 @@ def run_inspect(args, providers, say) -> int:
     else:
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     return 0 if verdict in ("healthy", "skipped") else 1
+
+
+def _is_rate_limited(result) -> bool:
+    """判断探测结果是否因 429/rate_limit 失败。"""
+    if not result or not isinstance(result, dict):
+        return False
+    if result.get("error_category") == "rate_limit":
+        return True
+    if result.get("http_status") == 429 or result.get("status") == 429:
+        return True
+    err = str(result.get("error", "")).lower()
+    return "rate" in err and ("limit" in err or "frequent" in err or "too many" in err)
+
+
+def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
+    """对单个模型跑 7 维探测，返回 report dict（不含重试；重试由 _run_inspect_all 负责）。"""
+    protocol = detect_protocol(inspect_p)
+    text_result, text_raw = (None, None)
+    if "text" in include:
+        text_result, text_raw = _inspect_text(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            max_tokens=_mt, disable_thinking=_dt, user_agent=_ua)
+    streaming_result = None
+    if "streaming" in include:
+        streaming_result = probe_stream(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            ttft_timeout=getattr(args, "ttft_timeout", None),
+            max_tokens=_mt, disable_thinking=_dt, user_agent=_ua)
+    metadata_result = {"status": "skipped"}
+    if "metadata" in include:
+        metadata_result = probe_model_metadata(
+            inspect_p, re.sub(r"\[.*?\]$", "", model_id),
+            args.timeout, args.skip_tls_verify, user_agent=_ua)
+    context_result = {"status": "skipped"}
+    if "metadata" in include:
+        has_declared = (metadata_result.get("declared_context_window") is not None
+                        and metadata_result.get("status") == "available")
+        if not has_declared:
+            _ctx = {"512k": 524288, "1m": 1048576}.get(
+                getattr(args, "probe_context", "512k"), 524288)
+            context_result = probe_context_smoke(
+                inspect_p, model_id, _ctx, args.timeout, args.skip_tls_verify, user_agent=_ua)
+    thinking_result = {"status": "skipped"}
+    if "thinking" in include:
+        thinking_result = _inspect_thinking(
+            inspect_p, inspect_p.tiers[0], text_raw,
+            args.timeout, args.skip_tls_verify, max_tokens=_mt, user_agent=_ua)
+    tools_result = {"status": "skipped"}
+    if "tools" in include:
+        tools_result = _probe_tools(inspect_p, model_id, args.timeout, args.skip_tls_verify, _ua)
+    vision_result = {"status": "skipped"}
+    if "vision" in include:
+        vision_result = _probe_vision(inspect_p, model_id, args.timeout, args.skip_tls_verify, _ua)
+
+    if text_result and text_result["status"] == "pass":
+        protocol["confidence"] = "confirmed"
+    responded_model = (streaming_result or {}).get("response_model")
+    model_consistency = _inspect_model_consistency(model_id, responded_model, include)
+    verdict, anomaly, recommended = _inspect_verdict(
+        text_result, model_consistency, thinking_result, tools_result)
+    return {
+        "schema_version": 1, "command": "inspect",
+        "provider": inspect_p.name, "model": model_id,
+        "protocol": protocol,
+        "text": text_result,
+        "streaming": streaming_result if streaming_result is not None else {"status": "not_run"},
+        "metadata": metadata_result, "context": context_result,
+        "thinking": thinking_result, "tools": tools_result, "vision": vision_result,
+        "model_consistency": model_consistency,
+        "summary": {"verdict": verdict, "model_routing_anomaly": anomaly,
+                    "recommended_actions": recommended},
+    }
+
+
+def _run_inspect_all(args, providers, say) -> int:
+    """--all-models / --models: 对一 provider 下多个模型逐个跑 inspect。"""
+    name = args.provider
+    p = next((x for x in providers if x.name == name), None)
+    if p is None:
+        say(f"未找到供应商: {name!r}（当前 type={args.type}）")
+        return 2
+
+    configured = [t.model for t in p.tiers]
+    listed = []
+
+    # --models 优先：用户直接指定模型 ID 列表
+    if getattr(args, "models", None):
+        models = [m.strip() for m in args.models.split(",") if m.strip()]
+        models = list(dict.fromkeys(models))  # 去重保序
+        say(f"批量 inspect: {name} · {len(models)} 个模型 (用户指定)")
+    else:
+        src = getattr(args, "source", "configured")
+        if src in ("listed", "both"):
+            _ua = getattr(args, "user_agent", None)
+            r = fetch_models(p, args.timeout, args.skip_tls_verify, user_agent=_ua)
+            if r["status"] == 200:
+                listed = r["models"]
+            else:
+                say(f"拉 /v1/models 失败: [{r['status']}] {r['error'][:80]}；用 configured 降级")
+        if src == "configured":
+            models = list(dict.fromkeys(configured))
+        elif src == "listed":
+            models = listed or list(dict.fromkeys(configured))
+        else:  # both
+            models = list(dict.fromkeys(configured + listed))
+        say(f"批量 inspect: {name} · {len(models)} 个模型 (source={src})")
+
+    if not models:
+        say(f"供应商 {name!r} 无可用模型")
+        return 2
+
+    delay = float(getattr(args, "probe_delay", 3.0) or 0)
+    max_retries = int(getattr(args, "max_retries", 1) or 0)
+    human = (getattr(args, "output_format", None) == "human") or getattr(args, "human", False)
+    say(f"模型间延迟 {delay}s · 429 重试 {max_retries} 次 · 输出={'human' if human else 'json'}\n")
+
+    include = set(x.strip() for x in args.include.split(",") if x.strip())
+    _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
+    _dt = not getattr(args, "probe_enable_thinking", False)
+    _ua = getattr(args, "user_agent", None)
+
+    fail_count = 0
+    reports = []
+    for i, m in enumerate(models, 1):
+        say(f"\n{'='*60}")
+        say(f"[{i}/{len(models)}] {m}")
+        say(f"{'='*60}")
+
+        single_args = argparse.Namespace(**vars(args))
+        single_args.model = m
+        single_args.all_models = False
+        single_args.source = "manual"  # 批量不走 configured 校验
+        p_single, model_id, err = resolve_inspect_target(single_args, providers, say)
+        if p_single is None:
+            say(f"错误: {err}")
+            fail_count += 1
+            reports.append({"provider": name, "model": m, "error": err,
+                            "summary": {"verdict": "unavailable"}})
+            if i < len(models) and delay > 0:
+                time.sleep(delay)
+            continue
+
+        inspect_p = rebuild_provider_for_inspect(p_single, model_id)
+        # 429 重试
+        attempt = 0
+        while True:
+            report = _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua)
+            report["model_source"] = getattr(args, "source", "manual")
+            rate_hit = any(_is_rate_limited(report.get(k)) for k in
+                           ("text", "streaming", "metadata", "tools", "vision"))
+            if rate_hit and attempt < max_retries:
+                attempt += 1
+                wait = delay * attempt if delay > 0 else 3.0 * attempt
+                say(f"  ⚠ 429 rate_limit，{wait:.1f}s 后重试 ({attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            break
+
+        reports.append(report)
+        if human:
+            print(format_inspect_human(report), flush=True)
+        else:
+            # 流式 JSON：每个模型一行 NDJSON，便于实时消费
+            print(json.dumps(report, ensure_ascii=False), flush=True)
+
+        if report.get("summary", {}).get("verdict") not in ("healthy", "skipped"):
+            fail_count += 1
+
+        if i < len(models) and delay > 0:
+            time.sleep(delay)
+
+    say(f"\n{'='*60}")
+    say(f"批量检测完成: {len(models)} 个模型, {fail_count} 个失败")
+    say(f"{'='*60}")
+    # human 模式末尾再打一张汇总表
+    if human and reports:
+        print(f"\n{'#':>3}  {'模型':<42}  verdict")
+        print("-" * 60)
+        for i, r in enumerate(reports, 1):
+            v = (r.get("summary") or {}).get("verdict", "error")
+            m = r.get("model", "?")
+            print(f"{i:>3}  {m[:40]:<42}  {v}")
+    return 1 if fail_count > 0 else 0
 
 
 def format_inspect_human(r: dict) -> str:
@@ -3719,8 +3908,12 @@ def _build_parser():
                                help="对单一 (provider, model) 三元组进行深度诊断")
     p_inspect.add_argument("--provider", required=True,
                            help="供应商名称（与 cc-switch 中一致）")
-    p_inspect.add_argument("--model", required=True,
-                           help="模型 ID（精确匹配，可包含 [1M] 等后缀）")
+    p_inspect.add_argument("--model", default=None,
+                           help="模型 ID（精确匹配，可包含 [1M] 等后缀）；--all-models/--models 时忽略")
+    p_inspect.add_argument("--all-models", action="store_true",
+                           help="批量检测该供应商的多个模型（配合 --source 决定范围）")
+    p_inspect.add_argument("--models", default=None,
+                           help="逗号分隔的模型 ID 列表（自定义组合，如 glm-5-2,deepseek-v4-pro）")
     p_inspect.add_argument("--source", default="configured",
                            choices=["configured", "listed", "manual"],
                            help="模型来源：configured(cc-switch 配置)、"
@@ -3741,7 +3934,14 @@ def _build_parser():
     p_inspect.add_argument("--probe-context", choices=["512k", "1m"], default="512k",
                            help="上下文窗口探测档位：512k（默认）或 1m；仅在元数据无声明时触发")
     p_inspect.add_argument("--human", action="store_true",
-                           help="以人类可读格式输出到 stdout（默认 JSON）")
+                           help="以人类可读格式输出到 stdout（默认 JSON；与 --format human 等价）")
+    p_inspect.add_argument("--format", default=None, choices=["human", "json"],
+                           dest="output_format",
+                           help="输出格式：human / json（默认 json；--human 等价于 human）")
+    p_inspect.add_argument("--probe-delay", type=float, default=3.0,
+                           help="批量模式模型间延迟秒（默认 3.0，防 429）")
+    p_inspect.add_argument("--max-retries", type=int, default=1,
+                           help="rate_limit(429) 时重试次数（默认 1）")
     p_inspect.add_argument("--with-history", action="store_true",
                            help="报告中附加该供应商近 24h 日志摘要")
     p_inspect.add_argument("--history-since", default="24h",

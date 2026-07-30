@@ -152,9 +152,9 @@ function Menu-HealthCheckQuick {
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Write-Host ""
-    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
-    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择"
+    Write-Host "  [1] 重新选择（类型/范围）" -ForegroundColor White
+    Write-Host "  [2] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择（默认 2）"
     if ($again -eq "1") { return (Menu-HealthCheckQuick) }
     return $code
 }
@@ -183,9 +183,9 @@ function Menu-HealthCheckCustom {
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Write-Host ""
-    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
-    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择"
+    Write-Host "  [1] 重新选择（类型/范围）" -ForegroundColor White
+    Write-Host "  [2] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择（默认 2）"
     if ($again -eq "1") { return (Menu-HealthCheckCustom) }
     return $code
 }
@@ -231,9 +231,9 @@ function Menu-ListModels {
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "list-models"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Write-Host ""
-    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
-    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择"
+    Write-Host "  [1] 重新选择（类型/范围/探测模式）" -ForegroundColor White
+    Write-Host "  [2] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择（默认 2）"
     if ($again -eq "1") { return (Menu-ListModels) }
     return $code
 }
@@ -278,6 +278,168 @@ function Menu-Inspect {
         Read-Host "按回车"; return 1
     }
     Write-Host ""
+
+    Write-Host "检测模式:" -ForegroundColor Yellow
+    Write-Host "  [1] 单一模型（默认）" -ForegroundColor White
+    Write-Host "  [2] 批量检测该供应商的所有模型" -ForegroundColor White
+    Write-Host "  [3] 自定义选择模型 + 检测维度" -ForegroundColor White
+    $modeChoice = Read-Host "选择（默认 1）"
+    $batchMode = ($modeChoice -eq "2")
+    $customMode = ($modeChoice -eq "3")
+
+    if ($customMode) {
+        Write-Host ""
+        Write-Host "可用模型列表:" -ForegroundColor Yellow
+        $curProv = if ($parsed) { $parsed.providers | Where-Object { $_.name -eq $provider } | Select-Object -First 1 } else { $null }
+        $modelChoices = [System.Collections.Generic.List[object]]::new()
+        $seen = @{}
+        if ($curProv) {
+            foreach ($cm in @($curProv.configured_models)) {
+                if ($cm -and $cm.model -and -not $seen.ContainsKey($cm.model)) {
+                    $seen[$cm.model] = $true
+                    $modelChoices.Add([pscustomobject]@{ id = $cm.model; label = "[$($cm.tier) 档位]" })
+                }
+            }
+            foreach ($mid in @($curProv.models)) {
+                if ($mid -and -not $seen.ContainsKey($mid)) {
+                    $seen[$mid] = $true
+                    $modelChoices.Add([pscustomobject]@{ id = $mid; label = "" })
+                }
+            }
+        }
+        if ($modelChoices.Count -eq 0) {
+            Write-Host "  （无可用模型，请手动输入）" -ForegroundColor Yellow
+            $modelInput = Read-Host "  模型 ID（逗号分隔）"
+            $selectedModels = $modelInput
+        } else {
+            for ($i = 0; $i -lt $modelChoices.Count; $i++) {
+                $mc = $modelChoices[$i]
+                $lab = if ($mc.label) { "  $($mc.label)" } else { "" }
+                Write-Host ("  [{0}] {1}{2}" -f ($i + 1), $mc.id, $lab)
+            }
+            Write-Host "  [a] 全部模型" -ForegroundColor Cyan
+            $msel = Read-Host "输入序号（逗号分隔，如 1,3,5）或 a 全选（默认 1）"
+            if ([string]::IsNullOrWhiteSpace($msel)) {
+                $selectedModels = $modelChoices[0].id
+            } elseif ($msel -eq "a" -or $msel -eq "A") {
+                $selectedModels = ($modelChoices | ForEach-Object { $_.id }) -join ","
+            } else {
+                $idxs = $msel -split "," | ForEach-Object { $_.Trim() }
+                $selected = @()
+                foreach ($idx in $idxs) {
+                    if ($idx -match '^\d+$' -and [int]$idx -ge 1 -and [int]$idx -le $modelChoices.Count) {
+                        $selected += $modelChoices[[int]$idx - 1].id
+                    }
+                }
+                if ($selected.Count -eq 0) {
+                    Write-Host "无效选择，返回主菜单。" -ForegroundColor Yellow
+                    Read-Host "按回车"; return 1
+                }
+                $selectedModels = $selected -join ","
+            }
+        }
+
+        Write-Host ""
+        Write-Host "检测维度（默认全开）:" -ForegroundColor Yellow
+        Write-Host "  [1] text              文本探测"
+        Write-Host "  [2] streaming         流式探测"
+        Write-Host "  [3] model-consistency 模型路由比对"
+        Write-Host "  [4] metadata          元数据"
+        Write-Host "  [5] thinking          Thinking 能力"
+        Write-Host "  [6] tools             Tool use"
+        Write-Host "  [7] vision            视觉能力"
+        Write-Host "  [a] 全部维度（默认）" -ForegroundColor Cyan
+        $dimSel = Read-Host "输入序号（逗号分隔，如 1,2,3）或 a 全选（默认 a）"
+        $dimMap = @{
+            "1" = "text"
+            "2" = "streaming"
+            "3" = "model-consistency"
+            "4" = "metadata"
+            "5" = "thinking"
+            "6" = "tools"
+            "7" = "vision"
+        }
+        if ([string]::IsNullOrWhiteSpace($dimSel) -or $dimSel -eq "a" -or $dimSel -eq "A") {
+            $include = "text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools"
+        } else {
+            $dims = $dimSel -split "," | ForEach-Object { $_.Trim() }
+            $selected = @()
+            foreach ($d in $dims) {
+                if ($dimMap.ContainsKey($d)) {
+                    $selected += $dimMap[$d]
+                }
+            }
+            if ($selected.Count -eq 0) {
+                Write-Host "无效维度，使用默认全开。" -ForegroundColor Yellow
+                $include = "text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools"
+            } else {
+                # 自动加上 protocol 和 error-classification
+                $selected += "protocol", "error-classification"
+                $include = ($selected | Select-Object -Unique) -join ","
+            }
+        }
+
+        Write-Host ""
+        Write-Host "已选模型: $selectedModels" -ForegroundColor Cyan
+        Write-Host "已选维度: $include" -ForegroundColor Cyan
+        Write-Host ""
+
+        $cmdArgs = [System.Collections.Generic.List[string]]::new()
+        $cmdArgs.Add("inspect")
+        $cmdArgs.Add("--provider"); $cmdArgs.Add($provider)
+        $cmdArgs.Add("--models"); $cmdArgs.Add($selectedModels)
+        $cmdArgs.Add("--include"); $cmdArgs.Add($include)
+        $cmdArgs.Add("--source"); $cmdArgs.Add("manual")
+        $cmdArgs.Add("--type"); $cmdArgs.Add($type)
+        $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+        $cmdArgs.Add("--timeout"); $cmdArgs.Add("30")
+        $cmdArgs.Add("--workers"); $cmdArgs.Add("1")
+        $cmdArgs.Add("--human")
+        $cmdArgs.Add("--probe-delay"); $cmdArgs.Add("3")
+        $cmdArgs.Add("--max-retries"); $cmdArgs.Add("1")
+        Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "inspect"
+
+        $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        Write-Host ""
+        Write-Host "  [1] 重新选择（重走 type → provider → 模式）" -ForegroundColor White
+        Write-Host "  [2] 返回主菜单" -ForegroundColor White
+        $again = Read-Host "选择（默认 2）"
+        if ($again -eq "1") { return (Menu-Inspect) }
+        return $code
+    }
+
+    if ($batchMode) {
+        Write-Host ""
+        Write-Host "批量检测范围:" -ForegroundColor Yellow
+        Write-Host "  [1] configured - cc-switch 配置档位"
+        Write-Host "  [2] listed     - 供应商 /v1/models 声明"
+        Write-Host "  [3] both       - 两者合并去重"
+        $srcChoice = Read-Host "选择（默认 1）"
+        $source = switch ($srcChoice) { "2" { "listed" } "3" { "both" } default { "configured" } }
+        Write-Host ""
+
+        $cmdArgs = [System.Collections.Generic.List[string]]::new()
+        $cmdArgs.Add("inspect")
+        $cmdArgs.Add("--provider"); $cmdArgs.Add($provider)
+        $cmdArgs.Add("--all-models")
+        $cmdArgs.Add("--source"); $cmdArgs.Add($source)
+        $cmdArgs.Add("--type"); $cmdArgs.Add($type)
+        $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+        $cmdArgs.Add("--timeout"); $cmdArgs.Add("30")
+        $cmdArgs.Add("--workers"); $cmdArgs.Add("1")
+        $cmdArgs.Add("--human")
+        $cmdArgs.Add("--probe-delay"); $cmdArgs.Add("3")
+        $cmdArgs.Add("--max-retries"); $cmdArgs.Add("1")
+        Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "inspect"
+
+        $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        Write-Host ""
+        Write-Host "  [1] 重新选择（重走 type → provider → 模式）" -ForegroundColor White
+        Write-Host "  [2] 返回主菜单" -ForegroundColor White
+        $again = Read-Host "选择（默认 2）"
+        if ($again -eq "1") { return (Menu-Inspect) }
+        return $code
+    }
 
     Write-Host "[2/2] 选择模型（配置档位优先，其余来自 /v1/models）" -ForegroundColor Yellow
     $curProv = if ($parsed) { $parsed.providers | Where-Object { $_.name -eq $provider } | Select-Object -First 1 } else { $null }
@@ -342,9 +504,9 @@ function Menu-Inspect {
 
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Write-Host ""
-    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
-    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择"
+    Write-Host "  [1] 重新选择（重走 type → provider → model）" -ForegroundColor White
+    Write-Host "  [2] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择（默认 2）"
     if ($again -eq "1") { return (Menu-Inspect) }
     return $code
 }
@@ -405,9 +567,9 @@ function Menu-Logs {
         }
     }
     Write-Host ""
-    Write-Host "  [1] 再测一次（重新选择）" -ForegroundColor White
-    Write-Host "  [回车] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择"
+    Write-Host "  [1] 重新选择日志子项" -ForegroundColor White
+    Write-Host "  [2] 返回主菜单" -ForegroundColor White
+    $again = Read-Host "选择（默认 2）"
     if ($again -eq "1") { return (Menu-Logs) }
     return 0
 }
