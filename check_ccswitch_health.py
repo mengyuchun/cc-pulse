@@ -2311,12 +2311,171 @@ def _inspect_verdict(text_result, model_consistency, thinking_result, tools_resu
     return verdict, anomaly, recommended
 
 
+_INSPECT_DEFAULT_INCLUDE = (
+    "text,streaming,model-consistency,protocol,error-classification,"
+    "metadata,thinking,tools"
+)
+_COMPARE_DEFAULT_INCLUDE = "text,streaming"
+
+
+def _parse_include(raw: str | None, default: str) -> set[str]:
+    """解析 --include；None/空 → default。"""
+    src = default if raw is None else raw
+    out = {x.strip() for x in src.split(",") if x.strip()}
+    return out or {x.strip() for x in default.split(",") if x.strip()}
+
+
+def _parse_compare_targets(spec: str) -> list[tuple[str, str]]:
+    """解析 --compare 规格字符串 → [(provider, model), ...]。
+
+    格式：逗号分隔的 'provider/model' 对。
+    provider 名或 model 名本身含 / 时，最后一个 / 之后是 model，之前是 provider。
+    """
+    out = []
+    for raw in (spec or "").split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        if "/" not in part:
+            raise ValueError(f"--compare 项缺少 '/'：{part!r}（应为 provider/model）")
+        provider, model = part.rsplit("/", 1)
+        provider, model = provider.strip(), model.strip()
+        if not provider or not model:
+            raise ValueError(f"--compare 项 provider 或 model 为空：{part!r}")
+        out.append((provider, model))
+    if len(out) < 2:
+        raise ValueError("--compare 至少需要 2 个 'provider/model' 目标")
+    return out
+
+
+def _run_inspect_compare(args, providers, say) -> int:
+    """--compare: 对多个 (provider, model) 跑同一组维度，输出对齐对比报告。"""
+    try:
+        targets = _parse_compare_targets(args.compare)
+    except ValueError as e:
+        say(str(e))
+        print(json.dumps({
+            "schema_version": 1, "command": "inspect-compare",
+            "error": str(e),
+        }, ensure_ascii=False, indent=2))
+        return 2
+
+    # 对比默认 text+streaming；只有用户显式 --include 才扩维度
+    include = _parse_include(getattr(args, "include", None), _COMPARE_DEFAULT_INCLUDE)
+    _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
+    _dt = not getattr(args, "probe_enable_thinking", False)
+    _ua = getattr(args, "user_agent", None)
+    human = (getattr(args, "output_format", None) == "human") or getattr(args, "human", False)
+    delay = float(getattr(args, "probe_delay", 3.0) or 0)
+
+    say(f"对比模式: {len(targets)} 个目标 · include={','.join(sorted(include))}")
+    results = []
+    for i, (pname, mid) in enumerate(targets, 1):
+        say(f"\n[{i}/{len(targets)}] {pname} / {mid}")
+        single = argparse.Namespace(**vars(args))
+        single.provider = pname
+        single.model = mid
+        single.source = "manual"  # 对比跨供应商，不走 configured 校验
+        single.all_models = False
+        single.models = None
+        single.compare = None
+        p, model_id, err = resolve_inspect_target(single, providers, say)
+        if p is None:
+            say(f"  跳过: {err}")
+            results.append({
+                "provider": pname, "model": mid, "error": err,
+                "text": {"status": "error", "elapsed_seconds": 0, "answer": "",
+                         "correct": False, "http_status": 0,
+                         "error_category": "resolve_failed", "error": err},
+                "streaming": {"status": "not_run"},
+                "summary": {"verdict": "unavailable"},
+            })
+            continue
+        inspect_p = rebuild_provider_for_inspect(p, model_id)
+        report = _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua)
+        report["model_source"] = "manual"
+        results.append(report)
+        if i < len(targets) and delay > 0:
+            time.sleep(delay)
+
+    # 汇总对比表
+    rows = []
+    for r in results:
+        t = r.get("text") or {}
+        s = r.get("streaming") or {}
+        rows.append({
+            "provider": r.get("provider"),
+            "model": r.get("model"),
+            "verdict": (r.get("summary") or {}).get("verdict", "error"),
+            "text_status": t.get("status"),
+            "text_elapsed": t.get("elapsed_seconds"),
+            "answer": (t.get("answer") or "")[:40],
+            "correct": t.get("correct"),
+            "streaming_status": s.get("status"),
+            "ttft": s.get("ttft_seconds"),
+            "stream_elapsed": s.get("elapsed_seconds"),
+            "error_category": t.get("error_category") or s.get("error_category"),
+        })
+
+    out = {
+        "schema_version": 1,
+        "command": "inspect-compare",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "targets": [{"provider": p, "model": m} for p, m in targets],
+        "include": sorted(include),
+        "comparison": rows,
+        "reports": results,
+    }
+
+    if human:
+        print(_format_compare_human(rows), flush=True)
+    else:
+        print(json.dumps(out, ensure_ascii=False, indent=2), flush=True)
+
+    # 退出码：全 healthy → 0；部分 → 3；全失败 → 4
+    ok = sum(1 for r in rows if r["verdict"] in ("healthy", "skipped"))
+    if ok == len(rows):
+        return 0
+    if ok > 0:
+        return 3
+    return 4
+
+
+def _format_compare_human(rows: list) -> str:
+    """对比报告人类可读表格。"""
+    lines = ["=" * 72, "  对比报告", "=" * 72]
+    hdr = f"{'#':>2}  {'provider':<18} {'model':<28} {'verdict':<12} {'text':>5} {'ttft':>6} {'ans'}"
+    lines.append(hdr)
+    lines.append("-" * 72)
+    for i, r in enumerate(rows, 1):
+        ttft = f"{r['ttft']:.2f}" if isinstance(r.get("ttft"), (int, float)) else "-"
+        te = f"{r['text_elapsed']:.2f}" if isinstance(r.get("text_elapsed"), (int, float)) else "-"
+        ans = (r.get("answer") or "")[:20]
+        lines.append(
+            f"{i:>2}  {(r.get('provider') or '?'):<18} "
+            f"{(r.get('model') or '?'):<28} "
+            f"{(r.get('verdict') or '?'):<12} "
+            f"{te:>5} {ttft:>6} {ans}"
+        )
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
 def run_inspect(args, providers, say) -> int:
     """单一模型深度检测（7 维度：text/streaming/metadata/context/thinking/tools/vision）。"""
     # --format 与 --human 合并：--format human 优先，否则 --human 为 True 时 human，否则 json
     _fmt = getattr(args, "output_format", None)
     if _fmt is None:
         args.output_format = "human" if getattr(args, "human", False) else "json"
+    if getattr(args, "compare", None):
+        return _run_inspect_compare(args, providers, say)
+    if not getattr(args, "provider", None):
+        say("inspect 需要 --provider，或改用 --compare 'A/m1,B/m2'")
+        print(json.dumps({
+            "schema_version": 1, "command": "inspect",
+            "error": "missing --provider",
+        }, ensure_ascii=False, indent=2))
+        return 2
     if getattr(args, "all_models", False) or getattr(args, "models", None):
         return _run_inspect_all(args, providers, say)
     p, model_id, err = resolve_inspect_target(args, providers, say)
@@ -2334,7 +2493,7 @@ def run_inspect(args, providers, say) -> int:
 
     inspect_p = rebuild_provider_for_inspect(p, model_id)
     protocol = detect_protocol(p)
-    include = set(x.strip() for x in args.include.split(",") if x.strip())
+    include = _parse_include(getattr(args, "include", None), _INSPECT_DEFAULT_INCLUDE)
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
     _ua = getattr(args, "user_agent", None)
@@ -2566,7 +2725,7 @@ def _run_inspect_all(args, providers, say) -> int:
     human = (getattr(args, "output_format", None) == "human") or getattr(args, "human", False)
     say(f"模型间延迟 {delay}s · 429 重试 {max_retries} 次 · 输出={'human' if human else 'json'}\n")
 
-    include = set(x.strip() for x in args.include.split(",") if x.strip())
+    include = _parse_include(getattr(args, "include", None), _INSPECT_DEFAULT_INCLUDE)
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
     _ua = getattr(args, "user_agent", None)
@@ -2607,6 +2766,10 @@ def _run_inspect_all(args, providers, say) -> int:
                 time.sleep(wait)
                 continue
             break
+        # 把限速重试次数写进 report，便于运维事后追溯
+        report["rate_limit_retries"] = attempt
+        if attempt > 0:
+            report.setdefault("summary", {})["rate_limited"] = True
 
         reports.append(report)
         if human:
@@ -3871,6 +4034,8 @@ def _build_parser():
                          help="只测故障转移队列里的供应商（含当前激活的）")
     p_check.add_argument("--current-only", action="store_true",
                          help="只测当前激活的供应商（最窄；与 --failover-only 同时设时本项优先）")
+    p_check.add_argument("--provider", default=None,
+                         help="按供应商名过滤（支持单个名、逗号分隔多个名或子串）")
     p_check.add_argument("--stealth", action="store_true",
                          help=f"隐身模式：并发降至≤{STEALTH_MAX_WORKERS} 且每档请求前随机延迟，弱化脚本式流量尖峰（较慢；仅 check）")
     p_check.add_argument("--json", action="store_true",
@@ -3895,6 +4060,8 @@ def _build_parser():
                       help="只测故障转移队列里的供应商（含当前激活的）")
     p_lm.add_argument("--current-only", action="store_true",
                       help="只测当前激活的供应商（最窄；与 --failover-only 同时设时本项优先）")
+    p_lm.add_argument("--provider", default=None,
+                      help="按供应商名过滤（支持单个名、逗号分隔多个名或子串）")
     p_lm.add_argument("--probe", action="store_true",
                       help="对每个模型发轻量探测（2+3 算术题），验证是否真能用")
     p_lm.add_argument("--deep", action="store_true",
@@ -3911,8 +4078,8 @@ def _build_parser():
     # inspect：单一模型深度检测
     p_inspect = sub.add_parser("inspect", parents=[common],
                                help="对单一 (provider, model) 三元组进行深度诊断")
-    p_inspect.add_argument("--provider", required=True,
-                           help="供应商名称（与 cc-switch 中一致）")
+    p_inspect.add_argument("--provider", default=None,
+                           help="供应商名称（与 cc-switch 中一致）；--compare 时可选")
     p_inspect.add_argument("--model", default=None,
                            help="模型 ID（精确匹配，可包含 [1M] 等后缀）；--all-models/--models 时忽略")
     p_inspect.add_argument("--all-models", action="store_true",
@@ -3928,10 +4095,10 @@ def _build_parser():
                            help="限定供应商类型 (默认: claude)")
     p_inspect.add_argument("--keep-suffix", action="store_true",
                            help="保留模型 ID 中的 [1M] 等后缀（默认会去后缀）")
-    p_inspect.add_argument("--include", default="text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools",
+    p_inspect.add_argument("--include", default=None,
                            help="要执行的检查项，逗号分隔；支持：text,streaming,"
-                                "model-consistency,protocol,error-classification,metadata,thinking,tools (默认全开)。"
-                                "省略某项即跳过其计算/输出")
+                                "model-consistency,protocol,error-classification,metadata,thinking,tools。"
+                                "默认全开（不含 vision）；--compare 默认仅 text,streaming")
     p_inspect.add_argument("--ttft-timeout", type=int, default=None,
                            help="流式探测首 token 超时（秒），默认使用 --timeout")
     p_inspect.add_argument("--with-metadata", action="store_true",
@@ -3943,6 +4110,11 @@ def _build_parser():
     p_inspect.add_argument("--format", default=None, choices=["human", "json"],
                            dest="output_format",
                            help="输出格式：human / json（默认 json；--human 等价于 human）")
+    p_inspect.add_argument("--compare", default=None,
+                           help="对比模式：逗号分隔的 'provider/model' 列表，"
+                                "如 'Relay-A/claude-sonnet-4-6,Relay-B/glm-5'。"
+                                "同一道题逐个打多个目标，输出对齐的对比报告；"
+                                "此模式不需要 --provider")
     p_inspect.add_argument("--quiet", action="store_true",
                            help="静默模式：只输出 NDJSON（每模型一行 JSON 到 stdout），关闭所有进度提示；"
                                 "与 --human 互斥。退出码：0 全成功 / 3 部分失败 / 4 全部失败")
@@ -4062,6 +4234,19 @@ def main():
         before = len(providers)
         providers = [p for p in providers if p.in_failover or p.is_current]
         say(f"--failover-only: {before} → {len(providers)}（只保留队列内+当前激活）")
+
+    # --compare 自带多 provider 目标，跳过全局 --provider 过滤以免裁掉对比对象
+    if (getattr(args, "provider", None) and providers
+            and not (args.command == "inspect" and getattr(args, "compare", None))):
+        prov_arg = str(args.provider).strip()
+        sub_list = [s.strip().lower() for s in prov_arg.split(",") if s.strip()]
+        if sub_list:
+            before = len(providers)
+            providers = [
+                p for p in providers
+                if any(sub in p.name.lower() for sub in sub_list)
+            ]
+            say(f"--provider '{prov_arg}': {before} → {len(providers)}（按名称过滤）")
 
     if args.command == "list-models":
         if not providers:

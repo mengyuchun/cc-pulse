@@ -111,6 +111,22 @@ test("调用了 check 子命令", "check_ccswitch_health.py check" in combined o
 test("快速体检带 --failover-only", "--failover-only" in combined)
 
 
+print("\n[PS1] 健康检测 · 自定义 - 选项 2 -> 范围 4 (自定义选择供应商)")
+# 主菜单 2 -> type 默认 -> range 4 -> provider 序号 1 -> 回车返回 -> 7 退出
+stdin_text = (
+    "2\n"          # 主菜单: 健康检测 · 自定义
+    "\n"           # type: 默认 claude
+    "4\n"          # 范围: 4 (自定义选择供应商)
+    "1\n"          # 选择序号 1
+    "\n"           # 返回主菜单
+    "7\n"          # 退出
+)
+rc, out, err = run_pwsh(stdin_text, timeout=120)
+combined = out + err
+test("自定义供应商检测 exit 0/1", rc in (0, 1), f"rc={rc}")
+test("输出含 '--provider'", "--provider" in combined)
+
+
 print("\n[PS1] 拉模型列表 - 选项 3 -> 1 (默认 claude/队列)")
 rc, out, err = run_pwsh("3\n\n1\n\n7\n", timeout=120)
 test("退出码 0 或 1", rc in (0, 1), f"rc={rc}")

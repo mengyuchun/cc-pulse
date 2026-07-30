@@ -172,6 +172,25 @@ test("unverifiable 空 requested",
      mod.compare_models("", "claude-sonnet-4-5")["match"] == "unverifiable")
 
 
+print("\n[Unit] _parse_compare_targets / _parse_include")
+test("parse_compare 两项",
+     mod._parse_compare_targets("A/m1,B/m2") == [("A", "m1"), ("B", "m2")])
+test("parse_compare provider 含 /",
+     mod._parse_compare_targets("org/A/m1,B/m2") == [("org/A", "m1"), ("B", "m2")])
+try:
+    mod._parse_compare_targets("only-one/m1")
+    _one_ok = False
+except ValueError:
+    _one_ok = True
+test("parse_compare 少于 2 项报错", _one_ok)
+test("parse_include None → inspect 默认含 thinking",
+     "thinking" in mod._parse_include(None, mod._INSPECT_DEFAULT_INCLUDE))
+test("parse_include None → compare 默认仅 text+streaming",
+     mod._parse_include(None, mod._COMPARE_DEFAULT_INCLUDE) == {"text", "streaming"})
+test("parse_include 显式覆盖",
+     mod._parse_include("text,tools", mod._COMPARE_DEFAULT_INCLUDE) == {"text", "tools"})
+
+
 print("\n[Unit] build_probe_request 含 stream=True")
 # 构造 fake provider
 p = mod.Provider(name="X", app_type="claude", base_url="https://example.com/v1",
@@ -1332,34 +1351,7 @@ try:
 finally:
     srv.shutdown()
 
-# 2) 全部失败：模型不在配置 → exit 4
-srv, port = start_server(MockAnthropicHandler)
-try:
-    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
-    rc, out, err = run_cli([
-        "inspect", "--provider", "Mock-Provider",
-        "--models", "does-not-exist-a,does-not-exist-b",
-        "--include", "text", "--quiet", "--probe-delay", "0",
-        "--source", "manual",
-    ], timeout=30)
-    # --models 强制 source=manual 时仍会尝试探测；mock 对未知 model 仍回 200 答 2+3
-    # 所以要让 mock 真失败，我们改用 source=configured + 不在档位的模型 → resolve 失败
-    # 上面 --source manual 会成功，改用 configured 触发 resolve 失败
-    rc, out, err = run_cli([
-        "inspect", "--provider", "Mock-Provider",
-        "--models", "does-not-exist-a,does-not-exist-b",
-        "--include", "text", "--quiet", "--probe-delay", "0",
-        "--source", "configured",
-    ], timeout=30)
-    # 注意：_run_inspect_all 在 --models 路径下会把 source 强制为 manual，
-    # 所以 configured 校验不会触发；改成用不存在的 provider 触发全部失败。
-    # 更干净：用 --all-models 但 mock 返回 401 的 handler。
-    test("quiet all-fail exit 4 or 0/3 (mock always answers)",
-         rc in (0, 3, 4), f"rc={rc} out={out[:150]} err={err[:150]}")
-finally:
-    srv.shutdown()
-
-# 3) 真正的 exit 4：用 401 handler 让所有模型都 fail
+# 2) 真正的 exit 4：用 401 handler 让所有模型都 fail
 class AuthFailHandler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
@@ -1383,7 +1375,7 @@ try:
 finally:
     srv.shutdown()
 
-# 4) 部分失败 exit 3：sonnet 通、haiku 401
+# 3) 部分失败 exit 3：sonnet 通、haiku 401
 class PartialFailHandler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
@@ -1401,28 +1393,7 @@ class PartialFailHandler(BaseHTTPRequestHandler):
             self.send_response(401); self.end_headers()
             self.wfile.write(b'{"error":"unauthorized"}')
             return
-        # sonnet：从 user message 抽 "a+b/a-b/a*b/a/b" 算答案，让 _answer_correct 通过
-        import re as _re
-        user_text = ""
-        for msg in req.get("messages", []):
-            if msg.get("role") == "user":
-                c = msg.get("content", "")
-                if isinstance(c, list):
-                    for blk in c:
-                        if isinstance(blk, dict) and blk.get("type") == "text":
-                            user_text = blk.get("text", ""); break
-                elif isinstance(c, str):
-                    user_text = c
-                break
-        m = _re.search(r"(\d+)\s*([+\-*/x×÷])\s*(\d+)", user_text)
-        if m:
-            a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
-            if op in ("+",): ans = str(a + b)
-            elif op in ("-",): ans = str(a - b)
-            elif op in ("*", "x", "×"): ans = str(a * b)
-            else: ans = str(a // b) if b else "0"
-        else:
-            ans = "0"
+        ans = _answer_for_body(req)
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -1465,6 +1436,66 @@ test("全部 → A,B,C", fs(False, False) == ["A","B","C"])
 test("--failover-only → A,B", fs(False, True) == ["A","B"])
 test("--current-only → B", fs(True, False) == ["B"])
 test("current 优先于 failover", fs(True, True) == ["B"])
+
+def fs_prov(cur, fo, prov_str):
+    res = ps
+    if cur: res = [p for p in res if p.is_current]
+    elif fo: res = [p for p in res if p.in_failover or p.is_current]
+    if prov_str:
+        subs = [s.strip().lower() for s in prov_str.split(",") if s.strip()]
+        res = [p for p in res if any(sub in p.name.lower() for sub in subs)]
+    return [p.name for p in res]
+
+test("--provider 单个匹配 → A", fs_prov(False, False, "A") == ["A"])
+test("--provider 逗号多选 → A,C", fs_prov(False, False, "A,C") == ["A", "C"])
+test("--provider 配合 failover → B", fs_prov(False, True, "B,C") == ["B"])
+
+print("\n[End-to-end] check --provider 过滤指定供应商")
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_multi_provider_db(f"http://127.0.0.1:{port}/v1")
+    rc, out, err = run_cli(["check", "--json", "--provider", "Prov-A,Prov-C"])
+    j = json.loads(out) if out else {}
+    pnames = [p.get("name") for p in j.get("providers", [])]
+    test("check --provider exit 0", rc == 0, f"rc={rc} err={err[:100]}")
+    test("check --provider 只保留匹配到的供应商", set(pnames) == {"Prov-A", "Prov-C"}, f"pnames={pnames}")
+finally:
+    srv.shutdown()
+
+
+print("\n[End-to-end] inspect --compare 跨供应商（无需 --provider）")
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_multi_provider_db(f"http://127.0.0.1:{port}/v1")
+    rc, out, err = run_cli([
+        "inspect",
+        "--compare", "Prov-A/claude-sonnet-4-5,Prov-C/claude-sonnet-4-5",
+        "--probe-delay", "0",
+    ], timeout=30)
+    j = json.loads(out) if out else {}
+    test("compare 无 --provider exit 0", rc == 0, f"rc={rc} err={err[:150]}")
+    test("compare command=inspect-compare", j.get("command") == "inspect-compare", f"j={list(j)[:8]}")
+    test("compare 默认 include 仅 text+streaming",
+         set(j.get("include") or []) == {"text", "streaming"}, f"include={j.get('include')}")
+    test("compare 2 个目标都 healthy",
+         [r.get("verdict") for r in j.get("comparison") or []] == ["healthy", "healthy"],
+         f"rows={j.get('comparison')}")
+    # 显式 --include 覆盖默认
+    rc2, out2, _ = run_cli([
+        "inspect",
+        "--compare", "Prov-A/claude-sonnet-4-5,Prov-B/claude-sonnet-4-5",
+        "--include", "text",
+        "--probe-delay", "0",
+    ], timeout=30)
+    j2 = json.loads(out2) if out2 else {}
+    test("compare 显式 --include text",
+         set(j2.get("include") or []) == {"text"}, f"include={j2.get('include')}")
+finally:
+    srv.shutdown()
+
+# 缺 --provider 且无 --compare → exit 2
+rc, out, err = run_cli(["inspect", "--model", "x"], timeout=10)
+test("inspect 缺 provider 无 compare → exit 2", rc == 2, f"rc={rc} out={out[:120]}")
 
 
 print("\n[Unit] probe on_attempt 档位级进度回调")

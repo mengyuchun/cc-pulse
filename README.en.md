@@ -293,21 +293,27 @@ python check_ccswitch_health.py inspect \
 python check_ccswitch_health.py inspect \
     --provider "Relay-A" --model "claude-sonnet-4-6" \
     --include text,streaming,metadata,thinking,tools,vision
+
+# Cross-provider compare (no --provider; defaults to text+streaming)
+python check_ccswitch_health.py inspect \
+    --compare "Relay-A/claude-sonnet-4-6,Relay-B/glm-5" --human
 ```
 
 **Flags**:
 
 | Flag | Meaning | Default |
 |------|---------|---------|
-| `--provider NAME` | Provider name (same as in cc-switch) | required |
-| `--model ID` | Model ID (may include suffixes like `[1M]`) | required |
+| `--provider NAME` | Provider name (same as in cc-switch); optional with `--compare` | required for single |
+| `--model ID` | Model ID (may include suffixes like `[1M]`) | required for single |
+| `--compare A/m1,B/m2` | Cross-provider compare; targets carry provider | off |
 | `--source configured\|listed\|manual` | Model source | `configured` |
 | `--type claude\|codex\|openclaw\|all` | Limit provider type | `claude` |
-| `--include LIST` | Checks to run (see table) | all on except vision |
+| `--include LIST` | Checks to run (see table) | all on; `--compare` defaults to `text,streaming` |
 | `--probe-context 512k\|1m` | Context smoke tier | `512k` |
 | `--keep-suffix` | Keep `[1M]`-style suffixes in model ID | off |
 | `--ttft-timeout SEC` | Streaming first-token timeout | same as `--timeout` |
 | `--human` | Human-readable output (default is JSON) | off |
+| `--quiet` | Batch silent NDJSON + exit 0/3/4 | off |
 
 **`--include` checks**:
 
@@ -413,10 +419,10 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 | 0 | Healthy (`check` has at least one usable provider / `inspect` healthy or skipped / `list-models` finished) |
 | 1 | All health checks failed / `inspect` unusable / wrong answer |
 | 2 | DB missing, no matching providers, or resolve failed (`inspect` target not found) |
-| 3 | `inspect --all-models` / `--models` **batch mode: partial failure** (≥1 healthy and ≥1 fail) |
-| 4 | `inspect --all-models` / `--models` **batch mode: all failed** |
+| 3 | `inspect --all-models` / `--models` / `--compare` **batch/compare: partial failure** |
+| 4 | `inspect --all-models` / `--models` / `--compare` **batch/compare: all failed** |
 
-> Batch mode (`--all-models` / `--models`) uses 3/4 for finer granularity so CI and `&&` chains can branch. Pair with `--quiet` for pure NDJSON output — one JSON object per model on stdout, all progress messages silenced.
+> Batch/compare mode uses 3/4 for finer granularity so CI and `&&` chains can branch. Pair with `--quiet` for pure NDJSON output — one JSON object per model on stdout, all progress messages silenced.
 
 ---
 
@@ -425,12 +431,13 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 `run_health_check.ps1` provides an interactive menu — double-click, no flags required:
 
 ```
-[1] Health check · quick       one-click (claude / queue / no JSON / no thinking)
-[2] Health check · custom      choose type / scope
+[1] Health check · quick       one-click (claude / queue)
+[2] Health check · custom      choose type / scope / providers
 [3] List models                GET /v1/models catalog
 [4] Deep diagnostics (inspect) single (provider, model) diagnosis
-[5] Advanced settings          JSON / thinking / UA / max-tokens / context / vision
-[6] Exit
+[5] Runtime logs               fails / stats / routing / watch
+[6] Advanced settings          JSON / stealth / thinking / UA / type / scope
+[7] Exit
 ```
 
 - Prefer interpreter from `CC_PULSE_PYTHON`, then `python` on PATH

@@ -170,7 +170,56 @@ function Menu-HealthCheckCustom {
     Write-Host "  [1] 只测故障转移队列 + 当前激活  (快)" -ForegroundColor White
     Write-Host "  [2] 测全部供应商                   (完整)" -ForegroundColor White
     Write-Host "  [3] 只测当前激活的 1 个供应商      (最快)" -ForegroundColor White
-    $scope = Read-Host "输入 1-3 (默认1)"
+    Write-Host "  [4] 自定义选择供应商               (多选数字)" -ForegroundColor White
+    $scope = Read-Host "输入 1-4 (默认1)"
+
+    $selectedProviderArg = ""
+    if ($scope -eq "4") {
+        Write-Host ""
+        Write-Host "正在拉取供应商列表…" -ForegroundColor DarkGray
+        $names = @()
+        try {
+            $rawJson = & $Python -u $MainScript list-models --type $type --db $DB --workers 6 --timeout 20 --json 2>$null
+            $parsed = ($rawJson -join "`n") | ConvertFrom-Json
+            $names = @($parsed.providers | ForEach-Object { $_.name })
+        } catch {
+            $names = @()
+        }
+        if ($names.Count -gt 0) {
+            for ($i = 0; $i -lt $names.Count; $i++) {
+                Write-Host "  [$($i + 1)] $($names[$i])"
+            }
+            Write-Host "  [a] 全部供应商" -ForegroundColor Cyan
+            $sel = Read-Host "输入序号（逗号分隔，如 1,3）或 a 全选（默认 1）"
+            if ([string]::IsNullOrWhiteSpace($sel)) {
+                $selectedProviderArg = $names[0]
+            } elseif ($sel -eq "a" -or $sel -eq "A") {
+                $selectedProviderArg = $names -join ","
+            } else {
+                $idxs = $sel -split "," | ForEach-Object { $_.Trim() }
+                $selectedNames = @()
+                foreach ($idx in $idxs) {
+                    if ($idx -match '^\d+$' -and [int]$idx -ge 1 -and [int]$idx -le $names.Count) {
+                        $selectedNames += $names[[int]$idx - 1]
+                    } elseif (-not [string]::IsNullOrWhiteSpace($idx)) {
+                        $selectedNames += $idx
+                    }
+                }
+                if ($selectedNames.Count -eq 0) {
+                    $selectedProviderArg = $names[0]
+                } else {
+                    $selectedProviderArg = $selectedNames -join ","
+                }
+            }
+        } else {
+            Write-Host "未能拉取供应商列表，请手动输入。" -ForegroundColor Yellow
+            $selectedProviderArg = Read-Host "  供应商名（逗号分隔）"
+        }
+        if ([string]::IsNullOrWhiteSpace($selectedProviderArg)) {
+            Write-Host "未选择供应商，返回主菜单。" -ForegroundColor Yellow
+            Read-Host "按回车"; return 1
+        }
+    }
 
     $cmdArgs = [System.Collections.Generic.List[string]]::new()
     $cmdArgs.Add("check")
@@ -179,6 +228,9 @@ function Menu-HealthCheckCustom {
     $cmdArgs.Add("--workers"); $cmdArgs.Add("8")
     $cmdArgs.Add("--timeout"); $cmdArgs.Add((Get-Timeout))
     if ($scope -eq "3") { $cmdArgs.Add("--current-only") }
+    elseif ($scope -eq "4") {
+        $cmdArgs.Add("--provider"); $cmdArgs.Add($selectedProviderArg)
+    }
     elseif ($scope -ne "2") { $cmdArgs.Add("--failover-only") }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()

@@ -198,6 +198,7 @@ python check_ccswitch_health.py check --failover-only --json  # 机器可读
 | `--type claude\|codex\|openclaw\|all` | 检测哪类供应商 | `claude` |
 | `--failover-only` | 只测故障转移队列里的供应商（含当前激活） | 关 |
 | `--current-only` | 只测当前激活的 1 个供应商（最窄；与 `--failover-only` 同时设时本项优先） | 关 |
+| `--provider 名/子串` | 按供应商名过滤（逗号多选或子串） | 关 |
 | `--json` | stdout 输出结构化 JSON，stderr 保留人类文本 | 关 |
 | `--workers N` | 并发数 | 6 |
 | `--timeout SEC` | 单请求超时秒 | 30 |
@@ -303,21 +304,27 @@ python check_ccswitch_health.py inspect \
 python check_ccswitch_health.py inspect \
     --provider "Relay-A" --model "claude-sonnet-4-6" \
     --include text,streaming,metadata,thinking,tools,vision
+
+# 跨供应商对比（无需 --provider；默认只跑 text+streaming）
+python check_ccswitch_health.py inspect \
+    --compare "Relay-A/claude-sonnet-4-6,Relay-B/glm-5" --human
 ```
 
 **参数**：
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
-| `--provider NAME` | 供应商名称（与 cc-switch 一致） | 必填 |
-| `--model ID` | 模型 ID（可含 `[1M]` 等后缀） | 必填 |
+| `--provider NAME` | 供应商名称（与 cc-switch 一致）；`--compare` 时可选 | 单模型必填 |
+| `--model ID` | 模型 ID（可含 `[1M]` 等后缀） | 单模型必填 |
+| `--compare A/m1,B/m2` | 跨供应商对比；目标自带 provider，无需 `--provider` | 关 |
 | `--source configured\|listed\|manual` | 模型来源 | `configured` |
 | `--type claude\|codex\|openclaw\|all` | 限定供应商类型 | `claude` |
-| `--include LIST` | 检查项（见下表） | 默认全开（不含 vision） |
+| `--include LIST` | 检查项（见下表） | 默认全开；`--compare` 默认 `text,streaming` |
 | `--probe-context 512k\|1m` | 上下文冒烟档位 | `512k` |
 | `--keep-suffix` | 保留模型 ID 的 `[1M]` 后缀 | 关 |
 | `--ttft-timeout SEC` | 流式首 token 超时 | 用 `--timeout` |
 | `--human` | 人类可读输出（默认 JSON） | 关 |
+| `--quiet` | 批量静默 NDJSON + 退出码 0/3/4 | 关 |
 
 **`--include` 检查项**：
 
@@ -423,10 +430,10 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 | 0 | 全部健康（`check` 至少一个供应商可用 / `inspect` healthy 或 skipped / `list-models` 完成） |
 | 1 | 健康检查全部失败 / `inspect` 不可用 / 答案错误 |
 | 2 | 数据库不存在、没有符合条件供应商、resolve 失败（inspect 找不到目标） |
-| 3 | `inspect --all-models` / `--models` **批量模式：部分失败**（至少一个 healthy，至少一个 fail） |
-| 4 | `inspect --all-models` / `--models` **批量模式：全部失败** |
+| 3 | `inspect --all-models` / `--models` / `--compare` **批量/对比：部分失败** |
+| 4 | `inspect --all-models` / `--models` / `--compare` **批量/对比：全部失败** |
 
-> 批量模式（`--all-models` / `--models`）用 3/4 区分粒度，方便 CI 与 `&&` 链判断。配 `--quiet` 输出纯 NDJSON，每模型一行 JSON 到 stdout，关闭所有进度提示。
+> 批量/对比模式用 3/4 区分粒度，方便 CI 与 `&&` 链判断。配 `--quiet` 输出纯 NDJSON，每模型一行 JSON 到 stdout，关闭所有进度提示。
 
 ---
 
@@ -435,12 +442,13 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 `run_health_check.ps1` 提供交互式菜单，双击即可，无需记参数：
 
 ```
-[1] 健康检测 · 快速体检   一键（claude/队列/不JSON/不thinking）
-[2] 健康检测 · 自定义     选类型/范围
+[1] 健康检测 · 快速体检   一键（claude/队列）
+[2] 健康检测 · 自定义     选类型/范围/供应商
 [3] 拉模型列表            GET /v1/models 目录
 [4] 深度诊断 (inspect)    单一 (provider, model) 诊断
-[5] 高级设置              JSON/thinking/UA/max-tokens/context/vision
-[6] 退出
+[5] 运行日志              失败/统计/路由/实时监控
+[6] 高级设置              JSON/stealth/thinking/UA/类型/范围
+[7] 退出
 ```
 
 - 优先用 `CC_PULSE_PYTHON` 指定的解释器，其次 PATH 中的 `python`
