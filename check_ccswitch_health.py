@@ -22,7 +22,6 @@ CC-Pulse — cc-switch 供应商健康检测脚本（独立运行，不改 cc-sw
 
 import argparse
 import json
-import os
 import random
 import re
 import sqlite3
@@ -39,12 +38,21 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from ccpulse_output import (
+    _c,
+    _output_stream,
+    _sanitize_for_terminal,
+    _say_colored,
+    say,
+)
+
 DB_PATH = str(Path.home() / ".cc-switch" / "cc-switch.db")
 
 # 默认兜底的 claude-cli 版本（读取本机版本失败时用）
 _DEFAULT_CLAUDE_CLI_VERSION = "2.1.44"
 
 # 本机 claude-cli 版本缓存（懒加载，首次 _user_agent() 调用时探测）
+# 有锁保护的幂等懒缓存：这是"无全局可变状态"约定下刻意保留的唯一豁免。
 _CLAUDE_CLI_VERSION_CACHE: str | None = None
 _CLAUDE_VERSION_LOCK = threading.Lock()
 
@@ -184,7 +192,7 @@ TIER_ENV_KEYS = {
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelTier:
     tier: str  # haiku/sonnet/opus/fable/default
     model: str  # 干净模型名（已去 [1M]）
@@ -202,7 +210,7 @@ class Protocol(str, Enum):
     UNKNOWN = "unknown"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Provider:
     name: str
     app_type: str
@@ -1111,7 +1119,14 @@ def _drain_non_sse_stream(resp, p: Provider) -> dict:
 
     返回 {text, response_model, raw_preview}。
     """
-    raw = resp.read()
+    raw = resp.read(1 << 20)  # 限长 1MB，防无界读
+    stream_truncated = False
+    if len(raw) == 1 << 20:
+        # 已到限长：再试探 1 字节判断是否还有内容
+        try:
+            stream_truncated = bool(resp.read(1))
+        except (OSError, ValueError):
+            stream_truncated = True
     text = ""
     response_model = None
     content_type = resp.headers.get("Content-Type", "")
@@ -1136,6 +1151,7 @@ def _drain_non_sse_stream(resp, p: Provider) -> dict:
         "text": text,
         "response_model": response_model,
         "raw_preview": bytes(raw)[:200],
+        "stream_truncated": stream_truncated,
     }
 
 
@@ -1150,6 +1166,7 @@ def _drain_sse_stream(
     usage_values = {"input_tokens": None, "output_tokens": None}
     got_done = False
     sse_done = False
+    stream_truncated = False
     raw_buf = bytearray()
     stream_socket = getattr(
         getattr(getattr(resp, "fp", None), "raw", None), "_sock", None
@@ -1255,7 +1272,9 @@ def _drain_sse_stream(
             else:
                 sse_buffer += line.encode("utf-8", errors="replace")
             if len(sse_buffer) > 65536:
-                sse_buffer = sse_buffer[-65536:]
+                # 事件过大：整体丢弃当前待处理事件，避免截断后误解析残缺 JSON
+                stream_truncated = True
+                sse_buffer = b""
 
             while True:
                 event_bytes, sse_buffer = _take_event(sse_buffer)
@@ -1307,6 +1326,7 @@ def _drain_sse_stream(
         "text": "".join(response_text_buf),
         "raw_preview": bytes(raw_buf),
         "usage": usage,
+        "stream_truncated": stream_truncated,
     }
 
 
@@ -1470,85 +1490,17 @@ def probe_stream(
         "response_model": response_model,
         "content_type": content_type,
         "event_count": event_count,
-        "text": text[:80],
+        "text": _sanitize_for_terminal(text[:80]),
         "is_sse": is_sse,
-        "error": error_msg,
+        "error": _sanitize_for_terminal(error_msg),
         "error_category": error_category,
-        "raw_preview": raw_preview.decode("utf-8", errors="replace")
+        "raw_preview": _sanitize_for_terminal(
+            raw_preview.decode("utf-8", errors="replace")
+        )
         if raw_preview
         else "",
         "usage": usage,
     }
-
-
-# 全局输出目标：默认 stdout；--json 模式下切换为 stderr，stdout 仅承载 JSON
-_human_out = sys.stdout
-_say_lock = threading.Lock()
-_CONTROL_RE = re.compile(
-    "\x1b\\[[0-9;]*[A-Za-z]|\x1b\\][^\x07]*\x07|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"
-)
-
-
-def _sanitize_for_terminal(s: str) -> str:
-    """剥离 ANSI 转义和 C0 控制字符，防止恶意供应商响应注入终端指令。"""
-    return _CONTROL_RE.sub("", s)
-
-
-def say(*a, **k):
-    """人类可读进度输出。默认 flush，避免被 PowerShell 管道块缓冲吞掉。
-
-    多线程下串行化，保证每行完整不交错；自动清理控制字符。
-    """
-    k.setdefault("flush", True)
-    cleaned = [_sanitize_for_terminal(str(x)) for x in a]
-    with _say_lock:
-        print(*cleaned, file=_human_out, **k)
-
-
-# ---------- 颜色 / emoji ----------
-# 说明：所有外部内容（供应商名 / error_message 等）必须先经 _sanitize_for_terminal
-# 清洗，再由本模块拼上受控 ANSI 颜色码后通过 _say_colored 输出。
-# 这样既能高亮，又不给恶意供应商注入终端序列的机会。
-
-_ANSI = {
-    "reset": "\x1b[0m",
-    "bold": "\x1b[1m",
-    "dim": "\x1b[2m",
-    "red": "\x1b[31m",
-    "green": "\x1b[32m",
-    "yellow": "\x1b[33m",
-    "blue": "\x1b[34m",
-    "magenta": "\x1b[35m",
-    "cyan": "\x1b[36m",
-    "gray": "\x1b[90m",
-}
-
-
-def _use_color() -> bool:
-    """是否启用颜色。默认对 TTY 启用；NO_COLOR / --no-color / 非 TTY 时关闭。"""
-    if os.environ.get("NO_COLOR"):
-        return False
-    if os.environ.get("CCPULSE_NO_COLOR"):
-        return False
-    try:
-        return bool(_human_out.isatty())
-    except (AttributeError, OSError):
-        return False
-
-
-def _c(text: str, *styles) -> str:
-    """给文本包一层 ANSI 样式；非 TTY 或禁用时返回原文。"""
-    if not _use_color():
-        return text
-    prefix = "".join(_ANSI[s] for s in styles if s in _ANSI)
-    return f"{prefix}{text}{_ANSI['reset']}"
-
-
-def _say_colored(text: str, **k) -> None:
-    """打印一行带颜色的文本：外部字段应事先 sanitize，颜色码由本模块拼上。"""
-    k.setdefault("flush", True)
-    with _say_lock:
-        print(text, file=_human_out, **k)
 
 
 def _status_badge(ok: bool, http_status: int | None, error_category: str | None) -> str:
@@ -2656,10 +2608,14 @@ def run_health_check(args, providers, say) -> int:
                 f"  · {p.name[:22]:22} {r['tier']:6} [{st}] {r.get('elapsed', 0)}s {err}"
             )
 
-    with ThreadPoolExecutor(max_workers=_workers) as ex:
-        futs = {
-            ex.submit(
-                probe,
+    output_stream = _output_stream.get()
+
+    def _probe_in_parent_context(p: Provider) -> dict:
+        # ThreadPoolExecutor 不会自动复制上下文（只有 ProcessPoolExecutor 会），
+        # 这里显式把父线程的输出流传给 worker，否则 _on_attempt 的 say() 会落到 stdout。
+        token = _output_stream.set(output_stream)
+        try:
+            return probe(
                 p,
                 args.timeout,
                 args.skip_tls_verify,
@@ -2669,9 +2625,12 @@ def run_health_check(args, providers, say) -> int:
                 _on_attempt,
                 stainless_version=_sv,
                 stealth=_stealth,
-            ): p
-            for p in providers
-        }
+            )
+        finally:
+            _output_stream.reset(token)
+
+    with ThreadPoolExecutor(max_workers=_workers) as ex:
+        futs = {ex.submit(_probe_in_parent_context, p): p for p in providers}
         for i, fut in enumerate(as_completed(futs), 1):
             r = fut.result()
             results.append(r)
@@ -3374,7 +3333,9 @@ def run_inspect(args, providers, say) -> int:
         )
 
     context_result = {"status": "skipped"}
-    if "metadata" in include:
+    if "context" in include or (
+        getattr(args, "include", None) is None and "metadata" in include
+    ):
         has_declared = (
             metadata_result.get("declared_context_window") is not None
             and metadata_result.get("status") == "available"
@@ -3540,7 +3501,9 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             user_agent=_ua,
         )
     context_result = {"status": "skipped"}
-    if "metadata" in include:
+    if "context" in include or (
+        getattr(args, "include", None) is None and "metadata" in include
+    ):
         has_declared = (
             metadata_result.get("declared_context_window") is not None
             and metadata_result.get("status") == "available"
@@ -3947,6 +3910,15 @@ def _parse_since(s: str | None) -> int | None:
     return now - n * mult
 
 
+def _resolve_since_or_fail(args, output) -> tuple[int | None, int | None]:
+    """解析日志命令的 --since；失败时输出提示并返回 (None, 2)。"""
+    try:
+        return _parse_since(getattr(args, "since", None)), None
+    except ValueError as exc:
+        output(str(exc))
+        return None, 2
+
+
 def _fmt_ts(ts) -> str:
     if ts is None:
         return "?"
@@ -4266,11 +4238,9 @@ def read_log_file_tail(path: str, lines: int = 50, keyword: str | None = None) -
 
 def run_history(args, say) -> int:
     """history 子命令。"""
-    try:
-        since_ts = _parse_since(getattr(args, "since", None))
-    except ValueError as e:
-        say(str(e))
-        return 2
+    since_ts, error_code = _resolve_since_or_fail(args, say)
+    if error_code is not None:
+        return error_code
     limit = getattr(args, "limit", 20) or 20
     fails = getattr(args, "fails", False)
     prov = getattr(args, "provider", None) or None
@@ -4350,11 +4320,9 @@ def run_history(args, say) -> int:
 
 
 def run_stats(args, say) -> int:
-    try:
-        since_ts = _parse_since(getattr(args, "since", None))
-    except ValueError as e:
-        say(str(e))
-        return 2
+    since_ts, error_code = _resolve_since_or_fail(args, say)
+    if error_code is not None:
+        return error_code
     stats = query_stats(args.db, since_ts=since_ts)
     report = {
         "schema_version": 1,
@@ -4404,11 +4372,9 @@ def run_stats(args, say) -> int:
 
 
 def run_routing(args, say) -> int:
-    try:
-        since_ts = _parse_since(getattr(args, "since", None))
-    except ValueError as e:
-        say(str(e))
-        return 2
+    since_ts, error_code = _resolve_since_or_fail(args, say)
+    if error_code is not None:
+        return error_code
     limit = getattr(args, "limit", 20) or 20
     pairs = query_routing(args.db, since_ts=since_ts, limit=limit)
     report = {
@@ -4431,6 +4397,18 @@ def run_routing(args, say) -> int:
     return 0
 
 
+def _filter_new_watch_rows(rows, last_ts, seen_ids) -> list[dict]:
+    """筛出新 watch 行：created_at >= last_ts 且 (request_id, created_at) 组合键未见过。"""
+    out = []
+    for r in rows:
+        rid = str(r.get("request_id") or "")
+        cts = r.get("created_at") or 0
+        key = f"{rid}|{cts}"
+        if cts >= last_ts and key not in seen_ids:
+            out.append(r)
+    return out
+
+
 def run_watch(args, say) -> int:
     """轮询 proxy_request_logs，有新行就打印（Ctrl+C 退出）。"""
     interval = max(1, int(getattr(args, "interval", 3) or 3))
@@ -4443,9 +4421,10 @@ def run_watch(args, say) -> int:
     last_ts = bootstrap[0]["created_at"] if bootstrap else int(time.time())
     seen_ids: set[str] = set()
     if bootstrap:
-        rid = bootstrap[0].get("request_id")
+        rid = str(bootstrap[0].get("request_id") or "")
+        cts = bootstrap[0].get("created_at") or 0
         if rid:
-            seen_ids.add(str(rid))
+            seen_ids.add(f"{rid}|{cts}")
     say(
         f"watch: 每 {interval}s 轮询 proxy_request_logs"
         f"{'（仅失败）' if fails_only else ''}"
@@ -4463,22 +4442,11 @@ def run_watch(args, say) -> int:
                 provider_substr=prov,
             )
             # query 是 DESC；反转让旧的先打
-            new_rows = []
-            for r in reversed(rows):
-                rid = str(r.get("request_id") or "")
-                cts = r.get("created_at") or 0
-                if cts < last_ts:
-                    continue
-                if rid and rid in seen_ids:
-                    continue
-                # 同一秒内的新行：允许 cts==last_ts 但 id 未见过
-                if cts == last_ts and rid and rid in seen_ids:
-                    continue
-                new_rows.append(r)
+            new_rows = _filter_new_watch_rows(list(reversed(rows)), last_ts, seen_ids)
             for r in new_rows:
                 rid = str(r.get("request_id") or "")
-                if rid:
-                    seen_ids.add(rid)
+                cts = r.get("created_at") or 0
+                seen_ids.add(f"{rid}|{cts}")
                 st = r.get("status_code")
                 ok = st == 200 and not r.get("error_message")
                 badge = _status_badge(ok, st, r.get("error_category"))
@@ -4880,11 +4848,9 @@ def _fmt_ms(v) -> str:
 
 def run_analyze(args, say) -> int:
     """analyze 子命令：默认全维度报表，可用 --mode 选单个维度。"""
-    try:
-        since_ts = _parse_since(getattr(args, "since", None))
-    except ValueError as e:
-        say(str(e))
-        return 2
+    since_ts, error_code = _resolve_since_or_fail(args, say)
+    if error_code is not None:
+        return error_code
     id_map = load_provider_id_map(args.db)
     rows = query_analyze_raw(args.db, since_ts=since_ts)
     mode = getattr(args, "mode", "all") or "all"
@@ -5473,23 +5439,33 @@ def main():
     ap, *_ = _build_parser()
     args = ap.parse_args()
 
-    global _human_out
-    # JSON 输出时：人类可读走 stderr，stdout 仅承载 JSON
-    if getattr(args, "json", False) or (
-        args.command == "inspect" and not getattr(args, "human", False)
+    if getattr(args, "quiet", False) and (
+        getattr(args, "human", False) or getattr(args, "output_format", None) == "human"
     ):
-        _human_out = sys.stderr
-
-    # --quiet：只输出 NDJSON，关闭所有 say() 进度
-    quiet = getattr(args, "quiet", False)
-    if quiet:
-        if (
-            getattr(args, "human", False)
-            or getattr(args, "output_format", None) == "human"
-        ):
-            say("--quiet 与 --human 互斥；忽略 --human，强制 JSON", file=sys.stderr)
+        print(
+            "--quiet 与 --human 互斥；忽略 --human，强制 JSON",
+            file=sys.stderr,
+            flush=True,
+        )
         args.output_format = "json"
         args.human = False
+
+    output_token = _output_stream.set(
+        sys.stderr
+        if getattr(args, "json", False)
+        or (args.command == "inspect" and not getattr(args, "human", False))
+        else sys.stdout
+    )
+
+    try:
+        return _main_with_args(args)
+    finally:
+        _output_stream.reset(output_token)
+
+
+def _main_with_args(args) -> int:
+    """执行已解析参数；单独封装以保证输出 ContextVar 始终可恢复。"""
+    quiet = getattr(args, "quiet", False)
 
     def _say_silent(*a, **k):
         pass

@@ -234,11 +234,12 @@ python check_ccswitch_health.py history --fails \
 |------|---------|----------|
 | `--limit N` | Row count | history / routing |
 | `--fails` | Failures only | history |
-| `--since 24h\|7d\|30m\|seconds` | Time window | history / stats / routing |
+| `--since 24h\|7d\|30m\|seconds` | Time window | history / stats / routing / analyze |
 | `--provider substr` | Filter by name | history |
 | `--json` | JSON output | all three |
 | `--log-file PATH` | Tail on-disk log | history |
 | `--with-history` | Attach 24h summary after check/inspect | check / inspect |
+| `--history-since` | Time window used by `--with-history` | check / inspect |
 | `--interval N` | Poll interval seconds (default 3) | watch |
 
 Failures map into the same `error_category` enum used by live probes.
@@ -312,6 +313,10 @@ python check_ccswitch_health.py inspect \
 | `--probe-context 512k\|1m` | Context smoke tier | `512k` |
 | `--keep-suffix` | Keep `[1M]`-style suffixes in model ID | off |
 | `--ttft-timeout SEC` | Streaming first-token timeout | same as `--timeout` |
+| `--with-metadata` | Backward-compatible; metadata is already on and sends no extra request | off |
+| `--probe-delay SEC` | Delay between batch models | `3.0` |
+| `--max-retries N` | Retry count for 429 | `1` |
+| `--format human\|json` | Output format | `json` |
 | `--human` | Human-readable output (default is JSON) | off |
 | `--quiet` | Batch silent NDJSON + exit 0/3/4 | off |
 

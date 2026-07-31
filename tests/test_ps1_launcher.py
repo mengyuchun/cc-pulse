@@ -268,8 +268,41 @@ test("退出码 0（最终选 7 退出）", rc == 0, f"rc={rc}")
 test("提示无效输入", "无效" in combined)
 
 
-# 清理
-shutil.rmtree(tmp, ignore_errors=True)
+print("\n[PS1] 菜单失败返回主菜单不崩溃")
+# 不存在的数据库会令 Show-Banner 提前失败；按回车返回后应能继续菜单并正常退出。
+missing_db = db_path + ".missing"
+original_db = db_path
+try:
+    db_path = missing_db
+    rc, out, err = run_pwsh("1\n\n7\n")
+finally:
+    db_path = original_db
+combined = out + err
+test("提前返回后可继续退出", rc in (0, 1), f"rc={rc} output={combined[-300:]}")
+test("提前返回无类型转换异常", "Cannot convert" not in combined)
+
+
+print("\n[PS1] inspect 缺供应商返回主菜单不崩溃")
+empty_db = os.path.join(tmp, "empty.db")
+sqlite3.connect(empty_db).close()
+original_db = db_path
+try:
+    db_path = empty_db
+    rc, out, err = run_pwsh("4\n\n\n\n7\n")
+finally:
+    db_path = original_db
+combined = out + err
+test("inspect 提前返回后可继续退出", rc in (0, 1), f"rc={rc} output={combined[-300:]}")
+test("inspect 提前返回无类型转换异常", "Cannot convert" not in combined)
+missing_db = db_path + ".missing"
+original_db = db_path
+try:
+    db_path = missing_db
+    rc, out, err = run_pwsh("5\n2\n\n7\n")
+finally:
+    db_path = original_db
+combined = out + err
+test("日志命令失败码透传", rc == 1, f"rc={rc} output={combined[-300:]}")
 
 
 # 汇总

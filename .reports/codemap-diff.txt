@@ -1,0 +1,36 @@
+Codemap update: initial generation
+Date: 2026-07-31
+
+Previous codemaps: none
+Diff calculation: not applicable (first generation)
+
+Files scanned:
+- check_ccswitch_health.py
+- ccpulse_output.py
+- run_health_check.ps1
+- justfile
+- requirements.txt
+- tests/test_ccpulse_full.py
+- tests/test_p0_protocol_fix.py
+- tests/test_ps1_launcher.py
+- tests/test_docs_consistency.py
+- CLAUDE.md
+
+Added:
+- docs/CODEMAPS/architecture.md
+- docs/CODEMAPS/backend.md
+- docs/CODEMAPS/data.md
+- docs/CODEMAPS/dependencies.md
+
+Not generated:
+- frontend.md: no browser frontend; PowerShell launcher is covered by architecture/backend maps.
+
+Dependencies detected:
+- Runtime: Python standard library only.
+- Development: ruff, just.
+- External/local services: cc-switch SQLite/logs, configured provider HTTP APIs, optional local Claude CLI version lookup.
+
+Architecture notes:
+- One Python CLI entry point with live probe and read-only analytics commands.
+- Output isolation/sanitization resides in ccpulse_output.py.
+- No documents were stale because this is the first codemap generation.

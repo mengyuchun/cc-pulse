@@ -281,6 +281,7 @@ python check_ccswitch_health.py analyze --since 7d --json
 | `--json` | JSON 输出 | history / stats / routing / analyze |
 | `--log-file PATH` | 磁盘日志尾部 | history |
 | `--with-history` | check/inspect 后附 24h 摘要 | check / inspect |
+| `--history-since` | `--with-history` 的时间窗口 | check / inspect |
 | `--interval N` | 轮询间隔秒（默认 3） | watch |
 
 失败原因会映射到与探测相同的 `error_category`（如 `authentication` / `rate_limit` / `network` / `model_not_found`）。
@@ -323,6 +324,10 @@ python check_ccswitch_health.py inspect \
 | `--probe-context 512k\|1m` | 上下文冒烟档位 | `512k` |
 | `--keep-suffix` | 保留模型 ID 的 `[1M]` 后缀 | 关 |
 | `--ttft-timeout SEC` | 流式首 token 超时 | 用 `--timeout` |
+| `--with-metadata` | 兼容旧命令；metadata 默认已开启，不会额外发请求 | 关 |
+| `--probe-delay SEC` | 批量模型间延迟 | `3.0` |
+| `--max-retries N` | 429 重试次数 | `1` |
+| `--format human\|json` | 输出格式 | `json` |
 | `--human` | 人类可读输出（默认 JSON） | 关 |
 | `--quiet` | 批量静默 NDJSON + 退出码 0/3/4 | 关 |
 

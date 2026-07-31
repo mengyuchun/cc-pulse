@@ -45,7 +45,7 @@ class ProbeStreamConsistency(unittest.TestCase):
         ) as file:
             source = file.read()
         start = source.index("def probe_stream(")
-        end = source.index("\n\n# 全局输出目标", start)
+        end = source.index("\n\ndef _status_badge", start)
         self.assertIn("_answer_correct(answer_text, expected)", source[start:end])
 
 

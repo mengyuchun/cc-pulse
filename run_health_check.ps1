@@ -140,7 +140,7 @@ function Menu-HealthCheckQuick {
     $typeLabel = $script:AdvType
     $scopeLabel = if ($script:AdvScope -eq "all") { "全部" } else { "队列+当前" }
     if (-not (Show-Banner "健康检测 · 快速体检（$typeLabel / $scopeLabel）")) {
-        Read-Host "按回车返回主菜单"; return 1
+        Read-Host "按回车返回主菜单" | Out-Null; return 1
     }
     $cmdArgs = [System.Collections.Generic.List[string]]::new()
     $cmdArgs.Add("check")
@@ -162,7 +162,7 @@ function Menu-HealthCheckQuick {
 # ── [2] 健康检测 · 自定义（选类型/范围） ─────────────────────────
 function Menu-HealthCheckCustom {
     if (-not (Show-Banner "健康检测 · 自定义")) {
-        Read-Host "按回车返回主菜单"; return 1
+        Read-Host "按回车返回主菜单" | Out-Null; return 1
     }
     $type = Get-AppType
     Write-Host ""
@@ -217,7 +217,7 @@ function Menu-HealthCheckCustom {
         }
         if ([string]::IsNullOrWhiteSpace($selectedProviderArg)) {
             Write-Host "未选择供应商，返回主菜单。" -ForegroundColor Yellow
-            Read-Host "按回车"; return 1
+            Read-Host "按回车" | Out-Null; return 1
         }
     }
 
@@ -245,7 +245,7 @@ function Menu-HealthCheckCustom {
 # ── [3] 拉模型列表 ──────────────────────────────────────────────
 function Menu-ListModels {
     if (-not (Show-Banner "拉取供应商 /v1/models 模型目录")) {
-        Read-Host "按回车返回主菜单"; return 1
+        Read-Host "按回车返回主菜单" | Out-Null; return 1
     }
     $type = Get-AppType
     Write-Host ""
@@ -293,7 +293,7 @@ function Menu-ListModels {
 # ── [4] 深度诊断 inspect（精简：type → provider → model） ─────
 function Menu-Inspect {
     if (-not (Show-Banner "深度诊断 (inspect)")) {
-        Read-Host "按回车返回主菜单"; return 1
+        Read-Host "按回车返回主菜单" | Out-Null; return 1
     }
     $type = Get-AppType
     Write-Host ""
@@ -347,7 +347,7 @@ function Menu-Inspect {
     }
     if ($providers.Count -eq 0 -or [string]::IsNullOrWhiteSpace($provider)) {
         Write-Host "未提供供应商名，返回主菜单。" -ForegroundColor Yellow
-        Read-Host "按回车"; return 1
+        Read-Host "按回车" | Out-Null; return 1
     }
     Write-Host ""
 
@@ -391,7 +391,7 @@ function Menu-Inspect {
         }
         if ($tasks.Count -eq 0) {
             Write-Host "所选供应商均无对应档位模型，返回主菜单。" -ForegroundColor Yellow
-            Read-Host "按回车"; return 1
+            Read-Host "按回车" | Out-Null; return 1
         }
         Write-Host "将检测 $($tasks.Count) 个 (供应商, 档位) 组合:" -ForegroundColor Green
         foreach ($t in $tasks) { Write-Host "  · $($t.provider) [$($t.tier)] -> $($t.model)" -ForegroundColor White }
@@ -479,7 +479,7 @@ function Menu-Inspect {
                 }
                 if ($selected.Count -eq 0) {
                     Write-Host "无效选择，返回主菜单。" -ForegroundColor Yellow
-                    Read-Host "按回车"; return 1
+                    Read-Host "按回车" | Out-Null; return 1
                 }
                 $selectedModels = $selected -join ","
             }
@@ -625,7 +625,7 @@ function Menu-Inspect {
     }
     if ([string]::IsNullOrWhiteSpace($model)) {
         Write-Host "未提供模型 ID，返回主菜单。" -ForegroundColor Yellow
-        Read-Host "按回车"; return 1
+        Read-Host "按回车" | Out-Null; return 1
     }
     $keepSuffix = $false
     if ($model -match '\[.+\]$') {
@@ -660,7 +660,7 @@ function Menu-Inspect {
 # ── [5] 运行日志（只读 cc-switch 历史） ──────────────────────────
 function Menu-Logs {
     if (-not (Show-Banner "运行日志 · 只读 cc-switch proxy 日志")) {
-        Read-Host "按回车返回主菜单"; return 1
+        Read-Host "按回车返回主菜单" | Out-Null; return 1
     }
     Write-Host "请选择:" -ForegroundColor Yellow
     Write-Host "  [1] 最近失败日志        history --fails" -ForegroundColor White
@@ -671,45 +671,46 @@ function Menu-Logs {
     Write-Host "  [6] 分析报表            analyze · 按天/模型/供应商交叉"
     Write-Host "  [7] 返回主菜单"
     $c = Read-Host "输入 1-7 (默认1)"
+    $code = 0
     switch ($c) {
         "2" {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--limit"); $cmdArgs.Add("30")
             Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "history"
-            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
         "3" {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("stats"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
-            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
         "4" {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("routing"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--since"); $cmdArgs.Add("7d"); $cmdArgs.Add("--limit"); $cmdArgs.Add("20")
-            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
         "5" {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("watch"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--interval"); $cmdArgs.Add("3")
             Write-Host "实时监控中，Ctrl+C 结束…" -ForegroundColor Cyan
-            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
         "6" {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("analyze"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
-            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
         "7" { return 0 }
         default {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--fails"); $cmdArgs.Add("--limit"); $cmdArgs.Add("30")
-            $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
     }
     Write-Host ""
@@ -717,7 +718,7 @@ function Menu-Logs {
     Write-Host "  [2] 返回主菜单" -ForegroundColor White
     $again = Read-Host "选择（默认 2）"
     if ($again -eq "1") { return (Menu-Logs) }
-    return 0
+    return $code
 }
 
 # ── [6] 高级设置（进程内有效） ───────────────────────────────────
@@ -789,7 +790,7 @@ function Menu-AdvancedSettings {
 
     Write-Host ""
     Write-Host "已保存。JSON/stealth/max-tokens/thinking/UA 作用于 check；类型/范围作用于快速体检；上下文档位与 vision 仅 inspect。" -ForegroundColor Green
-    Read-Host "按回车返回主菜单"
+    Read-Host "按回车返回主菜单" | Out-Null
 }
 
 # ── 主菜单循环 ──────────────────────────────────────────────────
@@ -810,21 +811,25 @@ function Show-MainMenu {
     return [Console]::In.ReadLine()
 }
 
+$script:LastMenuCode = 0
 while ($true) {
     $choice = Show-MainMenu
-    if ($null -eq $choice) { exit 0 }   # stdin 结束，退出而非重绘
+    if ($null -eq $choice) { exit $script:LastMenuCode }  # stdin 结束，退出而非重绘
+    $menuCode = $null
     switch ($choice.Trim()) {
-        ""  { $null = Menu-HealthCheckQuick }
-        "1" { $null = Menu-HealthCheckQuick }
-        "2" { $null = Menu-HealthCheckCustom }
-        "3" { $null = Menu-ListModels }
-        "4" { $null = Menu-Inspect }
-        "5" { $null = Menu-Logs }
-        "6" { $null = Menu-AdvancedSettings }
-        "7" { exit 0 }
+        ""  { $menuCode = Menu-HealthCheckQuick }
+        "1" { $menuCode = Menu-HealthCheckQuick }
+        "2" { $menuCode = Menu-HealthCheckCustom }
+        "3" { $menuCode = Menu-ListModels }
+        "4" { $menuCode = Menu-Inspect }
+        "5" { $menuCode = Menu-Logs }
+        "6" { $menuCode = Menu-AdvancedSettings }
+        "7" { exit $script:LastMenuCode }
         default {
             Write-Host "无效输入: '$choice'" -ForegroundColor Red
             Read-Host "按回车重试"
+            continue
         }
     }
+    if ($null -ne $menuCode) { $script:LastMenuCode = [int]$menuCode }
 }

@@ -24,8 +24,11 @@ from typing import ClassVar
 
 # 从项目根定位主脚本与当前解释器（可从任意目录运行）
 _HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(os.path.dirname(_HERE), "check_ccswitch_health.py")
+_ROOT = os.path.dirname(_HERE)
+SCRIPT = os.path.join(_ROOT, "check_ccswitch_health.py")
 PY = sys.executable
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 # 1. 通过 importlib 加载项目模块
 import importlib.util
@@ -1912,6 +1915,56 @@ finally:
     srv.shutdown()
 
 
+print("\n[End-to-end] context 冒烟守卫（显式 include 运行 / 未含时跳过）")
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    # 'context' 显式在 --include 里 → 必须运行冒烟（mock 未专门处理，status 非 skipped）
+    rc, out, err = run_cli(
+        [
+            "inspect",
+            "--provider",
+            "Mock-Provider",
+            "--model",
+            "claude-sonnet-4-5",
+            "--include",
+            "text,context",
+        ],
+        timeout=30,
+    )
+    j = json.loads(out) if out else {}
+    test(
+        "include=text,context → context 非 skipped",
+        j.get("context", {}).get("status") != "skipped",
+        f"context={j.get('context')} rc={rc} err={err[:150]}",
+    )
+    # --include metadata → context 不冒烟，metadata 正常跑
+    rc, out, err = run_cli(
+        [
+            "inspect",
+            "--provider",
+            "Mock-Provider",
+            "--model",
+            "claude-sonnet-4-5",
+            "--include",
+            "metadata",
+        ]
+    )
+    j = json.loads(out) if out else {}
+    test(
+        "include=metadata → context skipped",
+        j.get("context", {}).get("status") == "skipped",
+        f"context={j.get('context')} rc={rc} err={err[:150]}",
+    )
+    test(
+        "include=metadata → metadata 已跑",
+        j.get("metadata", {}).get("status") == "available",
+        f"metadata={j.get('metadata')}",
+    )
+finally:
+    srv.shutdown()
+
+
 print("\n[End-to-end] vision 显式 include")
 srv, port = start_server(MockAnthropicHandler)
 try:
@@ -2083,6 +2136,49 @@ try:
     test("quiet 部分失败 exit 3", rc == 3, f"rc={rc} out={out[:300]} err={err[:150]}")
     lines = [ln for ln in out.strip().splitlines() if ln.strip()]
     test("quiet 部分失败 NDJSON 2 行", len(lines) == 2, f"n={len(lines)}")
+finally:
+    srv.shutdown()
+
+
+print("\n[End-to-end] inspect --quiet --human 不崩溃、stdout 保持 NDJSON")
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    rc, out, err = run_cli(
+        [
+            "inspect",
+            "--provider",
+            "Mock-Provider",
+            "--all-models",
+            "--include",
+            "text",
+            "--quiet",
+            "--human",
+            "--probe-delay",
+            "0",
+        ],
+        timeout=30,
+    )
+    test(
+        "quiet --human 退出码 ∈ (0,1,2)",
+        rc in (0, 1, 2),
+        f"rc={rc} out={out[:120]!r} err={err[:200]!r}",
+    )
+    test(
+        "quiet --human stderr 无 Traceback", "Traceback" not in err, f"err={err[:300]}"
+    )
+    lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+    ok_json = True
+    for ln in lines:
+        try:
+            json.loads(ln)
+        except (json.JSONDecodeError, TypeError):
+            ok_json = False
+    test(
+        "quiet --human stdout 每行可 json.loads",
+        ok_json and len(lines) >= 1,
+        f"n={len(lines)} out={out[:200]!r}",
+    )
 finally:
     srv.shutdown()
 
@@ -2443,8 +2539,7 @@ print("\n[Unit] say() 默认 flush + ANSI 清理")
 import io
 
 buf = io.StringIO()
-old = mod._human_out
-mod._human_out = buf
+token = mod._output_stream.set(buf)
 try:
     mod.say("progress-line")
     test("say 写入内容", "progress-line" in buf.getvalue())
@@ -2454,8 +2549,93 @@ try:
     val = buf.getvalue()
     test("say 剥离 ANSI 转义", "\x1b" not in val, f"val={val!r}")
     test("say 保留正常文本", "eviltext" in val and "end" in val, f"val={val!r}")
+    # C1 控制符 U+0080–U+009F（\x9b CSI / \x9d OSC 终止符）同样剥离
+    buf.truncate(0)
+    buf.seek(0)
+    mod.say("evil\x9b38;2;255;0;0mred\x9d")
+    val = buf.getvalue()
+    test(
+        "say 剥离 C1 控制字符",
+        "\x9b" not in val and "\x9d" not in val,
+        f"val={val!r}",
+    )
+    test(
+        "_sanitize_for_terminal 剥 C1 字节",
+        "\x9b" not in mod._sanitize_for_terminal("\x9b2J"),
+        f"s={mod._sanitize_for_terminal('\x9b2J')!r}",
+    )
 finally:
-    mod._human_out = old
+    mod._output_stream.reset(token)
+
+
+print("\n[Unit] _filter_new_watch_rows 去重 helper")
+
+
+def _watch_new(rows, last_ts, seen_ids):
+    """调用契约纯函数；兼容返回 (new_rows, new_seen) 与仅返回 list 两种形态。"""
+    out = mod._filter_new_watch_rows(rows, last_ts, seen_ids)
+    if isinstance(out, tuple) and len(out) == 2:
+        new_rows, new_seen = out
+        seen_ids.clear()
+        seen_ids.update(new_seen)
+    else:
+        new_rows = out
+        # 兼容形态：函数不就地更新 seen_ids 时，测试按契约键 f"{rid}|{cts}" 补充
+        for r in new_rows:
+            seen_ids.add(f"{r.get('request_id') or ''}|{r.get('created_at') or 0}")
+    return list(new_rows)
+
+
+# 同 request_id 在第二次调用时被过滤
+_seen = set()
+_row = {"created_at": 1000, "request_id": "r1", "provider_name": "P"}
+_first = _watch_new([_row], 1000, _seen)
+_second = _watch_new([_row], 1000, _seen)
+test(
+    "watch 同 request_id 第二次过滤",
+    len(_first) == 1 and len(_second) == 0,
+    f"1st={len(_first)} 2nd={len(_second)}",
+)
+
+# 空 request_id 且 created_at 相同 → 同秒内去重；跨秒则是新行
+_seen = set()
+_row_e = {"created_at": 2000, "request_id": "", "provider_name": "P"}
+_e1 = _watch_new([_row_e], 2000, _seen)
+_e2 = _watch_new([_row_e], 2000, _seen)
+test(
+    "watch 空 request_id 同秒去重",
+    len(_e1) == 1 and len(_e2) == 0,
+    f"1st={len(_e1)} 2nd={len(_e2)}",
+)
+_row_e2 = {"created_at": 2001, "request_id": "", "provider_name": "P"}
+_e3 = _watch_new([_row_e2], 2000, _seen)
+test("watch 空 request_id 跨秒保留", len(_e3) == 1, f"n={len(_e3)}")
+
+# created_at < last_ts 的行被排除
+_seen = set()
+_old_rows = [
+    {"created_at": 900, "request_id": "x", "provider_name": "P"},
+    {"created_at": 1000, "request_id": "y", "provider_name": "P"},
+]
+_out_old = _watch_new(_old_rows, 1000, _seen)
+test(
+    "watch created_at<last_ts 排除",
+    [r["request_id"] for r in _out_old] == ["y"],
+    f"out={_out_old}",
+)
+
+# created_at >= last_ts 且键未见过的行被保留
+_seen = set()
+_new_rows = [
+    {"created_at": 1000, "request_id": "n1", "provider_name": "P"},
+    {"created_at": 1001, "request_id": "n2", "provider_name": "P"},
+]
+_out_new = _watch_new(_new_rows, 1000, _seen)
+test(
+    "watch 未见过键保留",
+    {r["request_id"] for r in _out_new} == {"n1", "n2"},
+    f"out={_out_new}",
+)
 
 
 print("\n[Unit] extract_usage 缺字段/空 → missing_fields")
@@ -2644,8 +2824,23 @@ test("vision codex unsupported", r.get("status") == "unsupported", f"r={r}")
 
 
 print("\n[Unit] classify_log_error + parse_since + history helpers")
-test("parse_since 24h", mod._parse_since("24h") is not None)
-test("parse_since 7d", mod._parse_since("7d") is not None)
+old_time = mod.time.time
+mod.time.time = lambda: 1_000_000
+try:
+    test("parse_since 24h", mod._parse_since("24h") == 913_600)
+    test("parse_since 7d", mod._parse_since("7d") == 395_200)
+    test("parse_since 30m", mod._parse_since("30m") == 998_200)
+    test("parse_since seconds", mod._parse_since("3600") == 996_400)
+    test("parse_since normalizes case", mod._parse_since(" 24H ") == 913_600)
+    test("parse_since empty", mod._parse_since(None) is None)
+    try:
+        mod._parse_since("7x")
+        parsed_invalid = False
+    except ValueError:
+        parsed_invalid = True
+    test("parse_since rejects invalid unit", parsed_invalid)
+finally:
+    mod.time.time = old_time
 test(
     "classify 401 invalid api",
     mod.classify_log_error(401, "Invalid API key.") == "authentication",
@@ -3011,6 +3206,25 @@ test(
     f"report={history_report}",
 )
 
+# --since 非法 → exit 2 + stderr 提示（--json 下不输出可解析 JSON）
+rc, out, err = run_cli_db(["history", "--since", "7x", "--json"], log_db)
+test("history --since 7x → exit 2", rc == 2, f"rc={rc}")
+try:
+    json.loads(out)
+    bad_json = False
+except (json.JSONDecodeError, TypeError):
+    bad_json = True
+test(
+    "history --since 7x stdout 非 JSON",
+    bad_json or out.strip() == "",
+    f"out={out[:100]!r}",
+)
+test(
+    "history --since 7x stderr 含 无法解析",
+    "无法解析" in err,
+    f"err={err[:150]!r}",
+)
+
 rc, out, err = run_cli_db(["stats", "--json", "--since", "7d"], log_db)
 stats_report = json.loads(out) if out else {}
 test("stats CLI exit 0", rc == 0, f"rc={rc} err={err[:200]}")
@@ -3051,7 +3265,13 @@ watch_proc = subprocess.Popen(
     text=True,
 )
 try:
-    time.sleep(0.2)
+    deadline = time.monotonic() + 2
+    watch_out = ""
+    watch_err = ""
+    while time.monotonic() < deadline:
+        if watch_proc.poll() is not None:
+            break
+        time.sleep(0.1)
     watch_proc.terminate()
     watch_out, watch_err = watch_proc.communicate(timeout=3)
 except subprocess.TimeoutExpired:
