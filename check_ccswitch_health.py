@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from ccpulse_archive import parse_since, run_trend
+from ccpulse_env import run_env_check
 from ccpulse_output import (
     _c,
     _output_stream,
@@ -2559,6 +2561,40 @@ def run_list_models(args, providers, say) -> int:
     return 0
 
 
+def _archive_check_results(args, providers, results) -> None:
+    """把 check 探测结果追加到本地归档（供 trend 跨次聚合）。
+
+    每条 provider 记录：ts / provider / model / status / latency / ttft / error_category。
+    失败不阻断探测：IO 或数据异常全部吞掉。
+    """
+    try:
+        from ccpulse_archive import append_record, archive_path
+
+        path = archive_path(getattr(args, "archive", None))
+        now = int(time.time())
+        for r in results:
+            ok = r.get("overall_ok")
+            bt = r.get("best_tier")
+            attempt = None
+            if ok and bt:
+                attempt = next((a for a in r["attempts"] if a["tier"] == bt), None)
+            if attempt is None and r["attempts"]:
+                attempt = r["attempts"][0]
+            record = {
+                "ts": now,
+                "command": "check",
+                "provider": r.get("name", "?"),
+                "model": (attempt or {}).get("model", "?") or "?",
+                "status": "ok" if ok else "fail",
+                "latency": (attempt or {}).get("elapsed"),
+                "ttft": (attempt or {}).get("ttft_seconds"),
+                "error_category": (attempt or {}).get("error_category"),
+            }
+            append_record(path, record)
+    except Exception:  # noqa: BLE001, S110 - 归档失败不影响健康检测
+        pass
+
+
 def run_health_check(args, providers, say) -> int:
     """对每个供应商按档位回退顺序进行真实问题探测。
 
@@ -2723,6 +2759,9 @@ def run_health_check(args, providers, say) -> int:
             "providers": results_sorted,
         }
         print(json.dumps(json_report, ensure_ascii=False, indent=2), flush=True)
+
+    # 归档：每次 check 探测结果追加一行 JSONL（供 trend 跨次聚合），失败不阻断
+    _archive_check_results(args, providers, results)
     return 0 if ok else 1
 
 
@@ -3429,7 +3468,7 @@ def run_inspect(args, providers, say) -> int:
         try:
             since = getattr(args, "history_since", "24h") or "24h"
             report["history"] = summarize_provider_history(
-                args.db, inspect_p.name, since_ts=_parse_since(since)
+                args.db, inspect_p.name, since_ts=parse_since(since)
             )
             report["history_since"] = since
         except Exception as e:  # noqa: BLE001 - 历史附加信息不能中断 inspect
@@ -3450,6 +3489,33 @@ def run_inspect(args, providers, say) -> int:
         say(text)
     else:
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+
+    # 归档：inspect 结果追加一行（供 trend 跨次聚合），失败不阻断
+    try:
+        from ccpulse_archive import append_record, archive_path
+
+        lat = None
+        ttft = None
+        if streaming_result and streaming_result.get("ttft_seconds") is not None:
+            ttft = streaming_result["ttft_seconds"]
+        if text_result and text_result.get("elapsed") is not None:
+            lat = text_result.get("elapsed")
+        append_record(
+            archive_path(getattr(args, "archive", None)),
+            {
+                "ts": int(time.time()),
+                "command": "inspect",
+                "provider": inspect_p.name,
+                "model": model_id,
+                "status": "ok" if verdict in ("healthy", "skipped") else "fail",
+                "latency": lat,
+                "ttft": ttft,
+                "error_category": (text_result or {}).get("error_category"),
+            },
+        )
+    except Exception:  # noqa: BLE001, S110 - 归档失败不影响 inspect
+        pass
+
     return 0 if verdict in ("healthy", "skipped") else 1
 
 
@@ -3894,26 +3960,10 @@ def format_inspect_human(r: dict) -> str:
 LOGS_DIR = str(Path.home() / ".cc-switch" / "logs")
 
 
-def _parse_since(s: str | None) -> int | None:
-    """解析 --since：24h / 7d / 30m / 3600 → unix 秒下限；None 表示不限。"""
-    if not s:
-        return None
-    s = str(s).strip().lower()
-    now = int(time.time())
-    if s.isdigit():
-        return now - int(s)
-    m = re.fullmatch(r"(\d+)([smhd])", s)
-    if not m:
-        raise ValueError(f"无法解析 --since: {s!r}（示例: 24h / 7d / 30m / 3600）")
-    n, u = int(m.group(1)), m.group(2)
-    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[u]
-    return now - n * mult
-
-
 def _resolve_since_or_fail(args, output) -> tuple[int | None, int | None]:
     """解析日志命令的 --since；失败时输出提示并返回 (None, 2)。"""
     try:
-        return _parse_since(getattr(args, "since", None)), None
+        return parse_since(getattr(args, "since", None)), None
     except ValueError as exc:
         output(str(exc))
         return None, 2
@@ -5009,9 +5059,9 @@ def run_analyze(args, say) -> int:
 def format_history_sidebar(db_path: str, provider_name: str, since: str = "24h") -> str:
     """给 check/inspect 附带的一行历史摘要。"""
     try:
-        since_ts = _parse_since(since)
+        since_ts = parse_since(since)
     except ValueError:
-        since_ts = _parse_since("24h")
+        since_ts = parse_since("24h")
     s = summarize_provider_history(db_path, provider_name, since_ts=since_ts)
     if not s:
         return f"  history({since}): 无记录"
@@ -5036,6 +5086,8 @@ SUBCOMMANDS = (
     "routing",
     "watch",
     "analyze",
+    "env-check",
+    "trend",
 )
 # 主解析器上带值的全局选项：扫描子命令时要连它的值一起跳过，
 # 否则 `--db list-models` 这类会把选项的值误认成子命令。
@@ -5175,6 +5227,11 @@ def _build_parser():
         "--history-since",
         default="24h",
         help="--with-history 时间窗口（默认 24h；如 7d / 30m）",
+    )
+    p_check.add_argument(
+        "--archive",
+        default=None,
+        help="探测历史归档路径（默认 ~/.cc-pulse/probe_history.jsonl）",
     )
     # 探测 token 预算：故意挂在 check 子解析器，不放 common（见 common 定义处说明）
     p_check.add_argument(
@@ -5360,6 +5417,11 @@ def _build_parser():
         "--history-since", default="24h", help="--with-history 时间窗口（默认 24h）"
     )
     p_inspect.add_argument(
+        "--archive",
+        default=None,
+        help="探测历史归档路径（默认 ~/.cc-pulse/probe_history.jsonl）",
+    )
+    p_inspect.add_argument(
         "--probe-max-tokens",
         type=int,
         default=PROBE_MAX_TOKENS,
@@ -5429,6 +5491,30 @@ def _build_parser():
     )
     p_analyze.add_argument("--json", action="store_true", help="JSON 输出")
 
+    p_env = sub.add_parser(
+        "env-check",
+        parents=[common],
+        help="检测环境变量是否覆盖 cc-switch 所选供应商（静默路由排查）",
+    )
+    p_env.add_argument("--json", action="store_true", help="JSON 输出")
+
+    p_trend = sub.add_parser(
+        "trend",
+        parents=[common],
+        help="读取本地探测归档，按供应商/模型聚合趋势（成功率/延迟分位/错误分类）",
+    )
+    p_trend.add_argument(
+        "--since", default="7d", help="时间窗口：24h / 7d / 30m / 秒数（默认 7d）"
+    )
+    p_trend.add_argument(
+        "--archive",
+        default=None,
+        help="归档文件路径（默认 ~/.cc-pulse/probe_history.jsonl）",
+    )
+    p_trend.add_argument("--provider", default=None, help="只统计指定供应商")
+    p_trend.add_argument("--model", default=None, help="只统计指定模型")
+    p_trend.add_argument("--json", action="store_true", help="JSON 输出")
+
     # 兜底默认（注入 check 后子解析器会覆盖这些）
     ap.set_defaults(command="check", type="claude", failover_only=False, json=False)
     return ap, common, p_check, p_lm, p_inspect, p_hist, p_stats, p_route, p_watch
@@ -5477,6 +5563,10 @@ def _main_with_args(args) -> int:
 
     if args.skip_tls_verify:
         say("警告：已跳过 TLS 证书验证，认证凭据可能遭中间人截获。")
+
+    # trend：读 CC-Pulse 自己的探测归档，不需要 cc-switch db
+    if args.command == "trend":
+        return run_trend(args, say)
 
     if not Path(args.db).exists():
         say(f"数据库不存在: {args.db}")
@@ -5541,6 +5631,9 @@ def _main_with_args(args) -> int:
 
     if args.command == "inspect":
         return run_inspect(args, providers, out_say)
+
+    if args.command == "env-check":
+        return run_env_check(args, providers, say)
 
     say(f"未知子命令: {args.command}")
     return 2

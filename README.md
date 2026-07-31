@@ -286,6 +286,52 @@ python check_ccswitch_health.py analyze --since 7d --json
 
 失败原因会映射到与探测相同的 `error_category`（如 `authentication` / `rate_limit` / `network` / `model_not_found`）。
 
+### `env-check` —— 环境变量覆盖检测
+
+检测环境变量是否会覆盖 cc-switch 所选供应商——"静默路由"的最大来源（如终端里设置了 `ANTHROPIC_BASE_URL`/`AUTH_TOKEN`，会盖过你在 cc-switch 里切的供应商）。只读环境变量与配置，不发 HTTP。
+
+```bash
+# 人类可读
+python check_ccswitch_health.py env-check
+
+# JSON（findings + conflicts 计数）
+python check_ccswitch_health.py env-check --json
+```
+
+退出码：有冲突（环境变量会覆盖 current provider）返回 **2**，否则 0。密钥只显示掩码（前 6 位 + `***`），绝不打印明文。
+
+| 参数 | 说明 |
+|------|------|
+| `--json` | JSON 输出 |
+
+### `trend` —— 探测历史趋势
+
+`check`/`inspect` 每次探测会追加一行到本地归档（默认 `~/.cc-pulse/probe_history.jsonl`，绝不写 cc-switch 的库）。`trend` 读取归档，按供应商聚合成功率 / 延迟分位 / 错误分类 / 按天趋势——暴露"降级"而非单点快照。
+
+```bash
+# 近 7 天趋势
+python check_ccswitch_health.py trend --since 7d
+
+# 只看某供应商 / 某模型
+python check_ccswitch_health.py trend --provider DeepSeek --since 30d
+
+# 指定归档文件（与 check --archive 配合）
+python check_ccswitch_health.py trend --archive ~/my_history.jsonl
+
+# JSON 输出
+python check_ccswitch_health.py trend --since 7d --json
+```
+
+`check`/`inspect` 可用 `--archive PATH` 覆盖归档路径，便于按项目/机器隔离历史。
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--since 24h\|7d\|30m\|秒` | 时间窗口 | `7d` |
+| `--archive PATH` | 归档文件路径 | `~/.cc-pulse/probe_history.jsonl` |
+| `--provider` | 只统计指定供应商 | 全部 |
+| `--model` | 只统计指定模型 | 全部 |
+| `--json` | JSON 输出 | 关 |
+
 ### `inspect` —— 单模型深度诊断
 
 ```bash

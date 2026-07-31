@@ -85,6 +85,16 @@ test-all:
     {{PYTHON}} tests/test_ccpulse_full.py
     {{PYTHON}} tests/test_p0_protocol_fix.py
     {{PYTHON}} tests/test_ps1_launcher.py
+    {{PYTHON}} tests/test_env_check.py
+    {{PYTHON}} tests/test_archive_trend.py
+
+# 探测历史趋势（归档跨次聚合）
+trend:
+    {{PYTHON}} {{SCRIPT}} trend --since 7d
+
+# 环境变量覆盖检测（静默路由排查）
+env-check:
+    {{PYTHON}} {{SCRIPT}} env-check
 
 # Lint with ruff
 lint:

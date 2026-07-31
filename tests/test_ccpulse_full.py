@@ -2824,23 +2824,25 @@ test("vision codex unsupported", r.get("status") == "unsupported", f"r={r}")
 
 
 print("\n[Unit] classify_log_error + parse_since + history helpers")
-old_time = mod.time.time
-mod.time.time = lambda: 1_000_000
+import ccpulse_archive
+
+old_time = ccpulse_archive.time.time
+ccpulse_archive.time.time = lambda: 1_000_000
 try:
-    test("parse_since 24h", mod._parse_since("24h") == 913_600)
-    test("parse_since 7d", mod._parse_since("7d") == 395_200)
-    test("parse_since 30m", mod._parse_since("30m") == 998_200)
-    test("parse_since seconds", mod._parse_since("3600") == 996_400)
-    test("parse_since normalizes case", mod._parse_since(" 24H ") == 913_600)
-    test("parse_since empty", mod._parse_since(None) is None)
+    test("parse_since 24h", mod.parse_since("24h") == 913_600)
+    test("parse_since 7d", mod.parse_since("7d") == 395_200)
+    test("parse_since 30m", mod.parse_since("30m") == 998_200)
+    test("parse_since seconds", mod.parse_since("3600") == 996_400)
+    test("parse_since normalizes case", mod.parse_since(" 24H ") == 913_600)
+    test("parse_since empty", mod.parse_since(None) is None)
     try:
-        mod._parse_since("7x")
+        mod.parse_since("7x")
         parsed_invalid = False
     except ValueError:
         parsed_invalid = True
     test("parse_since rejects invalid unit", parsed_invalid)
 finally:
-    mod.time.time = old_time
+    ccpulse_archive.time.time = old_time
 test(
     "classify 401 invalid api",
     mod.classify_log_error(401, "Invalid API key.") == "authentication",

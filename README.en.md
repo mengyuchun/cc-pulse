@@ -275,6 +275,52 @@ python check_ccswitch_health.py analyze --since 7d --json
 | `--since` | Time window | analyze |
 | `--json` | JSON output | analyze |
 
+### `env-check` — env override detection
+
+Detects whether environment variables override the cc-switch-selected provider — the biggest real-world source of "silent routing" (e.g. a terminal `ANTHROPIC_BASE_URL`/`AUTH_TOKEN` silently beats the provider you selected in cc-switch). Reads env + config only, no HTTP.
+
+```bash
+# Human-readable
+python check_ccswitch_health.py env-check
+
+# JSON (findings + conflict count)
+python check_ccswitch_health.py env-check --json
+```
+
+Exit code: **2** when conflicts exist (env would override the current provider), else 0. Secrets are masked (first 6 chars + `***`), never printed in full.
+
+| Flag | Meaning |
+|------|---------|
+| `--json` | JSON output |
+
+### `trend` — probe history trends
+
+Each `check`/`inspect` probe appends one line to a local archive (default `~/.cc-pulse/probe_history.jsonl`, never touches cc-switch's database). `trend` reads that archive and aggregates success rate / latency percentiles / error categories / per-day trend per provider — surfacing degradation instead of a single snapshot.
+
+```bash
+# Last 7 days
+python check_ccswitch_health.py trend --since 7d
+
+# Single provider / model
+python check_ccswitch_health.py trend --provider DeepSeek --since 30d
+
+# Custom archive (paired with check --archive)
+python check_ccswitch_health.py trend --archive ~/my_history.jsonl
+
+# JSON output
+python check_ccswitch_health.py trend --since 7d --json
+```
+
+`check`/`inspect` accept `--archive PATH` to override the archive path (per-project / per-machine isolation).
+
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `--since 24h\|7d\|30m\|seconds` | Time window | `7d` |
+| `--archive PATH` | Archive file path | `~/.cc-pulse/probe_history.jsonl` |
+| `--provider` | Restrict to one provider | all |
+| `--model` | Restrict to one model | all |
+| `--json` | JSON output | off |
+
 ### `inspect` — single-model deep diagnostics
 
 ```bash
