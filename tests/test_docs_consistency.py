@@ -4,6 +4,7 @@
 CI / pre-commit / `just lint-docs` 均可调用。
 退出码 0 = 通过，非 0 = 发现漂移。
 """
+
 import os
 import re
 import sys

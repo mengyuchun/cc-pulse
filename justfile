@@ -83,6 +83,7 @@ test-ps1:
 # 全部测试
 test-all:
     {{PYTHON}} tests/test_ccpulse_full.py
+    {{PYTHON}} tests/test_p0_protocol_fix.py
     {{PYTHON}} tests/test_ps1_launcher.py
 
 # Lint with ruff

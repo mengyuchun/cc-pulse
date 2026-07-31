@@ -309,27 +309,121 @@ function Menu-Inspect {
         $names = @()
     }
     $provider = ""
+    $providers = @()   # 多选时存供应商名数组
+    $multiProvider = $false
     if ($names.Count -gt 0) {
         for ($i = 0; $i -lt $names.Count; $i++) {
             Write-Host "  [$($i + 1)] $($names[$i])"
         }
-        $sel = Read-Host "输入序号选择，或直接输入供应商名（默认 1）"
+        Write-Host "  [a] 全部供应商" -ForegroundColor Cyan
+        $sel = Read-Host "输入序号（逗号分隔多选，如 1,3,5）或 a 全选（默认 1）"
         if ([string]::IsNullOrWhiteSpace($sel)) {
-            $provider = $names[0]
-        } elseif ($sel -match '^\d+$' -and [int]$sel -ge 1 -and [int]$sel -le $names.Count) {
-            $provider = $names[[int]$sel - 1]
+            $provider = $names[0]; $providers = @($names[0])
+        } elseif ($sel -eq "a" -or $sel -eq "A") {
+            $providers = @($names); $provider = $names -join ","; $multiProvider = $true
         } else {
-            $provider = $sel
+            $idxs = $sel -split "," | ForEach-Object { $_.Trim() }
+            $selectedNames = @()
+            foreach ($idx in $idxs) {
+                if ($idx -match '^\d+$' -and [int]$idx -ge 1 -and [int]$idx -le $names.Count) {
+                    $selectedNames += $names[[int]$idx - 1]
+                } elseif (-not [string]::IsNullOrWhiteSpace($idx)) {
+                    $selectedNames += $idx
+                }
+            }
+            if ($selectedNames.Count -eq 0) {
+                $provider = $names[0]; $providers = @($names[0])
+            } else {
+                $providers = @($selectedNames | Select-Object -Unique)
+                $provider = $providers -join ","
+                $multiProvider = ($providers.Count -gt 1)
+            }
         }
     } else {
         Write-Host "未能拉取供应商列表，请手动输入。" -ForegroundColor Yellow
-        $provider = Read-Host "  供应商名（与 cc-switch 中一致）"
+        $provider = Read-Host "  供应商名（逗号分隔多选）"
+        $providers = @($provider -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $multiProvider = ($providers.Count -gt 1)
     }
-    if ([string]::IsNullOrWhiteSpace($provider)) {
+    if ($providers.Count -eq 0 -or [string]::IsNullOrWhiteSpace($provider)) {
         Write-Host "未提供供应商名，返回主菜单。" -ForegroundColor Yellow
         Read-Host "按回车"; return 1
     }
     Write-Host ""
+
+    # 多供应商分支：选档位 -> 对每家取该档位模型 fan-out inspect
+    if ($multiProvider) {
+        Write-Host "多供应商已选: $($providers.Count) 家" -ForegroundColor Green
+        Write-Host "选择档位（从每家 cc-switch 配置中取对应模型）:" -ForegroundColor Yellow
+        Write-Host "  [1] haiku   （默认）" -ForegroundColor White
+        Write-Host "  [2] sonnet" -ForegroundColor White
+        Write-Host "  [3] opus" -ForegroundColor White
+        Write-Host "  [4] fable" -ForegroundColor White
+        Write-Host "  [5] default" -ForegroundColor White
+        Write-Host "  （逗号分隔多选，如 1,2 表示 haiku+sonnet）" -ForegroundColor DarkGray
+        $tierSel = Read-Host "选择档位（默认 1）"
+        $tierMap = @{ "1"="haiku"; "2"="sonnet"; "3"="opus"; "4"="fable"; "5"="default" }
+        if ([string]::IsNullOrWhiteSpace($tierSel)) { $tierSel = "1" }
+        $selectedTiers = @()
+        foreach ($t in ($tierSel -split "," | ForEach-Object { $_.Trim() })) {
+            if ($tierMap.ContainsKey($t)) { $selectedTiers += $tierMap[$t] }
+        }
+        if ($selectedTiers.Count -eq 0) { $selectedTiers = @("haiku") }
+        Write-Host "已选档位: $($selectedTiers -join ', ')" -ForegroundColor Green
+        Write-Host ""
+
+        # 对每家供应商，取所选档位的 model id（跳过未配置该档位的供应商）
+        $tasks = @()
+        foreach ($pn in $providers) {
+            $curProv = if ($parsed) { $parsed.providers | Where-Object { $_.name -eq $pn } | Select-Object -First 1 } else { $null }
+            if (-not $curProv) {
+                Write-Host "  跳过 [$pn]: 未找到配置" -ForegroundColor Yellow
+                continue
+            }
+            foreach ($tier in $selectedTiers) {
+                $cm = @($curProv.configured_models) | Where-Object { $_.tier -eq $tier } | Select-Object -First 1
+                if ($cm -and $cm.model) {
+                    $tasks += [pscustomobject]@{ provider=$pn; model=$cm.model; tier=$tier }
+                } else {
+                    Write-Host "  跳过 [$pn] [$tier 档位]: 未配置" -ForegroundColor DarkGray
+                }
+            }
+        }
+        if ($tasks.Count -eq 0) {
+            Write-Host "所选供应商均无对应档位模型，返回主菜单。" -ForegroundColor Yellow
+            Read-Host "按回车"; return 1
+        }
+        Write-Host "将检测 $($tasks.Count) 个 (供应商, 档位) 组合:" -ForegroundColor Green
+        foreach ($t in $tasks) { Write-Host "  · $($t.provider) [$($t.tier)] -> $($t.model)" -ForegroundColor White }
+        Write-Host ""
+
+        $overallCode = 0
+        foreach ($t in $tasks) {
+            Write-Host ""
+            Write-Host "========================================" -ForegroundColor Cyan
+            Write-Host "  $($t.provider) [$($t.tier)] $($t.model)" -ForegroundColor Cyan
+            Write-Host "========================================" -ForegroundColor Cyan
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("inspect")
+            $cmdArgs.Add("--provider"); $cmdArgs.Add($t.provider)
+            $cmdArgs.Add("--model"); $cmdArgs.Add($t.model)
+            $cmdArgs.Add("--source"); $cmdArgs.Add("manual")
+            $cmdArgs.Add("--type"); $cmdArgs.Add($type)
+            $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $cmdArgs.Add("--timeout"); $cmdArgs.Add("30")
+            $cmdArgs.Add("--workers"); $cmdArgs.Add("1")
+            $cmdArgs.Add("--human")
+            Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "inspect"
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            if ($code -ne 0 -and $overallCode -eq 0) { $overallCode = $code }
+        }
+        Write-Host ""
+        Write-Host "  [1] 重新选择（重走 type -> provider -> tier）" -ForegroundColor White
+        Write-Host "  [2] 返回主菜单" -ForegroundColor White
+        $again = Read-Host "选择（默认 2）"
+        if ($again -eq "1") { return (Menu-Inspect) }
+        return $overallCode
+    }
 
     Write-Host "检测模式:" -ForegroundColor Yellow
     Write-Host "  [1] 单一模型（默认）" -ForegroundColor White
