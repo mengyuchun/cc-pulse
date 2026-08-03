@@ -2856,7 +2856,13 @@ def detect_protocol(p: Provider) -> dict:
             Protocol.OPENAI_RESPONSES: "openai_responses",
         }
         detected = proto_map.get(p.protocol, "unknown")
-        confidence = "confirmed_by_protocol"
+        # 区分：base_url 有显式后缀的是"配置确认"，否则是 app_type 默认推断（均未实测）
+        has_suffix = (
+            "/chat/completions" in base
+            or "/v1/responses" in base
+            or "/v1/messages" in base
+        )
+        confidence = "configured" if has_suffix else "inferred"
         return {
             "detected": detected,
             "confidence": confidence,

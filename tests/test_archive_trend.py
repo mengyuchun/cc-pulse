@@ -157,7 +157,7 @@ test(
 
 
 print("\n[Unit] build_trend")
-trend = mod.build_trend(loaded)
+trend = mod.build_trend(loaded, include_test=True)
 test("trend total=6", trend["total"] == 6, f"total={trend['total']}")
 test(
     "trend 2 providers",
@@ -188,15 +188,15 @@ pb = next(p for p in trend["providers"] if p["provider"] == "Prov-B")
 test("trend Prov-B success_rate=0.5", pb["success_rate"] == 0.5)
 
 # 过滤
-pt = mod.build_trend(loaded, provider="Prov-A")
+pt = mod.build_trend(loaded, provider="Prov-A", include_test=True)
 test("过滤 provider 收窄", len(pt["providers"]) == 1 and pt["total"] == 4)
-mt = mod.build_trend(loaded, model="model-y")
+mt = mod.build_trend(loaded, model="model-y", include_test=True)
 test(
     "过滤 model 收窄",
     mt["total"] == 1 and len(mt["providers"]) == 1 and mt["providers"][0]["ok"] == 0,
     f"{mt}",
 )
-st = mod.build_trend(loaded, since_ts=t2)
+st = mod.build_trend(loaded, since_ts=t2, include_test=True)
 test("过滤 since 收窄", st["total"] == 2, f"total={st['total']}")
 test("过滤 since 设 window_start", st["window_start"] is not None)
 test(
@@ -212,7 +212,7 @@ test("human 含 Prov-A", "Prov-A" in text)
 test("human 按天简示", ":" in text and "/" in text, f"{text.splitlines()[-1]}")
 test(
     "human 空归档",
-    mod.format_trend_human({"providers": [], "total": 0}) == "（归档无记录）",
+    "归档无记录" in mod.format_trend_human({"providers": [], "total": 0}),
 )
 
 
@@ -225,7 +225,7 @@ def _capture(*args, **kwargs):
 
 _capture.lines = []
 args_h = types.SimpleNamespace(
-    since="7d", archive=arc, provider=None, model=None, json=False
+    since="7d", archive=arc, provider=None, model=None, json=False, include_test=True
 )
 rc = mod.run_trend(args_h, _capture)
 test("run_trend 人类 rc=0", rc == 0)
@@ -238,7 +238,7 @@ test(
 buf = io.StringIO()
 _capture.lines = []
 args_j = types.SimpleNamespace(
-    since="7d", archive=arc, provider=None, model=None, json=True
+    since="7d", archive=arc, provider=None, model=None, json=True, include_test=True
 )
 with contextlib.redirect_stdout(buf):
     rc = mod.run_trend(args_j, _capture)
@@ -255,7 +255,7 @@ test("run_trend json trend total", report["trend"]["total"] == 6)
 
 _capture.lines = []
 args_bad = types.SimpleNamespace(
-    since="7x", archive=arc, provider=None, model=None, json=False
+    since="7x", archive=arc, provider=None, model=None, json=False, include_test=True
 )
 rc = mod.run_trend(args_bad, _capture)
 test("run_trend 非法 --since rc=2", rc == 2)
@@ -268,13 +268,18 @@ test(
 empty_arc = os.path.join(tmp, "empty.jsonl")
 _capture.lines = []
 args_e = types.SimpleNamespace(
-    since="7d", archive=empty_arc, provider=None, model=None, json=False
+    since="7d",
+    archive=empty_arc,
+    provider=None,
+    model=None,
+    json=False,
+    include_test=True,
 )
 rc = mod.run_trend(args_e, _capture)
 test("run_trend 无记录 rc=0", rc == 0)
 test(
     "run_trend 无记录提示",
-    any("（归档无记录）" in l for l in _capture.lines),
+    any("归档无记录" in l for l in _capture.lines),
     f"{_capture.lines}",
 )
 

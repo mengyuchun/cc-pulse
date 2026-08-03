@@ -172,9 +172,8 @@ test(
 
 
 print("\n[PS1] 高级设置 - 选项 6")
-# 菜单6 + stealth/JSON/max-tokens/thinking/UA/context/vision/type/scope 共 9 项默认
-# + 返回主菜单 + 退出，共 1+9+1+1 = 12 次输入
-rc, out, err = run_pwsh("6\n\n\n\n\n\n\n\n\n\n\n7\n", timeout=60)
+# 新编号菜单：进入后直接 q 返回主菜单 -> 7 退出
+rc, out, err = run_pwsh("6\nq\n7\n", timeout=60)
 combined = out + err
 test("退出码 0", rc == 0, f"rc={rc}")
 test("输出含 '高级设置'", "高级设置" in combined)
@@ -184,19 +183,12 @@ test("显示 vision 设置", "vision" in combined.lower())
 
 
 print("\n[PS1] 高级设置端到端：开启 JSON 后快速体检输出 JSON")
-# [6] 开启 JSON -> 其余默认回车 -> [1] 快速体检 -> [6] 退出
+# 新编号菜单：[6] -> 1(JSON) -> y 开 -> q 返回 -> [1] 快速体检 -> 回车返回 -> [7] 退出
 stdin_text = (
     "6\n"  # 主菜单: 高级设置
-    "y\n"  # JSON 输出: 开
-    "\n"  # max-tokens: 默认
-    "\n"  # thinking: 默认
-    "\n"  # user-agent: 默认
-    "\n"  # context: 默认 512k
-    "\n"  # vision: 默认关
-    "\n"  # stealth: 默认关
-    "\n"  # 默认类型: claude
-    "\n"  # 默认范围: 队列
-    "\n"  # 回车返回主菜单
+    "1\n"  # 选第 1 项: JSON
+    "y\n"  # JSON: 开
+    "q\n"  # 返回主菜单
     "1\n"  # 主菜单: 快速体检
     "\n"  # 回车返回主菜单
     "7\n"  # 退出
@@ -209,20 +201,15 @@ test("stdout 含 JSON 报告", '"schema_version"' in combined or '"providers"' i
 
 
 print("\n[PS1] 高级设置：上下文档位 1m + vision 后 inspect 带参")
-# 高级设置设 1m + vision，再跑 inspect（手动 provider），检查命令行含新参数
+# 新编号菜单：[6] -> 5(上下文档位) 1m -> 6(vision) y -> q 返回
+#        -> [4] inspect: type默认 -> provider -> model -> 返回 -> [7] 退出
 stdin_text = (
-    # 高级设置提问顺序：JSON→max-tokens→thinking→UA→context→vision→stealth→type→scope
-    "6\n"
-    "\n"  # JSON 默认
-    "\n"  # max-tokens
-    "\n"  # thinking
-    "\n"  # UA
+    "6\n"  # 主菜单: 高级设置
+    "5\n"  # 第 5 项: 上下文档位
     "1m\n"  # context 1m
+    "6\n"  # 第 6 项: vision
     "y\n"  # vision 开
-    "\n"  # stealth 默认关
-    "\n"  # 默认类型: claude
-    "\n"  # 默认范围: 队列
-    "\n"  # 返回主菜单
+    "q\n"  # 返回主菜单
     # inspect：type → provider(序号/名) → model(序号/名)
     "4\n"  # inspect
     "\n"  # type 默认 claude
