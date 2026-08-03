@@ -43,6 +43,7 @@ from ccpulse_env import run_env_check
 from ccpulse_output import (
     _c,
     _output_stream,
+    _pad,
     _sanitize_for_terminal,
     _say_colored,
     say,
@@ -4170,6 +4171,7 @@ def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
                     "latencies": [],
                     "fail_cats": {},
                     "status_counts": {},
+                    "cost_usd": 0.0,
                 }
                 buckets[pid] = b
             b["total"] += 1
@@ -4184,6 +4186,13 @@ def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
                 b["status_counts"][key] = b["status_counts"].get(key, 0) + 1
             else:
                 b["ok"] += 1
+            # 成本聚合（total_cost_usd 是 TEXT，可能为空/非数字）
+            cost_raw = d.get("total_cost_usd")
+            if cost_raw:
+                try:
+                    b["cost_usd"] += float(cost_raw)
+                except (TypeError, ValueError):
+                    pass
             if (
                 d.get("request_model")
                 and d.get("model")
@@ -4205,6 +4214,7 @@ def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
                 {
                     "provider_id": b["provider_id"],
                     "provider_name": b["provider_name"],
+                    "is_deleted": b["provider_name"].startswith("deleted:"),
                     "total": b["total"],
                     "ok": b["ok"],
                     "fail": b["fail"],
@@ -4215,6 +4225,7 @@ def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
                     "top_fail_category": top_cat,
                     "fail_categories": b["fail_cats"],
                     "status_counts": b["status_counts"],
+                    "cost_usd": round(b["cost_usd"], 4),
                 }
             )
         out.sort(key=lambda x: (-x["fail"], -x["total"]))
@@ -4249,6 +4260,37 @@ def query_routing(
             {"request_model": a, "actual_model": b, "count": n}
             for a, b, n in conn.execute(sql, args)
         ]
+    finally:
+        conn.close()
+
+
+def query_provider_health(db_path: str) -> list:
+    """读 cc-switch 的 provider_health 表（被动流量健康度，非主动探测）。
+
+    返回每供应商：name / is_healthy / consecutive_failures / last_error / last_success_at。
+    """
+    id_map = load_provider_id_map(db_path)
+    conn = _open_ro(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        if not _table_exists(conn, "provider_health"):
+            return []
+        rows = []
+        for r in conn.execute(
+            "SELECT provider_id, app_type, is_healthy, consecutive_failures, "
+            "last_success_at, last_failure_at, last_error, updated_at "
+            "FROM provider_health"
+        ):
+            d = dict(r)
+            d["provider_name"] = id_map.get(d.get("provider_id")) or d.get(
+                "provider_id", "?"
+            )
+            rows.append(d)
+        # 不健康的排前面，再按失败次数降序
+        rows.sort(
+            key=lambda x: (x.get("is_healthy", 1), -x.get("consecutive_failures", 0))
+        )
+        return rows
     finally:
         conn.close()
 
@@ -4317,6 +4359,7 @@ def run_history(args, say) -> int:
                 "first_token_ms": r.get("first_token_ms"),
                 "input_tokens": r.get("input_tokens"),
                 "output_tokens": r.get("output_tokens"),
+                "total_cost_usd": r.get("total_cost_usd"),
                 "error_message": r.get("error_message"),
                 "error_category": r.get("error_category"),
                 "routing_mismatch": r.get("routing_mismatch"),
@@ -4357,6 +4400,8 @@ def run_history(args, say) -> int:
             _say_colored(
                 f"{model_line}  "
                 f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms"
+                f"  in={r.get('input_tokens') or 0} out={r.get('output_tokens') or 0}"
+                f"  cost=${float(r.get('total_cost_usd') or 0):.4f}"
             )
             if r.get("error_message"):
                 cat = _sanitize_for_terminal(str(r.get("error_category") or ""))
@@ -4374,10 +4419,14 @@ def run_stats(args, say) -> int:
     if error_code is not None:
         return error_code
     stats = query_stats(args.db, since_ts=since_ts)
+    include_deleted = getattr(args, "include_deleted", False)
+    if not include_deleted:
+        stats = [s for s in stats if not s.get("is_deleted")]
     report = {
         "schema_version": 1,
         "command": "stats",
         "since": getattr(args, "since", None),
+        "include_deleted": include_deleted,
         "providers": stats,
     }
     if getattr(args, "json", False):
@@ -4386,13 +4435,14 @@ def run_stats(args, say) -> int:
         say(
             f"stats: {len(stats)} 个供应商"
             f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}"
+            f"{'（已隐藏已删除供应商，--include-deleted 显示）' if not include_deleted else ''}"
         )
         hdr = (
-            f"{'供应商':24} {'请求':>6} {'成功%':>7} {'失败':>5} {'主失败因':18} "
-            f"{'中位延迟':>8} {'路由≠%':>7}"
+            f"{_pad('供应商', 24)} {'请求':>6} {'成功%':>7} {'失败':>5} "
+            f"{_pad('主失败因', 22)} {'中位延迟':>9} {'路由≠%':>7} {'成本$':>8}"
         )
         _say_colored(_c(hdr, "bold"))
-        say("-" * 90)
+        say("-" * 100)
         for s in stats:
             sr = s["success_rate"]
             rate_s = f"{sr * 100:.0f}%"
@@ -4402,21 +4452,33 @@ def run_stats(args, say) -> int:
                 rate_c = _c(rate_s, "yellow")
             else:
                 rate_c = _c(rate_s, "red", "bold")
-            med = (
-                f"{s['median_latency_ms']:.0f}ms"
-                if s["median_latency_ms"] is not None
-                else "-"
-            )
+            med_val = s["median_latency_ms"]
+            med = f"{med_val:.0f}ms" if med_val is not None else "-"
+            # 延迟 >10s 标红，>3s 标黄
+            if med_val is not None and med_val > 10000:
+                med_c = _c(med, "red", "bold")
+            elif med_val is not None and med_val > 3000:
+                med_c = _c(med, "yellow")
+            else:
+                med_c = med
             mm_r = s["mismatch_rate"]
             mm_s = f"{mm_r * 100:.0f}%"
-            mm_c = _c(mm_s, "yellow") if mm_r > 0.1 else mm_s
+            # 路由不一致 >50% 标红，>10% 标黄
+            if mm_r > 0.5:
+                mm_c = _c(mm_s, "red", "bold")
+            elif mm_r > 0.1:
+                mm_c = _c(mm_s, "yellow")
+            else:
+                mm_c = mm_s
             cat = s.get("top_fail_category") or "-"
-            cat_c = _c(cat[:18], "red") if cat != "-" else cat[:18]
+            cat_c = _c(_pad(cat[:22], 22), "red") if cat != "-" else _pad(cat[:22], 22)
             fail_c = _c(str(s["fail"]), "red") if s["fail"] > 0 else str(s["fail"])
+            cost = s.get("cost_usd") or 0.0
+            cost_s = f"{cost:.2f}" if cost > 0 else "-"
             pname = _sanitize_for_terminal(s["provider_name"][:24])
             _say_colored(
-                f"{pname:24} {s['total']:6d} {rate_c:>7} {fail_c:>5} "
-                f"{cat_c:18} {med:>8} {mm_c:>7}"
+                f"{_pad(pname, 24)} {s['total']:6d} {rate_c:>7} {fail_c:>5} "
+                f"{cat_c} {med_c:>9} {mm_c:>7} {cost_s:>8}"
             )
     return 0
 
@@ -4444,6 +4506,46 @@ def run_routing(args, say) -> int:
             say(
                 f"[{i:02d}] {p['count']:5d}×  {p['request_model']}  =>  {p['actual_model']}"
             )
+    return 0
+
+
+def run_health(args, say) -> int:
+    """health 子命令：读 cc-switch 的 provider_health（被动流量健康度）。
+
+    注意：这是 cc-switch 从真实代理流量聚合的健康判定（如额度用完/502/529），
+    不是主动可用性探测，也不校验答案正确性。主动探测请用 check / inspect。
+    """
+    rows = query_provider_health(args.db)
+    report = {
+        "schema_version": 1,
+        "command": "health",
+        "source": "cc-switch provider_health（被动流量聚合，非主动探测）",
+        "total": len(rows),
+        "unhealthy": sum(1 for r in rows if not r.get("is_healthy")),
+        "providers": rows,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str), flush=True)
+        return 0
+    if not rows:
+        say("provider_health 表无数据（cc-switch 未记录流量健康度）")
+        return 0
+    say(
+        f"health: {len(rows)} 个供应商"
+        f"（cc-switch 被动流量健康度，非主动探测；主动探测请用 check）"
+    )
+    hdr = f"{_pad('供应商', 24)} {'健康':>4} {'连续失败':>8} {'最近错误':40}"
+    _say_colored(_c(hdr, "bold"))
+    say("-" * 90)
+    for r in rows:
+        healthy = r.get("is_healthy")
+        name = _sanitize_for_terminal(str(r.get("provider_name") or "?")[:24])
+        h_c = _c("✓", "green") if healthy else _c("✗", "red", "bold")
+        fails = r.get("consecutive_failures") or 0
+        fail_c = _c(str(fails), "red", "bold") if fails > 0 else "0"
+        err = (r.get("last_error") or "-")[:60]
+        err = _sanitize_for_terminal(err)
+        _say_colored(f"{_pad(name, 24)} {h_c:>4} {fail_c:>8} {err}")
     return 0
 
 
@@ -5088,6 +5190,7 @@ SUBCOMMANDS = (
     "analyze",
     "env-check",
     "trend",
+    "health",
 )
 # 主解析器上带值的全局选项：扫描子命令时要连它的值一起跳过，
 # 否则 `--db list-models` 这类会把选项的值误认成子命令。
@@ -5453,9 +5556,12 @@ def _build_parser():
     p_hist.add_argument("--log-keyword", default=None, help="磁盘日志关键词过滤")
 
     p_stats = sub.add_parser(
-        "stats", parents=[common], help="按供应商汇总成功率/延迟/路由不一致"
+        "stats", parents=[common], help="按供应商汇总成功率/延迟/路由不一致/成本"
     )
     p_stats.add_argument("--since", default="7d", help="时间窗口（默认 7d）")
+    p_stats.add_argument(
+        "--include-deleted", action="store_true", help="包含已从 cc-switch 删除的供应商"
+    )
     p_stats.add_argument("--json", action="store_true", help="JSON 输出")
 
     p_route = sub.add_parser(
@@ -5513,7 +5619,19 @@ def _build_parser():
     )
     p_trend.add_argument("--provider", default=None, help="只统计指定供应商")
     p_trend.add_argument("--model", default=None, help="只统计指定模型")
+    p_trend.add_argument(
+        "--include-test",
+        action="store_true",
+        help="包含测试数据供应商（Mock-Provider/Prov-A 等，默认排除）",
+    )
     p_trend.add_argument("--json", action="store_true", help="JSON 输出")
+
+    p_health = sub.add_parser(
+        "health",
+        parents=[common],
+        help="读 cc-switch 被动流量健康度（provider_health，非主动探测）",
+    )
+    p_health.add_argument("--json", action="store_true", help="JSON 输出")
 
     # 兜底默认（注入 check 后子解析器会覆盖这些）
     ap.set_defaults(command="check", type="claude", failover_only=False, json=False)
@@ -5583,6 +5701,8 @@ def _main_with_args(args) -> int:
         return run_watch(args, say)
     if args.command == "analyze":
         return run_analyze(args, say)
+    if args.command == "health":
+        return run_health(args, say)
 
     types = (
         ["claude", "codex", "openclaw"]

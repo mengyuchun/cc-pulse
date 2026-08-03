@@ -4,6 +4,8 @@ import json
 import os
 from typing import Any
 
+from ccpulse_output import _pad
+
 # env 变量 → (tool, 配置取值类别)
 # 取值类别: base_url=供应商 base_url；token=供应商 api_key；tier:xxx=对应档位模型
 _ENV_VARS: list[tuple[str, str, str]] = [
@@ -55,6 +57,17 @@ def _config_value(provider: Any, kind: str) -> str:
     if kind.startswith("tier:"):
         return _tier_model(provider, kind.split(":", 1)[1])
     return ""
+
+
+# severity -> 中文标签（用于人类表格第二行的前缀）
+_SEVERITY_LABEL = {"conflict": "冲突", "override": "生效中", "info": "一致"}
+
+
+def _truncate(value: str, width: int = 22) -> str:
+    """值超宽时截断到 width-1 字符并加省略号，避免长 URL 撑破列宽。"""
+    if len(value) <= width:
+        return value
+    return value[: width - 1] + "…"
 
 
 def env_check_findings(providers: list, environ: dict | None = None) -> list[dict]:
@@ -124,13 +137,18 @@ def run_env_check(args: Any, providers: list, say: Any) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     else:
         if findings:
-            say(f"{'tool':<10} {'env_var':<30} {'当前值':<22} {'配置值':<22} 影响")
+            say(
+                f"{_pad('tool', 10)} {_pad('env_var', 30)} "
+                f"{_pad('当前值', 22)} {_pad('配置值', 22)}"
+            )
             say("-" * 100)
             for f in findings:
                 say(
-                    f"{f['tool']:<10} {f['env_var']:<30} {f['env_value']:<22} "
-                    f"{f['config_value']:<22} {f['impact']}"
+                    f"{_pad(f['tool'], 10)} {_pad(f['env_var'], 30)} "
+                    f"{_pad(_truncate(f['env_value']), 22)} "
+                    f"{_pad(_truncate(f['config_value']), 22)}"
                 )
+                say(f"  -> {_SEVERITY_LABEL[f['severity']]}：{f['impact']}")
         if conflicts:
             say(f"检测到 {conflicts} 处冲突：环境变量会覆盖 cc-switch 所选供应商")
         else:

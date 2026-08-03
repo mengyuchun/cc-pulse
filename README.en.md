@@ -17,6 +17,32 @@ Don't trust "it connected". Trust "it works". With so many providers, see at a g
 
 ---
 
+## TL;DR
+
+```bash
+git clone https://github.com/mengyuchun/cc-pulse.git
+cd cc-pulse
+python check_ccswitch_health.py check --failover-only   # daily check, fastest
+```
+
+If you have [just](https://just.systems/) installed, one line replaces all three: `just check`.
+
+> Want to deep-dive on a single model afterwards: `python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-sonnet-4-6" --human`
+
+---
+
+## Glossary
+
+| Term | Meaning |
+|------|---------|
+| **cc-switch** | Desktop tool that manages many Claude Code / Codex / OpenClaw relay providers; keeps a `cc-switch.db` |
+| **Relay** | Third-party service forwarding LLM API requests — often silently rewrites routing, model, or auth |
+| **Failover queue** | The list of providers cc-switch falls back through; `--failover-only` probes only those + the active one |
+| **Silent routing** | You picked A but traffic went elsewhere — typically because a terminal env var (`ANTHROPIC_BASE_URL` etc.) overrides cc-switch's choice |
+| **Tier** | The `haiku → sonnet → opus → fable → default` model-priority fallback order; CC-Pulse stops at the first tier that answers correctly |
+
+---
+
 ## Why CC-Pulse
 
 cc-switch helps you manage many Claude Code / Codex API relay providers. But relays are messier than they look:
@@ -143,10 +169,16 @@ python check_ccswitch_health.py check --help
 ```bash
 # Daily check: failover queue + current provider only (fastest)
 python check_ccswitch_health.py check --failover-only
+# With just installed, equivalent: just check
 
 # Full check
 python check_ccswitch_health.py check
+# Equivalent: just check-all
+```
 
+> `Relay-A` / `Relay-B` / `claude-sonnet-4-6` / `glm-5` in the examples below are **placeholders** — replace them with your own provider names and model IDs as configured in cc-switch.
+
+```bash
 # JSON report (JSON on stdout, human progress on stderr)
 python check_ccswitch_health.py check --failover-only --json | jq '.summary'
 
@@ -165,6 +197,21 @@ python check_ccswitch_health.py inspect \
 ---
 
 ## Subcommands
+
+### Scenario → command decision table
+
+**Suddenly broken? Start with `just env-check`, then `just trend`** — the former checks whether env vars silently override cc-switch's choice; the latter surfaces cross-day degradation.
+
+| What you want | Command | One-liner |
+|---------------|---------|-----------|
+| Which providers work right now | `just check` | Multi-tier probe + answer verification, see who really works |
+| Fetch provider-declared models | `just models` | `GET /v1/models`; listed ≠ usable |
+| Deep-dive one (provider, model) | `inspect` | 7-dimension checkup: text/streaming/metadata/context/thinking/tools/vision + routing match |
+| Recent failures / success history | `history` / `just stats` | Read-only cc-switch DB, aggregated by provider / time window |
+| Diagnose silent routing | `just env-check` / `routing` | env-check for env-var overrides; routing for request vs response model mismatch |
+| Cross-day degradation trend | `just trend` | Read local probe archive, aggregate by day |
+| Watch cc-switch logs live | `just watch` | Poll every 3s, prints new entries, Ctrl+C to stop |
+| Multi-dimensional aggregation | `just analyze` | By day / model / provider×day matrix with sparklines |
 
 ### `check` — daily health check
 
@@ -556,6 +603,31 @@ just test-ps1
 ```
 
 Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **247 Python tests + 33 PS1 tests**.
+
+### `just` command cheat sheet
+
+Confirmed against `justfile`; available once [just](https://just.systems/) is installed:
+
+| Command | Equivalent to | Purpose |
+|---------|---------------|---------|
+| `just check` | `check --failover-only --workers 8 --timeout 45` | Daily check (fastest) |
+| `just check-all` | `check --workers 8 --timeout 45` | Full check |
+| `just check-stealth` | `check --failover-only --stealth` | Stealth mode (when flagged) |
+| `just models` | `list-models --failover-only` | Fetch queue models |
+| `just models-probe` | `list-models --failover-only --probe` | Fetch + light probe |
+| `just models-deep` | `list-models --failover-only --deep` | Fetch + 7-dim deep probe |
+| `just trend` | `trend --since 7d` | 7-day probe trend |
+| `just env-check` | `env-check` | Env var override detection |
+| `just stats` | `stats --since 7d` | 7-day stats |
+| `just routing` | `routing --since 7d --limit 20` | Silent routing ranking |
+| `just watch` | `watch --interval 3` | Live monitoring |
+| `just analyze` | `analyze --since 7d` | Full-dimension analysis |
+| `just test` | `python tests/test_ccpulse_full.py` | Python tests |
+| `just test-ps1` | `python tests/test_ps1_launcher.py` | PS1 launcher tests |
+| `just lint-docs` | `python tests/test_docs_consistency.py` | Docs consistency guard |
+| `just format` / `just lint` | ruff format / ruff check | Dev formatting & lint |
+
+> No just? The raw `python check_ccswitch_health.py ...` forms are all shown in the subcommand sections above.
 
 ## Development
 

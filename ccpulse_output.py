@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import threading
+import unicodedata
 from typing import Any
 
 _output_stream = contextvars.ContextVar("output_stream", default=None)
@@ -29,6 +30,18 @@ _ANSI = {
 def _sanitize_for_terminal(text: str) -> str:
     """剥离 ANSI 转义和 C0 控制字符，防止恶意响应注入终端指令。"""
     return _CONTROL_RE.sub("", text)
+
+
+def _disp_width(text: str) -> int:
+    """字符串在终端的显示宽度：CJK 全角（W/F）算 2 格，其余算 1 格。"""
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text
+    )
+
+
+def _pad(text: str, width: int) -> str:
+    """按显示宽度右补空格到 width 格，修正 CJK 全角导致的表格错位。"""
+    return text + " " * max(0, width - _disp_width(text))
 
 
 def say(*args: Any, **kwargs: Any) -> None:

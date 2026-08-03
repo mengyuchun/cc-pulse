@@ -17,6 +17,32 @@
 
 ---
 
+## TL;DR 快速上手
+
+```bash
+git clone https://github.com/mengyuchun/cc-pulse.git
+cd cc-pulse
+python check_ccswitch_health.py check --failover-only   # 日常体检，最快
+```
+
+装了 [just](https://just.systems/) 的话，一行代替上面三条：`just check`。
+
+> 见到结果后想深挖单模型：`python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-sonnet-4-6" --human`
+
+---
+
+## 术语小词典
+
+| 术语 | 含义 |
+|------|------|
+| **cc-switch** | 管理多个 Claude Code / Codex / OpenClaw 中转供应商的桌面切换工具，维护一份 `cc-switch.db` |
+| **中转站** | 转发 LLM API 请求的第三方服务，常常悄悄改路由、改模型、改认证 |
+| **故障转移队列** | cc-switch 里排队待用的一组供应商；`--failover-only` 只探它们 + 当前激活 |
+| **静默路由** | 你切了 A，但流量被导到别处——典型来源是终端环境变量（`ANTHROPIC_BASE_URL` 等）覆盖了 cc-switch 的选择 |
+| **档位** | `haiku → sonnet → opus → fable → default` 模型优先级回退顺序，CC-Pulse 逐档探到首个正确回答即停 |
+
+---
+
 ## 为什么需要 CC-Pulse
 
 cc-switch 帮你管理一堆 Claude Code / Codex 的 API 中转供应商。但中转站的水远比你想象的深：
@@ -144,10 +170,16 @@ python check_ccswitch_health.py check --help
 ```bash
 # 日常体检：只测故障转移队列 + 当前激活（最快）
 python check_ccswitch_health.py check --failover-only
+# 装了 just 的话，等价于：just check
 
 # 全量体检
 python check_ccswitch_health.py check
+# 等价于：just check-all
+```
 
+> 下方示例中的 `Relay-A` / `Relay-B` / `claude-sonnet-4-6` / `glm-5` 均为**占位符**，请替换为你自己在 cc-switch 里的供应商名与模型 ID。
+
+```bash
 # JSON 报告（stdout 是 JSON，stderr 是人类可读进度）
 python check_ccswitch_health.py check --failover-only --json | jq '.summary'
 
@@ -166,6 +198,21 @@ python check_ccswitch_health.py inspect \
 ---
 
 ## 子命令详解
+
+### 场景 → 命令决策表
+
+**最近突然不能用？先 `just env-check` 再 `just trend`**——前者查环境变量是否静默覆盖了 cc-switch 选择，后者看跨天降级趋势。
+
+| 你想做的事 | 用哪个命令 | 一句话 |
+|-----------|-----------|--------|
+| 想知道现在哪家供应商能用 | `just check` | 多档回退探活 + 校验真实回答，一眼看清谁真能用 |
+| 拉供应商声明的模型清单 | `just models` | `GET /v1/models`，列出的 ≠ 能用 |
+| 给某供应商某模型做深度诊断 | `inspect` | 7 维度体检：text/streaming/metadata/context/thinking/tools/vision + 路由比对 |
+| 看最近失败日志 / 历史成功率 | `history` / `just stats` | 只读 cc-switch 库，按供应商 / 时间窗汇总 |
+| 排查静默路由 | `just env-check` / `routing` | env-check 查环境变量覆盖，routing 看请求 vs 响应模型不一致排行 |
+| 看跨天是否有降级趋势 | `just trend` | 读本地探测归档，按天聚合成功率 / 延迟 / 错误分类 |
+| 实时盯着 cc-switch 日志 | `just watch` | 每 3 秒轮询，有新日志就打印，Ctrl+C 结束 |
+| 多维交叉聚合分析 | `just analyze` | 按天 / 模型 / 供应商×日期矩阵，自带 sparkline |
 
 ### `check` —— 日常健康检测
 
@@ -568,6 +615,31 @@ just test-ps1
 ```
 
 测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **247 个 Python 测试 + 33 个 PS1 测试**。
+
+### `just` 常用命令速查
+
+读 `justfile` 确认的命令名，装了 [just](https://just.systems/) 后可直接用：
+
+| 命令 | 等价于 | 用途 |
+|------|--------|------|
+| `just check` | `check --failover-only --workers 8 --timeout 45` | 日常体检（最快） |
+| `just check-all` | `check --workers 8 --timeout 45` | 全量体检 |
+| `just check-stealth` | `check --failover-only --stealth` | 隐身模式（被识别时） |
+| `just models` | `list-models --failover-only` | 拉队列内模型清单 |
+| `just models-probe` | `list-models --failover-only --probe` | 拉清单 + 轻量探活 |
+| `just models-deep` | `list-models --failover-only --deep` | 拉清单 + 7 维深探 |
+| `just trend` | `trend --since 7d` | 7 天探测趋势 |
+| `just env-check` | `env-check` | 环境变量覆盖检测 |
+| `just stats` | `stats --since 7d` | 7 天统计 |
+| `just routing` | `routing --since 7d --limit 20` | 静默路由排行 |
+| `just watch` | `watch --interval 3` | 实时监控 |
+| `just analyze` | `analyze --since 7d` | 全维度分析 |
+| `just test` | `python tests/test_ccpulse_full.py` | Python 测试 |
+| `just test-ps1` | `python tests/test_ps1_launcher.py` | PS1 启动器测试 |
+| `just lint-docs` | `python tests/test_docs_consistency.py` | 文档一致性守卫 |
+| `just format` / `just lint` | ruff format / ruff check | 开发期格式化与 lint |
+
+> 没装 just 也无妨，所有命令的 `python check_ccswitch_health.py ...` 原形在上方子命令详解里。
 
 ## 开发
 

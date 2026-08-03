@@ -10,6 +10,8 @@ import os
 import re
 import time
 
+from ccpulse_output import _pad, _sanitize_for_terminal
+
 
 def parse_since(s: str | None) -> int | None:
     """解析 --since：24h / 7d / 30m / 3600 → unix 秒下限；None 表示不限。"""
@@ -84,15 +86,25 @@ def _day_key(ts) -> str | None:
         return None
 
 
+# 测试数据供应商名（从归档聚合中排除，防止测试运行污染真实趋势）
+_TEST_PROVIDERS = {"Mock-Provider", "Prov-A", "Prov-B", "Prov-C"}
+
+
 def build_trend(
     records: list[dict],
     since_ts: int | None = None,
     provider: str | None = None,
     model: str | None = None,
+    include_test: bool = False,
 ) -> dict:
-    """按供应商聚合成功率/延迟分位/错误分类/按天趋势；since/provider/model 过滤收窄。"""
+    """按供应商聚合成功率/延迟分位/错误分类/按天趋势；since/provider/model 过滤收窄。
+
+    默认排除测试数据供应商（Mock-Provider/Prov-A/B/C），避免测试运行污染真实趋势。
+    """
     recs = []
     for r in records:
+        if not include_test and r.get("provider") in _TEST_PROVIDERS:
+            continue
         if since_ts is not None:
             try:
                 if float(r.get("ts")) < since_ts:
@@ -176,11 +188,11 @@ def build_trend(
 def format_trend_human(trend: dict) -> str:
     """对齐表格：供应商/请求/成功%/p50/p95/主失败因/按天简示。纯文本无 ANSI。"""
     if not trend.get("providers"):
-        return "（归档无记录）"
+        return "（归档无记录；先运行 check 或 inspect 探测以生成归档）"
     w = trend.get("window_start")
     lines = [f"trend: {trend['total']} 条记录" + (f"  窗口≥{w}" if w else "")]
     lines.append(
-        f"{'供应商':24} {'请求':>6} {'成功%':>7} {'p50':>8} {'p95':>8} "
+        f"{_pad('供应商', 24)} {'请求':>6} {'成功%':>7} {'p50':>8} {'p95':>8} "
         f"{'主失败因':18} 按天"
     )
     lines.append("-" * 88)
@@ -191,8 +203,9 @@ def format_trend_human(trend: dict) -> str:
         cats = p.get("error_categories") or {}
         top = max(cats, key=cats.get) if cats else "-"
         days = " ".join(f"{d['date'][5:]}:{d['ok']}/{d['total']}" for d in p["by_day"])
+        prov = _sanitize_for_terminal(p["provider"])[:24]
         lines.append(
-            f"{p['provider'][:24]:24} {p['total']:6d} {rate:>7} {p50:>8} {p95:>8} "
+            f"{_pad(prov, 24)} {p['total']:6d} {rate:>7} {p50:>8} {p95:>8} "
             f"{top[:18]:18} {days}"
         )
     return "\n".join(lines)
@@ -214,6 +227,7 @@ def run_trend(args, say) -> int:
         since_ts=since_ts,
         provider=getattr(args, "provider", None) or None,
         model=getattr(args, "model", None) or None,
+        include_test=getattr(args, "include_test", False),
     )
     report = {
         "schema_version": 1,
