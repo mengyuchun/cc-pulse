@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import TypedDict
 
 from ccpulse_archive import parse_since, run_trend
 from ccpulse_env import run_env_check
@@ -211,6 +212,58 @@ class Protocol(str, Enum):
     OPENAI_CHAT_COMPLETIONS = "openai_chat_completions"  # /v1/chat/completions（含 openrouter / openclaw 兼容）
     OPENAI_RESPONSES = "openai_responses"  # /responses（codex / 部分自定义）
     UNKNOWN = "unknown"
+
+
+class ProbeTierResult(TypedDict, total=False):
+    tier: str
+    model: str
+    status: int
+    elapsed: float
+    error: str
+    error_category: str | None
+    answer: str
+    correct: bool
+    raw_body: str
+
+
+class ProbeStreamResult(TypedDict, total=False):
+    status: str  # "pass" / "fail" / "error"
+    http_status: int
+    elapsed_seconds: float
+    ttft_seconds: float | None
+    event_count: int
+    content_type: str
+    response_model: str
+    error: str
+    error_category: str | None
+
+
+class FetchModelsResult(TypedDict, total=False):
+    name: str
+    base_url: str
+    status: int
+    elapsed: float
+    error: str
+    error_category: str | None
+    models: list[str]
+
+
+class InspectDimensionResult(TypedDict, total=False):
+    status: str  # "pass" / "fail" / "error" / "skipped"
+    elapsed_seconds: float
+    answer: str
+    correct: bool
+    error: str
+    error_category: str | None
+
+
+class HistoryResult(TypedDict, total=False):
+    total: int
+    success: int
+    fail: int
+    success_rate: float
+    top_fail_category: str | None
+    mismatch_rate: float
 
 
 @dataclass(frozen=True)
@@ -440,6 +493,113 @@ def build_auth_headers(p: Provider) -> dict:
         return {"Authorization": f"Bearer {p.api_key}"}
 
 
+def _resolve_protocol(p: Provider) -> Protocol:
+    """从供应商属性解析出权威协议枚举。"""
+    proto = getattr(p, "protocol", Protocol.UNKNOWN)
+    if isinstance(proto, str):
+        proto = (
+            Protocol(proto)
+            if proto in Protocol._value2member_map_
+            else Protocol.UNKNOWN
+        )
+    if proto == Protocol.UNKNOWN:
+        if p.is_openrouter:
+            proto = Protocol.OPENAI_CHAT_COMPLETIONS
+        elif p.app_type == "codex":
+            proto = Protocol.OPENAI_RESPONSES
+        elif p.app_type == "openclaw":
+            proto = Protocol.OPENAI_CHAT_COMPLETIONS
+        elif p.app_type not in ("claude",):
+            proto = Protocol.ANTHROPIC_MESSAGES
+    return proto
+
+
+def _build_proto_url(p: Provider, proto: Protocol) -> str:
+    """按协议类型构造请求 URL。"""
+    base = p.base_url.rstrip("/")
+    if proto == Protocol.ANTHROPIC_MESSAGES:
+        return base + "/v1/messages"
+    if proto == Protocol.OPENAI_CHAT_COMPLETIONS:
+        # openclaw 用 /chat/completions（无 /v1/ 前缀）
+        if p.app_type == "openclaw" or p.is_openrouter:
+            return (
+                base
+                if base.endswith("/chat/completions")
+                else base + "/chat/completions"
+            )
+        return (
+            base
+            if base.endswith("/chat/completions")
+            else base + "/v1/chat/completions"
+        )
+    if proto == Protocol.OPENAI_RESPONSES:
+        return base if base.endswith("/responses") else base + "/responses"
+    # UNKNOWN → Anthropic 兼容
+    return base + "/v1/messages"
+
+
+# TODO: probe_context_smoke / _probe_tools / _probe_vision 三处也有内联 payload 构造，
+# 未来应统一到 _build_proto_payload（需先统一 headers/auth 参数接口）。
+def _build_proto_payload(
+    proto: Protocol,
+    model_id: str,
+    raw_model: str,
+    question: str,
+    *,
+    max_tokens: int,
+    stream: bool,
+    suppress: bool,
+) -> dict:
+    """按协议类型构造 payload dict（不含 headers/body/encode）。"""
+    if proto == Protocol.ANTHROPIC_MESSAGES:
+        payload = {
+            "model": model_id,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": question}],
+        }
+        if stream:
+            payload["stream"] = True
+        if suppress:
+            payload["thinking"] = {"type": "disabled"}
+        return payload
+
+    if proto == Protocol.OPENAI_CHAT_COMPLETIONS:
+        payload = {
+            "model": raw_model or model_id,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": question}],
+        }
+        if stream:
+            payload["stream"] = True
+        if suppress:
+            payload["reasoning_effort"] = "none"
+        return payload
+
+    if proto == Protocol.OPENAI_RESPONSES:
+        payload = {
+            "model": model_id,
+            "max_output_tokens": max_tokens,
+            "input": question,
+        }
+        if stream:
+            payload["stream"] = True
+        if suppress:
+            payload["reasoning"] = {"effort": "minimal"}
+        return payload
+
+    # Protocol.UNKNOWN → 最小 Anthropic 兼容
+    payload = {
+        "model": model_id,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": question}],
+    }
+    if stream:
+        payload["stream"] = True
+    if suppress:
+        payload["thinking"] = {"type": "disabled"}
+    return payload
+
+
 def build_probe_request(
     p: Provider,
     tier: ModelTier,
@@ -463,164 +623,33 @@ def build_probe_request(
 
     auth_h = build_auth_headers(p)
     suppress = disable_thinking and _is_thinking_prone_model(tier.model)
+    proto = _resolve_protocol(p)
 
-    # P0 修复：协议枚举驱动请求构造（替代旧的 app_type+is_openrouter 粗粒度分支）
-    proto = getattr(p, "protocol", Protocol.UNKNOWN)
-    if isinstance(proto, str):
-        proto = (
-            Protocol(proto)
-            if proto in Protocol._value2member_map_
-            else Protocol.UNKNOWN
-        )
-    if proto == Protocol.UNKNOWN:
-        if p.is_openrouter:
-            proto = Protocol.OPENAI_CHAT_COMPLETIONS
-        elif p.app_type not in ("claude", "codex", "openclaw"):
-            proto = Protocol.ANTHROPIC_MESSAGES
-
-    if proto == Protocol.ANTHROPIC_MESSAGES:
-        url = p.base_url.rstrip("/") + "/v1/messages"
-        payload = {
-            "model": tier.model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": question}],
-        }
-        if stream:
-            payload["stream"] = True
-        if suppress:
-            payload["thinking"] = {"type": "disabled"}
-        body = json.dumps(payload).encode()
-        headers = {
-            **_claude_code_headers(user_agent, stainless_version),
-            **auth_h,
-            "Content-Type": "application/json",
-        }
-        return url, "POST", headers, body
-
-    if proto == Protocol.OPENAI_CHAT_COMPLETIONS:
-        base_stripped = p.base_url.rstrip("/")
-        url = (
-            base_stripped
-            if base_stripped.endswith("/chat/completions")
-            else base_stripped + "/v1/chat/completions"
-        )
-        payload = {
-            "model": tier.raw_model or tier.model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": question}],
-        }
-        if stream:
-            payload["stream"] = True
-        if suppress:
-            payload["reasoning_effort"] = "none"
-        body = json.dumps(payload).encode()
-        headers = {
-            **_claude_code_headers(user_agent, stainless_version),
-            **auth_h,
-            "Content-Type": "application/json",
-        }
-        return url, "POST", headers, body
+    url = _build_proto_url(p, proto)
+    payload = _build_proto_payload(
+        proto,
+        tier.model,
+        tier.raw_model,
+        question,
+        max_tokens=max_tokens,
+        stream=stream,
+        suppress=suppress,
+    )
+    body = json.dumps(payload).encode()
 
     if proto == Protocol.OPENAI_RESPONSES:
-        base_stripped = p.base_url.rstrip("/")
-        url = (
-            base_stripped
-            if base_stripped.endswith("/v1/responses")
-            else base_stripped + "/v1/responses"
-        )
-        payload = {
-            "model": tier.model,
-            "max_output_tokens": max_tokens,
-            "input": question,
-        }
-        if stream:
-            payload["stream"] = True
-        if suppress:
-            payload["reasoning"] = {"effort": "minimal"}
-        body = json.dumps(payload).encode()
         headers = {
             "User-Agent": _user_agent(user_agent),
             **auth_h,
             "Content-Type": "application/json",
         }
-        return url, "POST", headers, body
-
-    # �知协议兜底（旧行为保留）
-    if p.app_type == "claude":
-        url = p.base_url.rstrip("/") + "/v1/messages"
-        payload = {
-            "model": tier.model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": question}],
-        }
-        if stream:
-            payload["stream"] = True
-        if suppress:
-            payload["thinking"] = {"type": "disabled"}
-        body = json.dumps(payload).encode()
-        headers = {
-            **_claude_code_headers(user_agent, stainless_version),
-            **auth_h,
-            "Content-Type": "application/json",
-        }
-        return url, "POST", headers, body
-    elif p.app_type == "openclaw" or p.is_openrouter:
-        url = p.base_url.rstrip("/") + "/chat/completions"
-        payload = {
-            "model": tier.raw_model or tier.model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": question}],
-        }
-        if stream:
-            payload["stream"] = True
-        if suppress:
-            payload["reasoning_effort"] = "none"
-        body = json.dumps(payload).encode()
-        headers = {
-            **_claude_code_headers(user_agent, stainless_version),
-            **auth_h,
-            "Content-Type": "application/json",
-        }
-        return url, "POST", headers, body
-    elif p.app_type == "codex":
-        url = p.base_url.rstrip("/") + "/responses"
-        payload = {
-            "model": tier.model,
-            "max_output_tokens": max_tokens,
-            "input": question,
-        }
-        if stream:
-            payload["stream"] = True
-        if suppress:
-            payload["reasoning"] = {"effort": "minimal"}
-        body = json.dumps(payload).encode()
-        headers = {
-            "User-Agent": _user_agent(user_agent),
-            **auth_h,
-            "Content-Type": "application/json",
-        }
-        return url, "POST", headers, body
     else:
-        base_stripped = p.base_url.rstrip("/")
-        url = (
-            base_stripped + "/v1/chat/completions"
-            if not base_stripped.endswith("/v1/chat/completions")
-            else base_stripped
-        )
-        payload = {
-            "model": tier.model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": question}],
-        }
-        if stream:
-            payload["stream"] = True
-        body = json.dumps(payload).encode()
         headers = {
             **_claude_code_headers(user_agent, stainless_version),
             **auth_h,
             "Content-Type": "application/json",
         }
-        return url, "POST", headers, body
+    return url, "POST", headers, body
 
 
 def extract_answer(p: Provider, resp_body: str) -> str:
@@ -862,6 +891,13 @@ def classify_error(resp_body: str, http_status: int = 0) -> tuple:
     return ErrorCategory.UNKNOWN, msg
 
 
+def _sanitize_raw_body(body: str, api_key: str) -> str:
+    """raw_body 脱敏：替换 API key 为掩码，防止写入报告时泄露。"""
+    if api_key and api_key in body:
+        return body.replace(api_key, api_key[:6] + "***")
+    return body
+
+
 def create_ssl_context(skip_tls_verify: bool) -> ssl.SSLContext:
     """默认验证 TLS 证书；仅在显式请求时跳过验证。"""
     if skip_tls_verify:
@@ -906,45 +942,56 @@ def _http_request(
     body: bytes | None = None,
     timeout: int = 30,
     skip_tls_verify: bool = False,
+    max_retries: int = 0,
 ) -> HttpResponse:
     """统一非流式 HTTP 请求，归一化 HTTPError/URLError/TLS/超时。
 
     消除 probe_tier / fetch_models / probe_model_metadata 里重复的 urlopen 样板。
     流式探测（probe_stream）因需要逐块读取 resp，不适用本函数。
+    max_retries: 网络层错误重试次数（仅对 URLError/TimeoutError/OSError 生效）。
     """
     ctx = create_ssl_context(skip_tls_verify)
     req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            raw = resp.read()
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                raw = resp.read(2 << 20)  # 2MB 限长，防止异常响应耗尽内存
+                return HttpResponse(
+                    status=resp.status,
+                    body=raw.decode("utf-8", errors="replace"),
+                    content_type=resp.headers.get("Content-Type", ""),
+                    error_category=None,
+                    error_msg="",
+                )
+        except urllib.error.HTTPError as e:
+            # HTTPError 有 status code，不算连接层错误；不重试
+            body_resp, _raw = _read_httperror_body(e)
             return HttpResponse(
-                status=resp.status,
-                body=raw.decode("utf-8", errors="replace"),
-                content_type=resp.headers.get("Content-Type", ""),
+                status=e.code,
+                body=body_resp,
+                content_type=e.headers.get("Content-Type", "") if e.headers else "",
                 error_category=None,
                 error_msg="",
             )
-    except urllib.error.HTTPError as e:
-        # HTTPError 有 status code，不算连接层错误；body 交给调用方 classify
-        body, _raw = _read_httperror_body(e)
-        return HttpResponse(
-            status=e.code,
-            body=body,
-            content_type=e.headers.get("Content-Type", "") if e.headers else "",
-            error_category=None,
-            error_msg="",
-        )
-    except urllib.error.URLError as e:
-        return HttpResponse(
-            0, "", "", _error_category_for_urlerror(e), f"连接失败: {e.reason}"
-        )
-    except (OSError, ssl.SSLError, ValueError) as e:
-        cat = (
-            _error_category_for_urlerror(e)
-            if _is_tls_error(e)
-            else ErrorCategory.UNKNOWN.value
-        )
-        return HttpResponse(0, "", "", cat, f"异常: {type(e).__name__}: {e}")
+        except urllib.error.URLError as e:
+            if attempt < max_retries:
+                time.sleep(1 + attempt)
+                continue
+            return HttpResponse(
+                0, "", "", _error_category_for_urlerror(e), f"连接失败: {e.reason}"
+            )
+        except (OSError, ssl.SSLError, ValueError) as e:
+            if attempt < max_retries:
+                time.sleep(1 + attempt)
+                continue
+            cat = (
+                _error_category_for_urlerror(e)
+                if _is_tls_error(e)
+                else ErrorCategory.UNKNOWN.value
+            )
+            return HttpResponse(0, "", "", cat, f"异常: {type(e).__name__}: {e}")
+    # 不应走到这里，但防御性兜底
+    return HttpResponse(0, "", "", ErrorCategory.UNKNOWN.value, "重试耗尽")
 
 
 def _is_tls_error(exc: BaseException) -> bool:
@@ -1609,6 +1656,7 @@ def probe_tier(
     user_agent: str | None = None,
     stainless_version: str | None = None,
     stealth: bool = False,
+    max_retries: int = 0,
 ) -> dict:
     """探测单个档位，返回结果字典（含 usage / raw_body 供 inspect 复用）。
 
@@ -1644,7 +1692,9 @@ def probe_tier(
     if stealth:
         time.sleep(random.uniform(STEALTH_JITTER_MIN, STEALTH_JITTER_MAX))
     start = time.time()
-    resp = _http_request(url, method, headers, body, timeout, skip_tls_verify)
+    resp = _http_request(
+        url, method, headers, body, timeout, skip_tls_verify, max_retries
+    )
     elapsed = round(time.time() - start, 2)
 
     # 连接层失败（网络/TLS/超时）
@@ -1675,7 +1725,7 @@ def probe_tier(
             "answer": "",
             "question": question,
             "usage": extract_usage(resp.body),
-            "raw_body": resp.body[:4000],
+            "raw_body": _sanitize_raw_body(resp.body[:4000], p.api_key),
             "has_thinking_signal": False,
         }
 
@@ -1694,7 +1744,7 @@ def probe_tier(
         if correct
         else ErrorCategory.ANSWER_MISMATCH.value,
         "usage": extract_usage(resp.body),
-        "raw_body": resp.body[:8000],
+        "raw_body": _sanitize_raw_body(resp.body[:8000], p.api_key),
         "has_thinking_signal": _response_has_thinking_signal(resp.body),
     }
 
@@ -1709,6 +1759,7 @@ def probe(
     on_attempt=None,
     stainless_version: str | None = None,
     stealth: bool = False,
+    max_retries: int = 0,
 ) -> dict:
     """按回退顺序探测档位，首个正确回答的档位即为可用档位。
 
@@ -1729,13 +1780,14 @@ def probe(
             user_agent=user_agent,
             stainless_version=stainless_version,
             stealth=stealth,
+            max_retries=max_retries,
         )
         attempts.append(r)
         if on_attempt is not None:
             try:
                 on_attempt(p, r)
-            except Exception:  # noqa: BLE001, S110 - 回调失败不影响探测结果
-                pass
+            except Exception as e:  # noqa: BLE001 - 回调失败不影响探测结果
+                sys.stderr.write(f"警告: on_attempt 回调失败: {e}\n")
         if r["status"] == 200 and r.get("correct"):
             best_tier = r
             break  # 找到能正确回答的档位，停止回退
@@ -1752,7 +1804,11 @@ def probe(
 
 
 def fetch_models(
-    p: Provider, timeout: int, skip_tls_verify: bool, user_agent: str | None = None
+    p: Provider,
+    timeout: int,
+    skip_tls_verify: bool,
+    user_agent: str | None = None,
+    max_retries: int = 0,
 ) -> dict:
     """拉取供应商的模型列表（GET /v1/models，Anthropic/OpenAI 兼容站通用）"""
     user_agent = user_agent or p.custom_user_agent
@@ -1769,7 +1825,9 @@ def fetch_models(
         headers.update(_claude_code_headers(user_agent))
 
     start = time.time()
-    resp = _http_request(url, "GET", headers, None, timeout, skip_tls_verify)
+    resp = _http_request(
+        url, "GET", headers, None, timeout, skip_tls_verify, max_retries
+    )
     elapsed = round(time.time() - start, 2)
 
     if resp.error_category is not None:
@@ -2665,8 +2723,8 @@ def _archive_check_results(args, providers, results) -> None:
                 "error_category": (attempt or {}).get("error_category"),
             }
             append_record(path, record)
-    except Exception:  # noqa: BLE001, S110 - 归档失败不影响健康检测
-        pass
+    except Exception as e:  # noqa: BLE001 - 归档失败不影响健康检测
+        sys.stderr.write(f"警告: check 结果归档失败: {e}\n")
 
 
 def run_health_check(args, providers, say) -> int:
@@ -2738,6 +2796,7 @@ def run_health_check(args, providers, say) -> int:
                 _on_attempt,
                 stainless_version=_sv,
                 stealth=_stealth,
+                max_retries=getattr(args, "retry", 0),
             )
         finally:
             _output_stream.reset(token)
@@ -2891,6 +2950,7 @@ def resolve_inspect_target(args, providers, say) -> tuple:
             args.timeout,
             args.skip_tls_verify,
             user_agent=getattr(args, "user_agent", None),
+            max_retries=getattr(args, "retry", 0),
         )
         if r["status"] != 200:
             return (
@@ -3609,8 +3669,8 @@ def run_inspect(args, providers, say) -> int:
                 "error_category": (text_result or {}).get("error_category"),
             },
         )
-    except Exception:  # noqa: BLE001, S110 - 归档失败不影响 inspect
-        pass
+    except Exception as e:  # noqa: BLE001 - 归档失败不影响 inspect
+        sys.stderr.write(f"警告: inspect 结果归档失败: {e}\n")
 
     return 0 if verdict in ("healthy", "skipped") else 1
 
@@ -3755,7 +3815,13 @@ def _run_inspect_all(args, providers, say) -> int:
         src = getattr(args, "source", "configured")
         if src in ("listed", "both"):
             _ua = getattr(args, "user_agent", None)
-            r = fetch_models(p, args.timeout, args.skip_tls_verify, user_agent=_ua)
+            r = fetch_models(
+                p,
+                args.timeout,
+                args.skip_tls_verify,
+                user_agent=_ua,
+                max_retries=getattr(args, "retry", 0),
+            )
             if r["status"] == 200:
                 listed = r["models"]
             else:
@@ -4049,9 +4115,16 @@ def format_inspect_human(r: dict) -> str:
     lines.append("")
     lines.append("-" * 60)
     lines.append(f"  总结：{r['summary']['verdict']}")
-    for a in (r.get("summary") or {}).get("recommended_actions") or []:
-        lines.append(f"  · {a}")
     lines.append("=" * 60)
+
+    # 推荐操作
+    rec = (r.get("summary") or {}).get("recommended_actions") or []
+    if rec:
+        lines.append("")
+        lines.append("  💡 建议操作:")
+        for action in rec:
+            lines.append(f"    • {action}")
+
     return "\n".join(lines)
 
 
@@ -5435,6 +5508,12 @@ def _build_parser():
         default=None,
         help="探测历史归档路径（默认 ~/.cc-pulse/probe_history.jsonl）",
     )
+    p_check.add_argument(
+        "--retry",
+        type=int,
+        default=0,
+        help="网络层错误重试次数（默认 0 不重试，仅对 URLError/TimeoutError/OSError 生效）",
+    )
     # 探测 token 预算：故意挂在 check 子解析器，不放 common（见 common 定义处说明）
     p_check.add_argument(
         "--probe-max-tokens",
@@ -5566,7 +5645,7 @@ def _build_parser():
     p_inspect.add_argument(
         "--with-metadata",
         action="store_true",
-        help="额外发 GET /v1/models/{id} 拉取供应商声明的窗口/能力等元数据（冗余，metadata 已默认开）",
+        help=argparse.SUPPRESS,  # 已废弃，metadata 默认包含在 --include 中
     )
     p_inspect.add_argument(
         "--probe-context",
@@ -5622,6 +5701,12 @@ def _build_parser():
         "--archive",
         default=None,
         help="探测历史归档路径（默认 ~/.cc-pulse/probe_history.jsonl）",
+    )
+    p_inspect.add_argument(
+        "--retry",
+        type=int,
+        default=0,
+        help="网络层错误重试次数（默认 0 不重试，仅对 URLError/TimeoutError/OSError 生效）",
     )
     p_inspect.add_argument(
         "--probe-max-tokens",
@@ -5788,6 +5873,17 @@ def _main_with_args(args) -> int:
     if not Path(args.db).exists():
         say(f"数据库不存在: {args.db}")
         return 2
+
+    # --archive 路径安全检查：必须在 home 或当前目录下
+    if getattr(args, "archive", None):
+        _ap = Path(args.archive).resolve()
+        _home = Path.home()
+        if not (_ap.is_relative_to(_home) or _ap.is_relative_to(Path.cwd())):
+            print(
+                f"错误: --archive 路径必须在 {_home} 或当前目录下",
+                file=sys.stderr,
+            )
+            return 2
 
     # 纯日志子命令：不加载 providers、不发 HTTP
     if args.command == "history":

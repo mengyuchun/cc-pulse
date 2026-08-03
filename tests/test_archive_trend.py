@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import types
+from pathlib import Path
 
 # 从项目根定位模块（可从任意目录运行）
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -61,11 +62,22 @@ try:
     test("parse_since invalid raises 无法解析", invalid)
 finally:
     mod.time.time = old_time
-test("archive_path override", mod.archive_path("D:/x/y.jsonl") == "D:/x/y.jsonl")
 test(
     "archive_path default",
     mod.archive_path().endswith(os.path.join(".cc-pulse", "probe_history.jsonl")),
 )
+# 路径限制：home/cwd 下可写，外部路径拒绝
+test(
+    "archive_path home 允许",
+    mod.archive_path(str(Path.home() / "test_pulse.jsonl")).endswith(
+        "test_pulse.jsonl"
+    ),
+)
+try:
+    mod.archive_path("D:/x/y.jsonl")
+    test("archive_path 外部路径拒绝", False)
+except ValueError:
+    test("archive_path 外部路径拒绝", True)
 
 
 print("\n[Unit] append_record / load_records")

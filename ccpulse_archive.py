@@ -32,7 +32,13 @@ def parse_since(s: str | None) -> int | None:
 def archive_path(override: str | None = None) -> str:
     """归档文件路径：override 非空用之；否则 ~/.cc-pulse/probe_history.jsonl。"""
     if override:
-        return override
+        from pathlib import Path
+
+        p = Path(override).resolve()
+        home = Path.home()
+        if not (p.is_relative_to(home) or p.is_relative_to(Path.cwd())):
+            raise ValueError(f"归档路径必须在 {home} 或当前目录下: {p}")
+        return str(p)
     return os.path.join(os.path.expanduser("~"), ".cc-pulse", "probe_history.jsonl")
 
 

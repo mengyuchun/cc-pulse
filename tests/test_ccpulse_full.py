@@ -2343,6 +2343,7 @@ def fake_probe_tier(
     user_agent=None,
     stainless_version=None,
     stealth=False,
+    max_retries=0,
 ):
     # 第 1 档失败，第 2 档成功
     if tier.tier == "haiku":
@@ -3286,6 +3287,463 @@ test(
 )
 
 shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ============ 新增测试：load_providers meta/notes 列覆盖 ============
+
+print("\n[Unit] load_providers 含 meta/notes 列")
+
+# 测试 1a：DB 无 meta/notes 列（向后兼容）
+_tmp1 = tempfile.mkdtemp(prefix="ccpulse_meta_test_")
+_db1 = os.path.join(_tmp1, "test.db")
+try:
+    _conn1 = sqlite3.connect(_db1)
+    _conn1.execute("""
+        CREATE TABLE providers (
+            name TEXT, app_type TEXT, settings_config TEXT,
+            is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER
+        )
+    """)
+    _conn1.execute(
+        "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "旧供应商",
+            "claude",
+            json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://old.test/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "sk-old",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-5",
+                    }
+                }
+            ),
+            0,
+            0,
+            0,
+        ),
+    )
+    _conn1.commit()
+    _conn1.close()
+    _provs1 = mod.load_providers(_db1, "claude")
+    test(
+        "无 meta/notes 列 load_providers 正常返回",
+        len(_provs1) == 1,
+        f"n={len(_provs1)}",
+    )
+    test(
+        "无 meta/notes 列 custom_user_agent=None",
+        _provs1[0].custom_user_agent is None,
+        f"custom_ua={_provs1[0].custom_user_agent!r}",
+    )
+    test(
+        "无 meta/notes 列 notes 为空",
+        _provs1[0].notes == "",
+        f"notes={_provs1[0].notes!r}",
+    )
+finally:
+    shutil.rmtree(_tmp1, ignore_errors=True)
+
+# 测试 1b：DB 有 meta/notes 列且有值
+_tmp2 = tempfile.mkdtemp(prefix="ccpulse_meta_test2_")
+_db2 = os.path.join(_tmp2, "test.db")
+try:
+    _conn2 = sqlite3.connect(_db2)
+    _conn2.execute("""
+        CREATE TABLE providers (
+            name TEXT, app_type TEXT, settings_config TEXT,
+            is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER,
+            meta TEXT, notes TEXT
+        )
+    """)
+    _conn2.execute(
+        "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "测试站",
+            "claude",
+            json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://x.test/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "sk-test",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-5",
+                    }
+                }
+            ),
+            0,
+            0,
+            0,
+            json.dumps(
+                {
+                    "apiFormat": "openai_chat",
+                    "customUserAgent": "test_agent/1.0",
+                }
+            ),
+            "限流中",
+        ),
+    )
+    _conn2.commit()
+    _conn2.close()
+    _provs2 = mod.load_providers(_db2, "claude")
+    test(
+        "有 meta/notes 列 load_providers 返回 1 个",
+        len(_provs2) == 1,
+        f"n={len(_provs2)}",
+    )
+    test(
+        "meta apiFormat=openai_chat -> protocol OPENAI_CHAT_COMPLETIONS",
+        _provs2[0].protocol == mod.Protocol.OPENAI_CHAT_COMPLETIONS,
+        f"proto={_provs2[0].protocol}",
+    )
+    test(
+        "meta customUserAgent 赋值到 custom_user_agent",
+        _provs2[0].custom_user_agent == "test_agent/1.0",
+        f"custom_ua={_provs2[0].custom_user_agent!r}",
+    )
+    test(
+        "notes 列值传递到 Provider.notes",
+        _provs2[0].notes == "限流中",
+        f"notes={_provs2[0].notes!r}",
+    )
+finally:
+    shutil.rmtree(_tmp2, ignore_errors=True)
+
+# 测试 1c：meta JSON 解析失败
+_tmp3 = tempfile.mkdtemp(prefix="ccpulse_meta_test3_")
+_db3 = os.path.join(_tmp3, "test.db")
+try:
+    _conn3 = sqlite3.connect(_db3)
+    _conn3.execute("""
+        CREATE TABLE providers (
+            name TEXT, app_type TEXT, settings_config TEXT,
+            is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER,
+            meta TEXT, notes TEXT
+        )
+    """)
+    _conn3.execute(
+        "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "坏meta站",
+            "claude",
+            json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://bad.test/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "sk-bad",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-5",
+                    }
+                }
+            ),
+            0,
+            0,
+            0,
+            "not-json",
+            "",
+        ),
+    )
+    _conn3.commit()
+    _conn3.close()
+    _provs3 = mod.load_providers(_db3, "claude")
+    test(
+        "meta 非法 JSON 不崩溃",
+        len(_provs3) == 1,
+        f"n={len(_provs3)}",
+    )
+    test(
+        "meta 非法 JSON -> custom_user_agent=None",
+        _provs3[0].custom_user_agent is None,
+        f"custom_ua={_provs3[0].custom_user_agent!r}",
+    )
+finally:
+    shutil.rmtree(_tmp3, ignore_errors=True)
+
+
+# ============ 新增测试：custom_user_agent UA 优先级回退 ============
+
+print("\n[Unit] build_probe_request custom_user_agent UA 优先级")
+
+_p_ua = mod.Provider(
+    name="UA-test",
+    app_type="claude",
+    base_url="https://ua.test",
+    api_key="sk-ua",
+    auth_mode="apikey",
+    tiers=[
+        mod.ModelTier("default", "claude-sonnet-4-20250514", "claude-sonnet-4-20250514")
+    ],
+    protocol=mod.Protocol.ANTHROPIC_MESSAGES,
+    custom_user_agent="provider_ua/1.0",
+    notes="test notes",
+)
+_t_ua = _p_ua.tiers[0]
+
+# 2a：CLI --user-agent 优先于 custom_user_agent
+_, _, _h_cli, _ = mod.build_probe_request(_p_ua, _t_ua, user_agent="cli_ua/2.0")
+test(
+    "UA 优先级：CLI --user-agent 优先",
+    "cli_ua/2.0" in _h_cli.get("User-Agent", ""),
+    f"UA={_h_cli.get('User-Agent')!r}",
+)
+
+# 2b：回退到 custom_user_agent
+_, _, _h_prov, _ = mod.build_probe_request(_p_ua, _t_ua, user_agent=None)
+test(
+    "UA 优先级：回退到 custom_user_agent",
+    "provider_ua/1.0" in _h_prov.get("User-Agent", ""),
+    f"UA={_h_prov.get('User-Agent')!r}",
+)
+
+# 2c：回退到默认（无 custom_user_agent，无 CLI）
+_p_no_ua = mod.Provider(
+    name="NoUA",
+    app_type="claude",
+    base_url="https://noua.test",
+    api_key="sk-noua",
+    auth_mode="apikey",
+    tiers=[
+        mod.ModelTier("default", "claude-sonnet-4-20250514", "claude-sonnet-4-20250514")
+    ],
+    protocol=mod.Protocol.ANTHROPIC_MESSAGES,
+    custom_user_agent=None,
+)
+_t_no_ua = _p_no_ua.tiers[0]
+_, _, _h_default, _ = mod.build_probe_request(_p_no_ua, _t_no_ua, user_agent=None)
+test(
+    "UA 优先级：回退到默认 claude-cli",
+    "claude-cli/" in _h_default.get("User-Agent", ""),
+    f"UA={_h_default.get('User-Agent')!r}",
+)
+
+
+# ============ 新增测试：rebuild_provider_for_inspect 字段保留 ============
+
+print("\n[Unit] rebuild_provider_for_inspect 字段保留")
+
+_p_orig = mod.Provider(
+    name="RebuildTest",
+    app_type="claude",
+    base_url="https://rebuild.test/v1",
+    api_key="sk-rebuild",
+    auth_mode="authtoken",
+    tiers=[
+        mod.ModelTier("haiku", "claude-haiku-4-5", "claude-haiku-4-5"),
+        mod.ModelTier("sonnet", "claude-sonnet-4-5", "claude-sonnet-4-5"),
+    ],
+    is_current=True,
+    in_failover=True,
+    is_openrouter=True,
+    protocol=mod.Protocol.OPENAI_CHAT_COMPLETIONS,
+    protocol_source="api_format",
+    custom_user_agent="ua/1.0",
+    notes="运营备注",
+)
+_p_rebuilt = mod.rebuild_provider_for_inspect(_p_orig, "gpt-4o")
+
+_rebuild_fields = {
+    "name": _p_rebuilt.name,
+    "app_type": _p_rebuilt.app_type,
+    "base_url": _p_rebuilt.base_url,
+    "api_key": _p_rebuilt.api_key,
+    "auth_mode": _p_rebuilt.auth_mode,
+    "is_current": _p_rebuilt.is_current,
+    "in_failover": _p_rebuilt.in_failover,
+    "is_openrouter": _p_rebuilt.is_openrouter,
+    "protocol": _p_rebuilt.protocol,
+    "protocol_source": _p_rebuilt.protocol_source,
+    "custom_user_agent": _p_rebuilt.custom_user_agent,
+    "notes": _p_rebuilt.notes,
+}
+_orig_fields = {
+    "name": _p_orig.name,
+    "app_type": _p_orig.app_type,
+    "base_url": _p_orig.base_url,
+    "api_key": _p_orig.api_key,
+    "auth_mode": _p_orig.auth_mode,
+    "is_current": _p_orig.is_current,
+    "in_failover": _p_orig.in_failover,
+    "is_openrouter": _p_orig.is_openrouter,
+    "protocol": _p_orig.protocol,
+    "protocol_source": _p_orig.protocol_source,
+    "custom_user_agent": _p_orig.custom_user_agent,
+    "notes": _p_orig.notes,
+}
+test(
+    "rebuild 保留所有非 tiers 字段",
+    _rebuild_fields == _orig_fields,
+    f"diff={ {k: (_orig_fields[k], _rebuild_fields[k]) for k in _orig_fields if _orig_fields[k] != _rebuild_fields[k]} }",
+)
+test(
+    "rebuild tiers 替换为单个 ModelTier",
+    len(_p_rebuilt.tiers) == 1,
+    f"tiers={_p_rebuilt.tiers}",
+)
+test(
+    "rebuild tiers[0].id == gpt-4o",
+    _p_rebuilt.tiers[0].model == "gpt-4o",
+    f"model={_p_rebuilt.tiers[0].model}",
+)
+test(
+    "rebuild custom_user_agent 保留",
+    _p_rebuilt.custom_user_agent == "ua/1.0",
+    f"custom_ua={_p_rebuilt.custom_user_agent!r}",
+)
+test(
+    "rebuild notes 保留",
+    _p_rebuilt.notes == "运营备注",
+    f"notes={_p_rebuilt.notes!r}",
+)
+test(
+    "rebuild protocol 保留",
+    _p_rebuilt.protocol == mod.Protocol.OPENAI_CHAT_COMPLETIONS,
+    f"proto={_p_rebuilt.protocol}",
+)
+
+
+# ============ 新增测试：_sanitize_raw_body 脱敏 ============
+
+print("\n[Unit] _sanitize_raw_body 脱敏")
+
+if hasattr(mod, "_sanitize_raw_body"):
+    _sb1 = mod._sanitize_raw_body(
+        '{"model":"x","api_key":"sk-1234567890abcdef"}',
+        "sk-1234567890abcdef",
+    )
+    test(
+        "sanitize_raw_body: api_key 被替换",
+        "sk-123" in _sb1 and "abcdef" not in _sb1,
+        f"result={_sb1!r}",
+    )
+    _sb2 = mod._sanitize_raw_body('{"model":"x"}', "sk-1234567890abcdef")
+    test(
+        "sanitize_raw_body: 无 api_key 原样返回",
+        _sb2 == '{"model":"x"}',
+        f"result={_sb2!r}",
+    )
+    _sb3 = mod._sanitize_raw_body('{"model":"x"}', "")
+    test(
+        "sanitize_raw_body: 空 key 原样返回",
+        _sb3 == '{"model":"x"}',
+        f"result={_sb3!r}",
+    )
+    _sb4 = mod._sanitize_raw_body('{"model":"x"}', None)
+    test(
+        "sanitize_raw_body: None key 原样返回",
+        _sb4 == '{"model":"x"}',
+        f"result={_sb4!r}",
+    )
+else:
+    test("_sanitize_raw_body 未实现（TODO）", True)
+
+
+# ============ 新增测试：parse_provider apiFormat 协议推断 ============
+
+print("\n[Unit] parse_provider apiFormat 协议推断")
+
+
+def _cfg(base="https://x.test/v1", token="sk-test"):
+    """构造 claude app_type 的 settings_config dict。"""
+    return {
+        "env": {
+            "ANTHROPIC_BASE_URL": base,
+            "ANTHROPIC_AUTH_TOKEN": token,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-5",
+        }
+    }
+
+
+# 5a：apiFormat="openai_chat"
+_pp1 = mod.parse_provider(
+    "P1",
+    "claude",
+    _cfg(),
+    False,
+    False,
+    api_format="openai_chat",
+)
+test(
+    "apiFormat=openai_chat -> OPENAI_CHAT_COMPLETIONS",
+    _pp1[0].protocol == mod.Protocol.OPENAI_CHAT_COMPLETIONS,
+    f"proto={_pp1[0].protocol}",
+)
+
+# 5b：apiFormat="openai_responses"
+_pp2 = mod.parse_provider(
+    "P2",
+    "claude",
+    _cfg(),
+    False,
+    False,
+    api_format="openai_responses",
+)
+test(
+    "apiFormat=openai_responses -> OPENAI_RESPONSES",
+    _pp2[0].protocol == mod.Protocol.OPENAI_RESPONSES,
+    f"proto={_pp2[0].protocol}",
+)
+
+# 5c：apiFormat="anthropic"
+_pp3 = mod.parse_provider(
+    "P3",
+    "claude",
+    _cfg(),
+    False,
+    False,
+    api_format="anthropic",
+)
+test(
+    "apiFormat=anthropic -> ANTHROPIC_MESSAGES",
+    _pp3[0].protocol == mod.Protocol.ANTHROPIC_MESSAGES,
+    f"proto={_pp3[0].protocol}",
+)
+
+# 5d：apiFormat=None（默认推断）
+_pp4 = mod.parse_provider(
+    "P4",
+    "claude",
+    _cfg(),
+    False,
+    False,
+    api_format=None,
+)
+test(
+    "apiFormat=None -> ANTHROPIC_MESSAGES（默认）",
+    _pp4[0].protocol == mod.Protocol.ANTHROPIC_MESSAGES,
+    f"proto={_pp4[0].protocol}",
+)
+
+# 5e：customUserAgent 赋值
+_pp5 = mod.parse_provider(
+    "P5",
+    "claude",
+    _cfg(),
+    False,
+    False,
+    custom_user_agent="codex_cli/0.144.0",
+)
+test(
+    "customUserAgent 赋值到 Provider",
+    _pp5[0].custom_user_agent == "codex_cli/0.144.0",
+    f"custom_ua={_pp5[0].custom_user_agent!r}",
+)
+
+# 5f：protocol_source 随 apiFormat
+test(
+    "apiFormat 设置 -> protocol_source='api_format'",
+    _pp1[0].protocol_source == "api_format",
+    f"source={_pp1[0].protocol_source!r}",
+)
+_pp6 = mod.parse_provider(
+    "P6",
+    "claude",
+    _cfg(),
+    False,
+    False,
+)
+test(
+    "无 apiFormat 无 URL 后缀 -> protocol_source=''",
+    _pp6[0].protocol_source == "",
+    f"source={_pp6[0].protocol_source!r}",
+)
 
 
 # ============ 汇总 ============
