@@ -224,7 +224,10 @@ class Provider:
     is_current: bool = False
     in_failover: bool = False
     is_openrouter: bool = False  # 向后兼容：base 含 /chat/completions 时为 True
-    protocol: Protocol = Protocol.UNKNOWN  # �式协议（优先于 app_type 默认推断）
+    protocol: Protocol = Protocol.UNKNOWN  # 权威协议（优先于 app_type 默认推断）
+    # protocol_source: "api_format"=cc-switch meta.apiFormat 显式配置 / "url_suffix"=base_url 后缀
+    # / ""=app_type 默认或未知；仅影响 detect_protocol 的 confidence 描述
+    protocol_source: str = ""
 
 
 def load_providers(db_path: str, app_type: str) -> list:
@@ -234,15 +237,26 @@ def load_providers(db_path: str, app_type: str) -> list:
     try:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute(
-            "SELECT name, app_type, settings_config, is_current, in_failover_queue "
-            "FROM providers WHERE app_type=? ORDER BY sort_index",
-            (app_type,),
+        # meta 列（存 apiFormat 协议配置）在部分旧库/测试库中不存在，动态检测以兼容
+        has_meta = "meta" in [r[1] for r in cur.execute("PRAGMA table_info(providers)")]
+        sel = (
+            "SELECT name, app_type, settings_config, meta, is_current, in_failover_queue "
+            "FROM providers WHERE app_type=? ORDER BY sort_index"
+            if has_meta
+            else "SELECT name, app_type, settings_config, is_current, in_failover_queue "
+            "FROM providers WHERE app_type=? ORDER BY sort_index"
         )
+        cur.execute(sel, (app_type,))
         providers = []
         for row in cur.fetchall():
             try:
                 cfg = json.loads(row["settings_config"])
+                api_format = None
+                if has_meta and row["meta"]:
+                    try:
+                        api_format = (json.loads(row["meta"]) or {}).get("apiFormat")
+                    except (json.JSONDecodeError, TypeError):
+                        api_format = None
                 providers.extend(
                     parse_provider(
                         row["name"],
@@ -250,6 +264,7 @@ def load_providers(db_path: str, app_type: str) -> list:
                         cfg,
                         bool(row["is_current"]),
                         bool(row["in_failover_queue"]),
+                        api_format,
                     )
                 )
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as e:
@@ -259,8 +274,14 @@ def load_providers(db_path: str, app_type: str) -> list:
         conn.close()
 
 
-def parse_provider(name, app_type, cfg, is_current, in_failover) -> list:
-    """解析单个供应商的 settings_config，返回 Provider 列表"""
+def parse_provider(
+    name, app_type, cfg, is_current, in_failover, api_format=None
+) -> list:
+    """解析单个供应商的 settings_config，返回 Provider 列表
+
+    api_format: cc-switch meta.apiFormat 字段（anthropic / openai_chat / openai_responses），
+    是供应商实际的 API 协议配置，优先于 base_url 后缀与 app_type 默认推断。
+    """
     out = []
     if app_type == "claude":
         env = cfg.get("env", {})
@@ -282,11 +303,18 @@ def parse_provider(name, app_type, cfg, is_current, in_failover) -> list:
                 tiers.append(ModelTier(tier, clean, v))
         if not tiers:
             return out
-        # 协议推断：base_url 显式后缀优先，其次 app_type 默认，避免 is_openrouter 单维推断错误
-        # P0 修复：L站0730（claude 类型 + base 不含 /chat/completions 但实际走 OpenAI 格式）
+        # 协议推断优先级：meta.apiFormat 配置 > base_url 显式后缀 > app_type 默认
+        # 修复：L站4w次 等配了 apiFormat=openai_chat 却被默认当 Anthropic Messages 发 403
         base_stripped = base.rstrip("/")
         proto = Protocol.UNKNOWN
-        if "/chat/completions" in base_stripped:
+        _API_FORMAT_TO_PROTO = {
+            "anthropic": Protocol.ANTHROPIC_MESSAGES,
+            "openai_chat": Protocol.OPENAI_CHAT_COMPLETIONS,
+            "openai_responses": Protocol.OPENAI_RESPONSES,
+        }
+        if api_format and api_format in _API_FORMAT_TO_PROTO:
+            proto = _API_FORMAT_TO_PROTO[api_format]
+        elif "/chat/completions" in base_stripped:
             proto = Protocol.OPENAI_CHAT_COMPLETIONS
         elif (
             base_stripped.endswith("/v1/responses") or "/v1/responses" in base_stripped
@@ -304,6 +332,16 @@ def parse_provider(name, app_type, cfg, is_current, in_failover) -> list:
             }.get(app_type, Protocol.UNKNOWN)
         # 向后兼容：is_openrouter 仍由 URL 子串判断（旧调用方依赖），protocol 才是权威
         is_or_compat = "/chat/completions" in base_stripped
+        # protocol_source：apiFormat 显式配置 / base_url 后缀 / app_type 默认
+        p_source = (
+            "api_format"
+            if api_format and api_format in _API_FORMAT_TO_PROTO
+            else "url_suffix"
+            if "/chat/completions" in base_stripped
+            or "/v1/responses" in base_stripped
+            or "/v1/messages" in base_stripped
+            else ""
+        )
         out.append(
             Provider(
                 name,
@@ -316,6 +354,7 @@ def parse_provider(name, app_type, cfg, is_current, in_failover) -> list:
                 in_failover,
                 is_or_compat,
                 protocol=proto,
+                protocol_source=p_source,
             )
         )
     elif app_type == "codex":
@@ -2841,6 +2880,8 @@ def rebuild_provider_for_inspect(p: Provider, model_id: str) -> Provider:
         is_current=p.is_current,
         in_failover=p.in_failover,
         is_openrouter=p.is_openrouter,
+        protocol=p.protocol,  # 保留协议配置，否则探测会退回默认 Anthropic Messages
+        protocol_source=p.protocol_source,
     )
 
 
@@ -2856,13 +2897,12 @@ def detect_protocol(p: Provider) -> dict:
             Protocol.OPENAI_RESPONSES: "openai_responses",
         }
         detected = proto_map.get(p.protocol, "unknown")
-        # 区分：base_url 有显式后缀的是"配置确认"，否则是 app_type 默认推断（均未实测）
-        has_suffix = (
-            "/chat/completions" in base
-            or "/v1/responses" in base
-            or "/v1/messages" in base
+        # confidence：apiFormat/base_url 显式配置 → configured；app_type 默认 → inferred（均未实测）
+        confidence = (
+            "configured"
+            if p.protocol_source in ("api_format", "url_suffix")
+            else "inferred"
         )
-        confidence = "configured" if has_suffix else "inferred"
         return {
             "detected": detected,
             "confidence": confidence,
@@ -2870,6 +2910,7 @@ def detect_protocol(p: Provider) -> dict:
                 "path_suffix": base,
                 "app_type": p.app_type,
                 "protocol_field": p.protocol.value,
+                "protocol_source": p.protocol_source,
                 "is_openrouter": p.is_openrouter,
             },
         }
