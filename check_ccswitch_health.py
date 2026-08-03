@@ -228,6 +228,11 @@ class Provider:
     # protocol_source: "api_format"=cc-switch meta.apiFormat 显式配置 / "url_suffix"=base_url 后缀
     # / ""=app_type 默认或未知；仅影响 detect_protocol 的 confidence 描述
     protocol_source: str = ""
+    # custom_user_agent: cc-switch meta.customUserAgent（如 codex_cli/0.144.0），
+    # 该供应商探测时的默认 UA；--user-agent CLI 参数优先级更高
+    custom_user_agent: str | None = None
+    # notes: cc-switch providers.notes（用户自记的限流/宕机等运营笔记）
+    notes: str = ""
 
 
 def load_providers(db_path: str, app_type: str) -> list:
@@ -237,13 +242,19 @@ def load_providers(db_path: str, app_type: str) -> list:
     try:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        # meta 列（存 apiFormat 协议配置）在部分旧库/测试库中不存在，动态检测以兼容
-        has_meta = "meta" in [r[1] for r in cur.execute("PRAGMA table_info(providers)")]
+        # meta/notes 列在部分旧库/测试库中不存在，动态检测以兼容
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(providers)")]
+        has_meta = "meta" in cols
+        has_notes = "notes" in cols
+        extra_cols = []
+        if has_meta:
+            extra_cols.append("meta")
+        if has_notes:
+            extra_cols.append("notes")
         sel = (
-            "SELECT name, app_type, settings_config, meta, is_current, in_failover_queue "
-            "FROM providers WHERE app_type=? ORDER BY sort_index"
-            if has_meta
-            else "SELECT name, app_type, settings_config, is_current, in_failover_queue "
+            "SELECT name, app_type, settings_config"
+            + (", " + ", ".join(extra_cols) if extra_cols else "")
+            + ", is_current, in_failover_queue "
             "FROM providers WHERE app_type=? ORDER BY sort_index"
         )
         cur.execute(sel, (app_type,))
@@ -252,11 +263,15 @@ def load_providers(db_path: str, app_type: str) -> list:
             try:
                 cfg = json.loads(row["settings_config"])
                 api_format = None
+                custom_ua = None
                 if has_meta and row["meta"]:
                     try:
-                        api_format = (json.loads(row["meta"]) or {}).get("apiFormat")
+                        meta_obj = json.loads(row["meta"]) or {}
+                        api_format = meta_obj.get("apiFormat")
+                        custom_ua = meta_obj.get("customUserAgent")
                     except (json.JSONDecodeError, TypeError):
-                        api_format = None
+                        pass
+                notes = (row["notes"] if has_notes and row["notes"] else "") or ""
                 providers.extend(
                     parse_provider(
                         row["name"],
@@ -265,6 +280,8 @@ def load_providers(db_path: str, app_type: str) -> list:
                         bool(row["is_current"]),
                         bool(row["in_failover_queue"]),
                         api_format,
+                        custom_ua,
+                        notes,
                     )
                 )
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as e:
@@ -275,7 +292,14 @@ def load_providers(db_path: str, app_type: str) -> list:
 
 
 def parse_provider(
-    name, app_type, cfg, is_current, in_failover, api_format=None
+    name,
+    app_type,
+    cfg,
+    is_current,
+    in_failover,
+    api_format=None,
+    custom_user_agent=None,
+    notes="",
 ) -> list:
     """解析单个供应商的 settings_config，返回 Provider 列表
 
@@ -355,6 +379,8 @@ def parse_provider(
                 is_or_compat,
                 protocol=proto,
                 protocol_source=p_source,
+                custom_user_agent=custom_user_agent,
+                notes=notes,
             )
         )
     elif app_type == "codex":
@@ -376,6 +402,8 @@ def parse_provider(
                     [ModelTier("default", model, model)],
                     is_current,
                     in_failover,
+                    custom_user_agent=custom_user_agent,
+                    notes=notes,
                 )
             )
     elif app_type == "openclaw":
@@ -397,6 +425,8 @@ def parse_provider(
                     tiers,
                     is_current,
                     in_failover,
+                    custom_user_agent=custom_user_agent,
+                    notes=notes,
                 )
             )
     return out
@@ -428,6 +458,9 @@ def build_probe_request(
     最终答案；普通 claude 模型不发该字段，更贴近真实 claude-cli，减少指纹。
     question 为实际探测问题（来自问题池随机抽取）；max_tokens 允许调高预算。
     """
+    # UA 优先级：CLI --user-agent > 供应商 meta.customUserAgent > 本机 claude-cli 版本
+    user_agent = user_agent or p.custom_user_agent
+
     auth_h = build_auth_headers(p)
     suppress = disable_thinking and _is_thinking_prone_model(tier.model)
 
@@ -1722,6 +1755,7 @@ def fetch_models(
     p: Provider, timeout: int, skip_tls_verify: bool, user_agent: str | None = None
 ) -> dict:
     """拉取供应商的模型列表（GET /v1/models，Anthropic/OpenAI 兼容站通用）"""
+    user_agent = user_agent or p.custom_user_agent
     # 路径不去重：base + /v1/models（与探测保持一致）
     if p.is_openrouter:
         # OpenRouter：base 是 .../chat/completions，模型端点是同级 /models
@@ -2660,6 +2694,9 @@ def run_health_check(args, providers, say) -> int:
 
     results = []
     health_started = time.time()
+    _notes_map = {
+        p.name: (p.notes or "").strip() for p in providers
+    }  # 供应商名→运营备注
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
     _ua = getattr(args, "user_agent", None)
@@ -2724,7 +2761,11 @@ def run_health_check(args, providers, say) -> int:
                     f"{a['tier']}:{a['status']}({a['error'][:30]})"
                     for a in r["attempts"]
                 )
-                say(f"[{i:>2}/{len(providers)}] {icon} {r['name'][:24]:24} {fails}")
+                _nt = _notes_map.get(r["name"], "")
+                _sfx = f"  notes:{_nt[:40]}" if _nt else ""
+                say(
+                    f"[{i:>2}/{len(providers)}] {icon} {r['name'][:24]:24} {fails}{_sfx}"
+                )
             if getattr(args, "with_history", False):
                 try:
                     say(
@@ -2747,7 +2788,10 @@ def run_health_check(args, providers, say) -> int:
     if fail:
         say("\n不可用详情（每档尝试结果）:")
         for r in fail:
+            _nt = _notes_map.get(r["name"], "")
             say(f"  ❌ {r['name'][:24]:24} {r['base_url']}  [auth:{r['auth_mode']}]")
+            if _nt:
+                say(f"      notes: {_nt[:60]}")
             for a in r["attempts"]:
                 say(
                     f"      {a['tier']:8} {a['model']:28} [{a['status']}] {a['elapsed']}s"
@@ -2882,6 +2926,8 @@ def rebuild_provider_for_inspect(p: Provider, model_id: str) -> Provider:
         is_openrouter=p.is_openrouter,
         protocol=p.protocol,  # 保留协议配置，否则探测会退回默认 Anthropic Messages
         protocol_source=p.protocol_source,
+        custom_user_agent=p.custom_user_agent,
+        notes=p.notes,
     )
 
 
@@ -3378,7 +3424,7 @@ def run_inspect(args, providers, say) -> int:
     include = _parse_include(getattr(args, "include", None), _INSPECT_DEFAULT_INCLUDE)
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
-    _ua = getattr(args, "user_agent", None)
+    _ua = getattr(args, "user_agent", None) or p.custom_user_agent
 
     if getattr(args, "with_metadata", False):
         say("提示: --with-metadata 已废弃，metadata 默认包含在 --include 中")
@@ -3494,6 +3540,8 @@ def run_inspect(args, providers, say) -> int:
         "model_source": args.source,
         "base_url": inspect_p.base_url,
         "auth_mode": inspect_p.auth_mode,
+        "custom_user_agent": p.custom_user_agent,  # 原始 Provider（未 rebuild）
+        "notes": p.notes,  # 原始 Provider 运营备注
         "protocol": protocol,
         "text": text_result,
         "streaming": streaming_result
@@ -3832,6 +3880,10 @@ def format_inspect_human(r: dict) -> str:
     lines.append(
         f"  Protocol:  {r['protocol']['detected']} · {r['protocol']['confidence']}"
     )
+    if r.get("custom_user_agent"):
+        lines.append(f"  UA:        {r['custom_user_agent']}")
+    if r.get("notes"):
+        lines.append(f"  Notes:     {r['notes']}")
     lines.append("=" * 60)
     lines.append("")
 
