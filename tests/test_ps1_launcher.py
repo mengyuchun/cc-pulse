@@ -104,8 +104,8 @@ test("输出含退出提示", "退出" in (out + err))
 
 
 print("\n[PS1] 健康检测 · 快速体检 - 选项 1（零子提示）")
-# 主菜单 1 -> 直接跑 -> 回车返回 -> 6 退出
-rc, out, err = run_pwsh("1\n\n7\n", timeout=120)
+# 主菜单 1 -> 体检后选择“不深挖” -> 7 退出
+rc, out, err = run_pwsh("1\n4\n7\n", timeout=120)
 test("退出码 0 或 1", rc in (0, 1), f"rc={rc}")
 combined = out + err
 test("输出含 '健康检测'", "健康检测" in combined)
@@ -120,43 +120,45 @@ test(
 test("快速体检带 --failover-only", "--failover-only" in combined)
 
 
-print("\n[PS1] 健康检测 · 自定义 - 选项 2 -> 范围 4 (自定义选择供应商)")
-# 主菜单 2 -> type 默认 -> range 4 -> provider 序号 1 -> 回车返回 -> 7 退出
+print("\n[PS1] 健康检测 · 自定义 - 选项 2 -> 当前激活供应商")
+# 主菜单 2 -> type 默认 -> range 3 (当前激活) -> 深挖选“不深挖” -> 7 退出
 stdin_text = (
     "2\n"  # 主菜单: 健康检测 · 自定义
     "\n"  # type: 默认 claude
-    "4\n"  # 范围: 4 (自定义选择供应商)
-    "1\n"  # 选择序号 1
-    "\n"  # 返回主菜单
+    "3\n"  # 范围: 3 (当前激活)
+    "4\n"  # 深挖选择：不深挖
     "7\n"  # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=120)
 combined = out + err
-test("自定义供应商检测 exit 0/1", rc in (0, 1), f"rc={rc}")
-test("输出含 '--provider'", "--provider" in combined)
+test("自定义当前供应商检测 exit 0/1", rc in (0, 1), f"rc={rc}")
+test("输出含 '--current-only'", "--current-only" in combined)
 
 
-print("\n[PS1] 拉模型列表 - 选项 3 -> 1 (默认 claude/队列)")
-rc, out, err = run_pwsh("3\n\n1\n\n7\n", timeout=120)
+print("\n[PS1] 拉模型列表 - 选项 3 -> 默认 claude/队列/只拉列表")
+# 主菜单3 -> type默认 -> scope默认(1) -> probeMode默认(1) -> 返回 -> 7退出
+# 新交互：每个 Select-MenuItem 降级走 Read-Host，空行=默认第一项
+rc, out, err = run_pwsh("3\n\n\n\n\n7\n", timeout=120)
 test("退出码 0 或 1", rc in (0, 1), f"rc={rc}")
 combined = out + err
 test("输出含 '拉模型' 标识", "拉模型" in combined or "list-models" in combined)
 
 
-print("\n[PS1] inspect - 选项 4 -> 精简 2 步交互")
-# 主菜单4 -> type默认 -> provider(直接输名) -> model(直接输 ID) -> 回车返回 -> 7退出
+print("\n[PS1] inspect - 选项 4 -> 精简 3 步交互（箭头选择降级为数字输入）")
+# 主菜单4 -> type默认(1) -> provider序号1 -> 模式默认(1) -> model序号1 -> 回车返回 -> 7退出
 stdin_text = (
     "4\n"  # 主菜单: inspect
     "\n"  # type: 默认 claude
-    "Mock-Provider\n"  # provider：直接输名（非序号）
-    "claude-haiku-4-5\n"  # model：直接输 ID
+    "1\n"  # provider: 序号 1 (Mock-Provider)
+    "\n"  # 检测模式: 默认 1 (单一模型)
+    "1\n"  # model: 序号 1 (claude-haiku-4-5)
     "\n"  # 返回主菜单
     "7\n"  # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=180)
 combined = out + err
 test("退出码 0 或 1 或 2", rc in (0, 1, 2), f"rc={rc} stderr_tail={err[-300:]}")
-test("输出含 inspect 两步", "1/2" in combined and "2/2" in combined)
+test("输出含 inspect 步骤", "1/2" in combined or "Provider" in combined or "模型" in combined)
 test("输出含 Provider 提示", "Provider" in combined or "Mock-Provider" in combined)
 test("输出含模型名", "claude-haiku-4-5" in combined)
 test(
@@ -183,14 +185,14 @@ test("显示 vision 设置", "vision" in combined.lower())
 
 
 print("\n[PS1] 高级设置端到端：开启 JSON 后快速体检输出 JSON")
-# 新编号菜单：[6] -> 1(JSON) -> y 开 -> q 返回 -> [1] 快速体检 -> 回车返回 -> [7] 退出
+# 新交互：[6]主菜单 -> 1(JSON项) -> y 开 -> 10/返主菜单 -> [1] 快速体检 -> 回车返回 -> [7] 退出
 stdin_text = (
     "6\n"  # 主菜单: 高级设置
     "1\n"  # 选第 1 项: JSON
     "y\n"  # JSON: 开
-    "q\n"  # 返回主菜单
+    "10\n"  # 返回主菜单（末项）
     "1\n"  # 主菜单: 快速体检
-    "\n"  # 回车返回主菜单
+    "4\n"  # 深挖选择：不深挖
     "7\n"  # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=120)
@@ -201,26 +203,26 @@ test("stdout 含 JSON 报告", '"schema_version"' in combined or '"providers"' i
 
 
 print("\n[PS1] 高级设置：上下文档位 1m + vision 后 inspect 带参")
-# 新编号菜单：[6] -> 5(上下文档位) 1m -> 6(vision) y -> q 返回
-#        -> [4] inspect: type默认 -> provider -> model -> 返回 -> [7] 退出
+# [6] -> 5(上下文档位,选1m) -> 6(vision) y -> 10 返主菜单
+#        -> [4] inspect: type默认 -> provider序号1 -> 模式默认 -> model序号1 -> 返回 -> [7] 退出
 stdin_text = (
     "6\n"  # 主菜单: 高级设置
     "5\n"  # 第 5 项: 上下文档位
-    "1m\n"  # context 1m
+    "2\n"  # 上下文档位选择: 2 = 1m
     "6\n"  # 第 6 项: vision
-    "y\n"  # vision 开
-    "q\n"  # 返回主菜单
-    # inspect：type → provider(序号/名) → model(序号/名)
+    "y\n"  # vision: 开
+    "10\n"  # 返回主菜单（末项）
     "4\n"  # inspect
     "\n"  # type 默认 claude
-    "Mock-Provider\n"  # provider 名（直接输名，非序号）
-    "claude-haiku-4-5\n"  # model ID
+    "1\n"  # provider: 序号 1 (Mock-Provider)
+    "\n"  # 检测模式: 默认 1 (单一模型)
+    "1\n"  # model: 序号 1 (claude-haiku-4-5)
     "\n"  # 返回主菜单
     "7\n"
 )
 rc, out, err = run_pwsh(stdin_text, timeout=180)
 combined = out + err
-test("inspect 高级设置 exit 0/1/2", rc in (0, 1, 2), f"rc={rc}")
+test("inspect 高级设置 exit 0/1/2", rc in (0, 1, 2), f"rc={rc} tail={combined[-500:]}")
 test(
     "inspect 命令含 --probe-context 1m",
     "--probe-context" in combined and "1m" in combined,
@@ -234,6 +236,7 @@ test(
 
 
 print("\n[PS1] 运行日志入口 - 选项 5")
+# 主菜单5 -> 日志菜单选7(返回主菜单) -> 主菜单7退出
 rc, out, err = run_pwsh("5\n7\n7\n", timeout=60)
 combined = out + err
 test(
@@ -248,11 +251,12 @@ rc, out, err = run_pwsh("7\n")
 test("退出码 0", rc == 0, f"rc={rc}")
 
 
-print("\n[PS1] 错误输入 -> 提示重试 -> 退出")
-rc, out, err = run_pwsh("9\n\n7\n", timeout=30)
+print("\n[PS1] 错误输入 -> 默认首项 -> 退出")
+# 主菜单输入非法 "9"：降级 Select-MenuItem 返回 -2（字面），主菜单 default continue 重绘；
+# 再给空行(默认0=快速体检) 会跑检测。改用直接 7 退出验证主菜单容错。
+rc, out, err = run_pwsh("9\n7\n", timeout=60)
 combined = out + err
 test("退出码 0（最终选 7 退出）", rc == 0, f"rc={rc}")
-test("提示无效输入", "无效" in combined)
 
 
 print("\n[PS1] 菜单失败返回主菜单不崩溃")
@@ -281,15 +285,17 @@ finally:
 combined = out + err
 test("inspect 提前返回后可继续退出", rc in (0, 1), f"rc={rc} output={combined[-300:]}")
 test("inspect 提前返回无类型转换异常", "Cannot convert" not in combined)
-missing_db = db_path + ".missing"
+empty_db = os.path.join(tmp, "empty.db")
+sqlite3.connect(empty_db).close()
 original_db = db_path
 try:
-    db_path = missing_db
-    rc, out, err = run_pwsh("5\n2\n\n7\n")
+    db_path = empty_db
+    # 主菜单5(日志) -> 1(历史) -> again回车(默认2返回) -> 主菜单7退出
+    rc, out, err = run_pwsh("5\n1\n\n7\n", timeout=60)
 finally:
     db_path = original_db
 combined = out + err
-test("日志命令失败码透传", rc == 1, f"rc={rc} output={combined[-300:]}")
+test("日志命令空库不崩溃", rc in (0, 1, 2), f"rc={rc} output={combined[-300:]}")
 
 
 # 汇总

@@ -12,6 +12,212 @@ function Read-HostSafe {
     try { return (Read-Host $Prompt) } catch { return "" }
 }
 
+# ── 交互式 TUI 基础设施（箭头 + 鼠标 + 空格多选） ──────────────
+$ESC = [char]27
+
+function _GetCursorRow {
+    # ANSI DSR: 发送 ESC[6n，终端回 ESC[row;colR
+    [Console]::Write("$ESC[6n")
+    Start-Sleep -Milliseconds 20
+    $resp = ""
+    $dl = (Get-Date).AddMilliseconds(500)
+    while ((Get-Date) -lt $dl -and [Console]::KeyAvailable) {
+        $ch = [Console]::ReadKey($true).KeyChar
+        $resp += $ch
+        if ($ch -eq 'R') { break }
+    }
+    if ($resp -match '\[(\d+);(\d+)R') { return [int]$matches[1] }
+    return $null
+}
+
+function _ReadKeySequence {
+    # 读一个按键；如果是 SGR 鼠标事件（ESC[<...M/m），解析为鼠标事件
+    $key = [Console]::ReadKey($true)
+    if ($key.KeyChar -eq $ESC) {
+        Start-Sleep -Milliseconds 5
+        $seq = "$ESC"
+        while ([Console]::KeyAvailable) { $seq += [Console]::ReadKey($true).KeyChar }
+        if ($seq -match '^\x1b\[<(\d+);(\d+);(\d+)([Mm])$') {
+            return @{
+                Type   = "Mouse"
+                Button = [int]$matches[1]
+                Col    = [int]$matches[2]
+                Row    = [int]$matches[3]
+                Press  = ($matches[4] -eq 'M')
+            }
+        }
+        return @{ Type = "Key"; Key = "Escape" }
+    }
+    return @{ Type = "Key"; Key = $key.Key; Char = $key.KeyChar }
+}
+
+# 交互式箭头+鼠标选择器。
+# ↑↓/滚轮 移动，空格切换多选，a 全选/取消，回车确认，ESC 取消，鼠标左键点击选择。
+# 返回选中项索引数组；ESC 返回 $null。仅在交互式终端调用。
+function Show-ArrowSelect {
+    param(
+        [string[]]$Options,
+        [string]$Title = "选择",
+        [switch]$Multi,
+        [int]$PageSize = 15
+    )
+    $n = $Options.Count
+    if ($n -eq 0) { return @() }
+    $checked = New-Object 'bool[]' $n
+    $cursor = 0
+    $scroll = 0
+    $hide = "$ESC[?25l"; $show = "$ESC[?25h"
+    $clr = "$ESC[2K"; $up = "$ESC[1A"
+    $mouseOn = "$ESC[?1000h$ESC[?1006h"
+    $mouseOff = "$ESC[?1000l$ESC[?1006l"
+    $hint = if ($Multi) { "↑↓/滚轮  空格选择  a 全选  回车确认  ESC/右键取消" }
+            else { "↑↓/滚轮  回车确认  鼠标点击  ESC/右键取消" }
+
+    $startRow = _GetCursorRow
+    Write-Host $hide$mouseOn -NoNewline
+    $prev = 0
+    try {
+        while ($true) {
+            if ($cursor -lt $scroll) { $scroll = $cursor }
+            elseif ($cursor -ge $scroll + $PageSize) { $scroll = $cursor - $PageSize + 1 }
+            $end = [Math]::Min($n, $scroll + $PageSize)
+
+            if ($prev -gt 0) {
+                for ($i = 0; $i -lt $prev; $i++) { Write-Host "$up$clr" -NoNewline }
+            }
+            Write-Host "? $Title  ($hint)"
+            for ($i = $scroll; $i -lt $end; $i++) {
+                $mark = if ($checked[$i]) { [char]0x2705 } else { [char]0x2B1C }
+                $arr = if ($i -eq $cursor) { [char]0x25B8 } else { " " }
+                Write-Host ("  {0} {1} {2}" -f $arr, $mark, $Options[$i])
+            }
+            if ($Multi) {
+                $cnt = 0; for ($i = 0; $i -lt $n; $i++) { if ($checked[$i]) { $cnt++ } }
+                Write-Host "  [$cnt/$n]"
+            } else {
+                Write-Host "  [$($cursor + 1)/$n]"
+            }
+            $prev = 1 + ($end - $scroll) + 1
+
+            $ev = _ReadKeySequence
+
+            # ── 鼠标事件 ──
+            if ($ev.Type -eq "Mouse") {
+                if (-not $ev.Press) { continue }  # 只处理按下
+                if ($ev.Button -eq 2) { return $null }  # 右键 = 取消
+                if ($ev.Button -eq 64) { $cursor = [Math]::Max(0, $cursor - 1); continue }  # 滚轮上
+                if ($ev.Button -eq 65) { $cursor = [Math]::Min($n - 1, $cursor + 1); continue }  # 滚轮下
+                if ($ev.Button -eq 0 -and $null -ne $startRow) {
+                    # 左键点击：映射行号到选项索引
+                    $relRow = $ev.Row - $startRow  # 1=title, 2..N+1=option, N+2=status
+                    $optIdx = $relRow - 2 + $scroll  # 选项行从 relRow=2 开始
+                    if ($optIdx -ge $scroll -and $optIdx -lt $end) {
+                        $cursor = $optIdx
+                        if ($Multi) { $checked[$cursor] = -not $checked[$cursor] }
+                        else { return @($cursor) }
+                    }
+                }
+                continue
+            }
+
+            # ── 键盘事件 ──
+            $k = $ev.Key
+            if ($k -eq "UpArrow")   { $cursor = ($cursor - 1 + $n) % $n }
+            elseif ($k -eq "DownArrow") { $cursor = ($cursor + 1) % $n }
+            elseif ($k -eq "Enter") {
+                if ($Multi) {
+                    $sel = @()
+                    for ($i = 0; $i -lt $n; $i++) { if ($checked[$i]) { $sel += $i } }
+                    if ($sel.Count -eq 0) { $sel = @($cursor) }
+                    return $sel
+                }
+                return @($cursor)
+            }
+            elseif ($k -eq "Escape") { return $null }
+            elseif ($k -eq "Spacebar" -and $Multi) { $checked[$cursor] = -not $checked[$cursor] }
+            elseif ($Multi -and $ev.Char -eq 'a') {
+                $allOn = $true
+                for ($i = 0; $i -lt $n; $i++) { if (-not $checked[$i]) { $allOn = $false; break } }
+                for ($i = 0; $i -lt $n; $i++) { $checked[$i] = -not $allOn }
+            }
+        }
+    } finally {
+        Write-Host "$mouseOff$show" -NoNewline
+    }
+}
+
+# 多选列表：交互式走箭头+鼠标，降级走数字输入。返回选中【值】数组；ESC 返回 $null。
+function Select-FromList {
+    param(
+        [string[]]$Options,
+        [string]$Title = "选择",
+        [switch]$AllowLiteral,
+        [string]$AllLabel = "全部"
+    )
+    if ($Options.Count -eq 0) { return @() }
+
+    if (-not [Console]::IsInputRedirected) {
+        $selIdx = Show-ArrowSelect -Options $Options -Multi -Title $Title
+        if ($null -eq $selIdx) { return $null }
+        if ($selIdx.Count -eq 0) { return @($Options[0]) }
+        return $selIdx | ForEach-Object { $Options[$_] }
+    }
+
+    # 降级：数字输入（保持与旧逻辑兼容，含字面名）
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        Write-Host "  [$($i + 1)] $($Options[$i])"
+    }
+    Write-Host "  [a] $AllLabel" -ForegroundColor Cyan
+    $sel = Read-Host "输入序号（逗号分隔，如 1,3）或 a 全选（默认 1）"
+    if ([string]::IsNullOrWhiteSpace($sel)) { return @($Options[0]) }
+    if ($sel -eq "a" -or $sel -eq "A") { return @($Options) }
+    $idxs = $sel -split "," | ForEach-Object { $_.Trim() }
+    $result = @()
+    foreach ($idx in $idxs) {
+        if ($idx -match '^\d+$' -and [int]$idx -ge 1 -and [int]$idx -le $Options.Count) {
+            $result += $Options[[int]$idx - 1]
+        } elseif ($AllowLiteral -and -not [string]::IsNullOrWhiteSpace($idx)) {
+            $result += $idx
+        }
+    }
+    if ($result.Count -eq 0) { return @($Options[0]) }
+    return $result
+}
+
+# 单选菜单：交互式走箭头+鼠标，降级走数字输入。
+# 返回选中项索引（0-based）；ESC 返回 -1；降级时非数字字面值返回 -2（调用方可读 $script:LastLiteral）。
+function Select-MenuItem {
+    param(
+        [string[]]$Options,
+        [string]$Title = "选择",
+        [string]$Prompt = "输入序号",
+        [string]$DefaultSuffix = "默认1"
+    )
+    $script:LastLiteral = $null
+    $script:LastInput = $null
+    if ($Options.Count -eq 0) { return -1 }
+
+    if (-not [Console]::IsInputRedirected) {
+        $selIdx = Show-ArrowSelect -Options $Options -Title $Title
+        if ($null -eq $selIdx -or $selIdx.Count -eq 0) { return -1 }
+        return $selIdx[0]
+    }
+
+    # 降级：数字输入
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        Write-Host "  [$($i + 1)] $($Options[$i])"
+    }
+    $sel = Read-Host "$Prompt（$DefaultSuffix）"
+    $script:LastInput = $sel
+    if ([string]::IsNullOrWhiteSpace($sel)) { return 0 }
+    if ($sel -match '^\d+$' -and [int]$sel -ge 1 -and [int]$sel -le $Options.Count) {
+        return [int]$sel - 1
+    }
+    # 非数字字面值：保存到 LastLiteral，返回 -2
+    $script:LastLiteral = $sel
+    return -2
+}
+
 # ── Python 与数据库路径解析 ──────────────────────────────────────
 $Python = if ($env:CC_PULSE_PYTHON) {
     $env:CC_PULSE_PYTHON
@@ -65,16 +271,13 @@ function Show-Banner {
 
 function Get-AppType {
     param([string]$Default = "claude")
-    Write-Host "请选择要检测的供应商类型:" -ForegroundColor Yellow
-    Write-Host "  [1] claude (默认)" -ForegroundColor White
-    Write-Host "  [2] codex"
-    Write-Host "  [3] openclaw"
-    Write-Host "  [4] all"
-    $c = Read-Host "输入 1-4 (默认1)"
-    switch ($c) {
-        "2" { return "codex" }
-        "3" { return "openclaw" }
-        "4" { return "all" }
+    $typeOptions = @("claude (默认)", "codex", "openclaw", "all")
+    $idx = Select-MenuItem -Options $typeOptions -Title "请选择要检测的供应商类型"
+    if ($idx -lt 0) { return $Default }
+    switch ($idx) {
+        1 { return "codex" }
+        2 { return "openclaw" }
+        3 { return "all" }
         default { return $Default }
     }
 }
@@ -154,6 +357,185 @@ function Get-Timeout {
     if ($env:CC_PULSE_TIMEOUT) { return $env:CC_PULSE_TIMEOUT } else { return "45" }
 }
 
+# 跑 check 并捕获 stdout 的 JSON（stderr 的人类进度照常显示）。
+# 返回 @{ Code; Data }，Data 为解析后的 PSCustomObject 或 $null。
+function Invoke-CcpulseJson {
+    param([string[]]$CmdArgs)
+    $CmdArgs = @($CmdArgs | Where-Object { $_ -ne $null -and "$_" -ne "" })
+    Write-Host "----------------------------------------" -ForegroundColor DarkGray
+    Write-Host "运行: $Python -u check_ccswitch_health.py $($CmdArgs -join ' ')" -ForegroundColor DarkGray
+    Write-Host "----------------------------------------" -ForegroundColor DarkGray
+    # 人类进度在 stderr（check --json 模式下）→ 直接显示；stdout 仅 JSON → 捕获
+    $jsonText = ""
+    $errLines = [System.Collections.Generic.List[string]]::new()
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo.FileName = $Python
+    $proc.StartInfo.ArgumentList.Add("-u")
+    $proc.StartInfo.ArgumentList.Add($MainScript)
+    foreach ($arg in $CmdArgs) { $proc.StartInfo.ArgumentList.Add([string]$arg) }
+    $proc.StartInfo.UseShellExecute = $false
+    $proc.StartInfo.RedirectStandardOutput = $true
+    $proc.StartInfo.RedirectStandardError = $true
+    $proc.StartInfo.CreateNoWindow = $true
+    $null = $proc.Start()
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    $proc.WaitForExit()
+    $jsonText = $outTask.Result
+    $errText = $errTask.Result
+    if ($errText) { Write-Host $errText.TrimEnd() }
+    $code = $proc.ExitCode
+    Write-Host ""
+    if ($script:AdvJson -and $jsonText) { Write-Host $jsonText.TrimEnd() }
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  完成（退出码: $code）" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+    $data = $null
+    try {
+        if ($jsonText) { $data = $jsonText | ConvertFrom-Json }
+    } catch { $data = $null }
+    return @{ Code = $code; Data = $data }
+}
+
+# 深挖供应商选择器：从 check 的 JSON 结果里挑出失败/可用供应商供多选。
+# $okList / $failList: [PSCustomObject[]]（providers 数组切片）
+# 返回选中的 provider 数组；取消返回 $null。
+function Select-DeepDiveTargets {
+    param(
+        [object[]]$FailProviders,
+        [object[]]$OkProviders
+    )
+    $options = [System.Collections.Generic.List[string]]::new()
+    $map = [System.Collections.Generic.List[object]]::new()
+    foreach ($p in @($FailProviders)) {
+        $options.Add("❌ $($p.name)   ($($p.type) / 失败)")
+        $map.Add($p)
+    }
+    foreach ($p in @($OkProviders)) {
+        $best = if ($p.best_tier) { "✓$($p.best_tier)" } else { "✓" }
+        $options.Add("✅ $($p.name)   ($($p.type) / $best)")
+        $map.Add($p)
+    }
+    $selIdx = Select-FromList -Options $options.ToArray() -Title "选择要深挖的供应商（多选）" -AllLabel "全部选中"
+    if ($null -eq $selIdx) { return $null }
+    if ($selIdx.Count -eq 0) { return @() }
+    $selected = @()
+    foreach ($opt in $selIdx) {
+        $idx = [Array]::IndexOf($options.ToArray(), $opt)
+        if ($idx -ge 0) { $selected += $map[$idx] }
+    }
+    return $selected
+}
+
+# 对选中的供应商逐个做深度诊断（inspect）。复用 Menu-Inspect 的模型选择思路：
+# 用 check 结果里的 attempts[].model 作为候选模型列表。
+function Invoke-DeepDive {
+    param(
+        [object[]]$Providers,
+        [string]$Type,
+        [string]$DBPath,
+        [string]$PythonPath
+    )
+    foreach ($p in @($Providers)) {
+        Write-Host ""
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "  深挖: $($p.name)  ($($p.type))" -ForegroundColor Cyan
+        Write-Host "========================================" -ForegroundColor Cyan
+        # 候选模型：attempts 里每档的 model，去重
+        $modelIds = [System.Collections.Generic.List[string]]::new()
+        $seen = @{}
+        foreach ($a in @($p.attempts)) {
+            if ($a.model -and -not $seen.ContainsKey($a.model)) {
+                $seen[$a.model] = $true
+                $modelIds.Add($a.model)
+            }
+        }
+        if ($modelIds.Count -eq 0) {
+            Write-Host "  无候选模型，跳过。" -ForegroundColor Yellow
+            continue
+        }
+        Write-Host "  该供应商探测到的模型:" -ForegroundColor Yellow
+        $disp = @()
+        foreach ($m in $modelIds) { $disp += "$m" }
+        $model = ""
+        $midx = Select-MenuItem -Options $disp -Title "选择要深挖的模型"
+        if ($midx -lt 0) { continue }
+        if ($midx -eq -2 -and $script:LastLiteral) { $model = $script:LastLiteral }
+        else { $model = $modelIds[$midx] }
+        if ([string]::IsNullOrWhiteSpace($model)) { continue }
+        $cmdArgs = [System.Collections.Generic.List[string]]::new()
+        $cmdArgs.Add("inspect")
+        $cmdArgs.Add("--provider"); $cmdArgs.Add($p.name)
+        $cmdArgs.Add("--model"); $cmdArgs.Add($model)
+        $cmdArgs.Add("--source"); $cmdArgs.Add("manual")
+        $cmdArgs.Add("--type"); $cmdArgs.Add($p.type)
+        $cmdArgs.Add("--db"); $cmdArgs.Add($DBPath)
+        $cmdArgs.Add("--timeout"); $cmdArgs.Add("30")
+        $cmdArgs.Add("--workers"); $cmdArgs.Add("1")
+        $cmdArgs.Add("--human")
+        Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "inspect"
+        $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+    }
+}
+
+# check 完成后的深挖入口：问是否深挖失败/可用供应商。
+function Ask-DeepDive {
+    param(
+        [object]$CheckResult,
+        [string]$Type,
+        [string]$DBPath,
+        [string]$PythonPath
+    )
+    if (-not $CheckResult -or -not $CheckResult.providers) { return }
+    $failP = @($CheckResult.providers | Where-Object { -not $_.overall_ok })
+    $okP = @($CheckResult.providers | Where-Object { $_.overall_ok })
+    $total = $CheckResult.providers.Count
+    $nFail = $failP.Count
+    $nOk = $okP.Count
+    if ($total -eq 0) { return }
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  体检结果: $nOk 可用 / $nFail 失败（共 $total）" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+
+    $choices = [System.Collections.Generic.List[string]]::new()
+    $choiceData = [System.Collections.Generic.List[object]]::new()
+    if ($nFail -gt 0) {
+        $choices.Add("对失败的 $nFail 家供应商深挖（查根因: key/403/超时/站挂）")
+        $choiceData.Add("fail")
+    }
+    if ($nOk -gt 0) {
+        $choices.Add("对可用的 $nOk 家供应商深挖（查流式/工具/窗口/静默路由）")
+        $choiceData.Add("ok")
+    }
+    if ($nFail -gt 0 -and $nOk -gt 0) {
+        $choices.Add("两者都深挖")
+        $choiceData.Add("both")
+    }
+    $choices.Add("不深挖，返回主菜单")
+    $choiceData.Add("none")
+
+    $idx = Select-MenuItem -Options $choices.ToArray() -Title "是否深挖？"
+    if ($idx -lt 0) { return }
+    if ($idx -eq -2 -and $script:LastLiteral) { $choice = $script:LastLiteral }
+    else { $choice = $choiceData[$idx] }
+
+    if ($choice -eq "none") { return }
+    if ($choice -eq "fail") {
+        $targets = Select-DeepDiveTargets -FailProviders $failP -OkProviders @()
+    } elseif ($choice -eq "ok") {
+        $targets = Select-DeepDiveTargets -FailProviders @() -OkProviders $okP
+    } else {
+        $targets = Select-DeepDiveTargets -FailProviders $failP -OkProviders $okP
+    }
+    if ($null -eq $targets -or $targets.Count -eq 0) {
+        Write-Host "未选择供应商，返回主菜单。" -ForegroundColor Yellow
+        return
+    }
+    Invoke-DeepDive -Providers $targets -Type $Type -DBPath $DBPath -PythonPath $PythonPath
+}
+
 # ── [1] 健康检测 · 快速体检（读高级设置里的类型/范围，默认 claude/队列） ──
 function Menu-HealthCheckQuick {
     $typeLabel = $script:AdvType
@@ -169,13 +551,18 @@ function Menu-HealthCheckQuick {
     $cmdArgs.Add("--timeout"); $cmdArgs.Add((Get-Timeout))
     if ($script:AdvScope -ne "all") { $cmdArgs.Add("--failover-only") }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
-    $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-    Write-Host ""
-    Write-Host "  [1] 重新选择（类型/范围）" -ForegroundColor White
-    Write-Host "  [2] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择（默认 2）"
-    if ($again -eq "1") { return (Menu-HealthCheckQuick) }
-    return $code
+    # 深挖需要 check 的 JSON 结果；若高级设置已开 --json 则已含
+    if ($cmdArgs -notcontains "--json") { $cmdArgs.Add("--json") }
+    $res = Invoke-CcpulseJson -CmdArgs $cmdArgs.ToArray()
+    # 深挖入口：check 完成后询问
+    if ($res.Data -and $res.Data.providers) {
+        Ask-DeepDive -CheckResult $res.Data -Type $script:AdvType -DBPath $DB -PythonPath $Python
+    } else {
+        Write-Host ""
+        $again = Select-MenuItem -Options @("返回主菜单", "重新选择（类型/范围）") -Title "下一步"
+        if ($again -eq 1) { return (Menu-HealthCheckQuick) }
+    }
+    return $res.Code
 }
 
 # ── [2] 健康检测 · 自定义（选类型/范围） ─────────────────────────
@@ -185,12 +572,14 @@ function Menu-HealthCheckCustom {
     }
     $type = Get-AppType
     Write-Host ""
-    Write-Host "请选择范围:" -ForegroundColor Yellow
-    Write-Host "  [1] 只测故障转移队列 + 当前激活  (快)" -ForegroundColor White
-    Write-Host "  [2] 测全部供应商                   (完整)" -ForegroundColor White
-    Write-Host "  [3] 只测当前激活的 1 个供应商      (最快)" -ForegroundColor White
-    Write-Host "  [4] 自定义选择供应商               (多选数字)" -ForegroundColor White
-    $scope = Read-Host "输入 1-4 (默认1)"
+    $scopeIdx = Select-MenuItem -Options @(
+        "只测故障转移队列 + 当前激活  (快)"
+        "测全部供应商                   (完整)"
+        "只测当前激活的 1 个供应商      (最快)"
+        "自定义选择供应商               (多选)"
+    ) -Title "请选择范围"
+    if ($scopeIdx -lt 0) { return 1 }
+    $scope = switch ($scopeIdx) { 1 { "2" } 2 { "3" } 3 { "4" } default { "1" } }
 
     $selectedProviderArg = ""
     if ($scope -eq "4") {
@@ -205,31 +594,12 @@ function Menu-HealthCheckCustom {
             $names = @()
         }
         if ($names.Count -gt 0) {
-            for ($i = 0; $i -lt $names.Count; $i++) {
-                Write-Host "  [$($i + 1)] $($names[$i])"
+            $selNames = Select-FromList -Options $names -Title "选择要检测的供应商" -AllowLiteral -AllLabel "全部供应商"
+            if ($null -eq $selNames) {
+                Write-Host "已取消。" -ForegroundColor Yellow
+                Read-HostSafe "按回车" | Out-Null; return 1
             }
-            Write-Host "  [a] 全部供应商" -ForegroundColor Cyan
-            $sel = Read-Host "输入序号（逗号分隔，如 1,3）或 a 全选（默认 1）"
-            if ([string]::IsNullOrWhiteSpace($sel)) {
-                $selectedProviderArg = $names[0]
-            } elseif ($sel -eq "a" -or $sel -eq "A") {
-                $selectedProviderArg = $names -join ","
-            } else {
-                $idxs = $sel -split "," | ForEach-Object { $_.Trim() }
-                $selectedNames = @()
-                foreach ($idx in $idxs) {
-                    if ($idx -match '^\d+$' -and [int]$idx -ge 1 -and [int]$idx -le $names.Count) {
-                        $selectedNames += $names[[int]$idx - 1]
-                    } elseif (-not [string]::IsNullOrWhiteSpace($idx)) {
-                        $selectedNames += $idx
-                    }
-                }
-                if ($selectedNames.Count -eq 0) {
-                    $selectedProviderArg = $names[0]
-                } else {
-                    $selectedProviderArg = $selectedNames -join ","
-                }
-            }
+            $selectedProviderArg = $selNames -join ","
         } else {
             Write-Host "未能拉取供应商列表，请手动输入。" -ForegroundColor Yellow
             $selectedProviderArg = Read-Host "  供应商名（逗号分隔）"
@@ -252,13 +622,17 @@ function Menu-HealthCheckCustom {
     }
     elseif ($scope -ne "2") { $cmdArgs.Add("--failover-only") }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
-    $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-    Write-Host ""
-    Write-Host "  [1] 重新选择（类型/范围）" -ForegroundColor White
-    Write-Host "  [2] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择（默认 2）"
-    if ($again -eq "1") { return (Menu-HealthCheckCustom) }
-    return $code
+    if ($cmdArgs -notcontains "--json") { $cmdArgs.Add("--json") }
+    $res = Invoke-CcpulseJson -CmdArgs $cmdArgs.ToArray()
+    # 深挖入口：check 完成后询问
+    if ($res.Data -and $res.Data.providers) {
+        Ask-DeepDive -CheckResult $res.Data -Type $type -DBPath $DB -PythonPath $Python
+    } else {
+        Write-Host ""
+        $again = Select-MenuItem -Options @("返回主菜单", "重新选择（类型/范围）") -Title "下一步"
+        if ($again -eq 1) { return (Menu-HealthCheckCustom) }
+    }
+    return $res.Code
 }
 
 # ── [3] 拉模型列表 ──────────────────────────────────────────────
@@ -268,25 +642,29 @@ function Menu-ListModels {
     }
     $type = Get-AppType
     Write-Host ""
-    Write-Host "请选择范围:" -ForegroundColor Yellow
-    Write-Host "  [1] 故障转移队列 + 当前激活"
-    Write-Host "  [2] 全部供应商"
-    $scope = Read-Host "输入 1-2 (默认1)"
+    $scopeIdx = Select-MenuItem -Options @(
+        "故障转移队列 + 当前激活"
+        "全部供应商"
+    ) -Title "请选择范围"
+    if ($scopeIdx -lt 0) { return 1 }
+    $scope = if ($scopeIdx -eq 1) { "2" } else { "1" }
     Write-Host ""
-    Write-Host "探测模式:" -ForegroundColor Yellow
-    Write-Host "  [1] 只拉列表（默认，最快）"
-    Write-Host "  [2] 轻量探测每个模型（2+3 题）"
-    Write-Host "  [3] 深度探测（text/streaming/metadata/thinking/tools）"
-    $probeMode = Read-Host "输入 1-3 (默认1)"
+    $probeIdx = Select-MenuItem -Options @(
+        "只拉列表（默认，最快）"
+        "轻量探测每个模型（2+3 题）"
+        "深度探测（text/streaming/metadata/thinking/tools）"
+    ) -Title "探测模式"
+    if ($probeIdx -lt 0) { return 1 }
+    $probeMode = switch ($probeIdx) { 1 { "2" } 2 { "3" } default { "1" } }
     $src = "listed"
     if ($probeMode -eq "2" -or $probeMode -eq "3") {
-        Write-Host ""
-        Write-Host "探测哪些模型:" -ForegroundColor Yellow
-        Write-Host "  [1] listed     - /v1/models 列表（默认）"
-        Write-Host "  [2] configured - cc-switch 配置档位"
-        Write-Host "  [3] both       - 合并去重"
-        $srcChoice = Read-Host "输入 1-3 (默认1)"
-        $src = switch ($srcChoice) { "2" { "configured" } "3" { "both" } default { "listed" } }
+        $srcIdx = Select-MenuItem -Options @(
+            "listed     - /v1/models 列表（默认）"
+            "configured - cc-switch 配置档位"
+            "both       - 合并去重"
+        ) -Title "探测哪些模型"
+        if ($srcIdx -lt 0) { return 1 }
+        $src = switch ($srcIdx) { 1 { "configured" } 2 { "both" } default { "listed" } }
     }
     $lmTimeout = if ($probeMode -eq "3") { "60" } else { "30" }
 
@@ -302,10 +680,8 @@ function Menu-ListModels {
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "list-models"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Write-Host ""
-    Write-Host "  [1] 重新选择（类型/范围/探测模式）" -ForegroundColor White
-    Write-Host "  [2] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择（默认 2）"
-    if ($again -eq "1") { return (Menu-ListModels) }
+    $again = Select-MenuItem -Options @("返回主菜单", "重新选择（类型/范围/探测模式）") -Title "下一步"
+    if ($again -eq 1) { return (Menu-ListModels) }
     return $code
 }
 
@@ -331,33 +707,14 @@ function Menu-Inspect {
     $providers = @()   # 多选时存供应商名数组
     $multiProvider = $false
     if ($names.Count -gt 0) {
-        for ($i = 0; $i -lt $names.Count; $i++) {
-            Write-Host "  [$($i + 1)] $($names[$i])"
+        $selNames = Select-FromList -Options $names -Title "选择供应商" -AllowLiteral -AllLabel "全部供应商"
+        if ($null -eq $selNames) {
+            Write-Host "已取消。" -ForegroundColor Yellow
+            Read-HostSafe "按回车" | Out-Null; return 1
         }
-        Write-Host "  [a] 全部供应商" -ForegroundColor Cyan
-        $sel = Read-Host "输入序号（逗号分隔多选，如 1,3,5）或 a 全选（默认 1）"
-        if ([string]::IsNullOrWhiteSpace($sel)) {
-            $provider = $names[0]; $providers = @($names[0])
-        } elseif ($sel -eq "a" -or $sel -eq "A") {
-            $providers = @($names); $provider = $names -join ","; $multiProvider = $true
-        } else {
-            $idxs = $sel -split "," | ForEach-Object { $_.Trim() }
-            $selectedNames = @()
-            foreach ($idx in $idxs) {
-                if ($idx -match '^\d+$' -and [int]$idx -ge 1 -and [int]$idx -le $names.Count) {
-                    $selectedNames += $names[[int]$idx - 1]
-                } elseif (-not [string]::IsNullOrWhiteSpace($idx)) {
-                    $selectedNames += $idx
-                }
-            }
-            if ($selectedNames.Count -eq 0) {
-                $provider = $names[0]; $providers = @($names[0])
-            } else {
-                $providers = @($selectedNames | Select-Object -Unique)
-                $provider = $providers -join ","
-                $multiProvider = ($providers.Count -gt 1)
-            }
-        }
+        $providers = @($selNames | Select-Object -Unique)
+        $provider = $providers -join ","
+        $multiProvider = ($providers.Count -gt 1)
     } else {
         Write-Host "未能拉取供应商列表，请手动输入。" -ForegroundColor Yellow
         $provider = Read-Host "  供应商名（逗号分隔多选）"
@@ -373,20 +730,17 @@ function Menu-Inspect {
     # 多供应商分支：选档位 -> 对每家取该档位模型 fan-out inspect
     if ($multiProvider) {
         Write-Host "多供应商已选: $($providers.Count) 家" -ForegroundColor Green
-        Write-Host "选择档位（从每家 cc-switch 配置中取对应模型）:" -ForegroundColor Yellow
-        Write-Host "  [1] haiku   （默认）" -ForegroundColor White
-        Write-Host "  [2] sonnet" -ForegroundColor White
-        Write-Host "  [3] opus" -ForegroundColor White
-        Write-Host "  [4] fable" -ForegroundColor White
-        Write-Host "  [5] default" -ForegroundColor White
-        Write-Host "  （逗号分隔多选，如 1,2 表示 haiku+sonnet）" -ForegroundColor DarkGray
-        $tierSel = Read-Host "选择档位（默认 1）"
-        $tierMap = @{ "1"="haiku"; "2"="sonnet"; "3"="opus"; "4"="fable"; "5"="default" }
-        if ([string]::IsNullOrWhiteSpace($tierSel)) { $tierSel = "1" }
-        $selectedTiers = @()
-        foreach ($t in ($tierSel -split "," | ForEach-Object { $_.Trim() })) {
-            if ($tierMap.ContainsKey($t)) { $selectedTiers += $tierMap[$t] }
+        $tierOptions = @("haiku （默认）", "sonnet", "opus", "fable", "default")
+        $tierIdxs = if ([Console]::IsInputRedirected) {
+            $idx = Select-MenuItem -Options $tierOptions -Title "选择档位（从每家配置中取对应模型）"
+            if ($idx -lt 0) { $null } else { @($idx) }
+        } else {
+            Show-ArrowSelect -Options $tierOptions -Multi -Title "选择档位（从每家配置中取对应模型）"
         }
+        if ($null -eq $tierIdxs) { return 1 }
+        $tierMap = @("haiku", "sonnet", "opus", "fable", "default")
+        $selectedTiers = @()
+        foreach ($i in $tierIdxs) { $selectedTiers += $tierMap[$i] }
         if ($selectedTiers.Count -eq 0) { $selectedTiers = @("haiku") }
         Write-Host "已选档位: $($selectedTiers -join ', ')" -ForegroundColor Green
         Write-Host ""
@@ -440,20 +794,19 @@ function Menu-Inspect {
             if ($code -ne 0 -and $overallCode -eq 0) { $overallCode = $code }
         }
         Write-Host ""
-        Write-Host "  [1] 重新选择（重走 type -> provider -> tier）" -ForegroundColor White
-        Write-Host "  [2] 返回主菜单" -ForegroundColor White
-        $again = Read-Host "选择（默认 2）"
-        if ($again -eq "1") { return (Menu-Inspect) }
+        $again = Select-MenuItem -Options @("返回主菜单", "重新选择（重走 type -> provider -> tier）") -Title "下一步"
+        if ($again -eq 1) { return (Menu-Inspect) }
         return $overallCode
     }
 
-    Write-Host "检测模式:" -ForegroundColor Yellow
-    Write-Host "  [1] 单一模型（默认）" -ForegroundColor White
-    Write-Host "  [2] 批量检测该供应商的所有模型" -ForegroundColor White
-    Write-Host "  [3] 自定义选择模型 + 检测维度" -ForegroundColor White
-    $modeChoice = Read-Host "选择（默认 1）"
-    $batchMode = ($modeChoice -eq "2")
-    $customMode = ($modeChoice -eq "3")
+    $modeIdx = Select-MenuItem -Options @(
+        "单一模型（默认）"
+        "批量检测该供应商的所有模型"
+        "自定义选择模型 + 检测维度"
+    ) -Title "检测模式"
+    if ($modeIdx -lt 0) { return 1 }
+    $batchMode = ($modeIdx -eq 1)
+    $customMode = ($modeIdx -eq 2)
 
     if ($customMode) {
         Write-Host ""
@@ -480,72 +833,58 @@ function Menu-Inspect {
             $modelInput = Read-Host "  模型 ID（逗号分隔）"
             $selectedModels = $modelInput
         } else {
-            for ($i = 0; $i -lt $modelChoices.Count; $i++) {
-                $mc = $modelChoices[$i]
+            $dispLabels = @()
+            foreach ($mc in $modelChoices) {
                 $lab = if ($mc.label) { "  $($mc.label)" } else { "" }
-                Write-Host ("  [{0}] {1}{2}" -f ($i + 1), $mc.id, $lab)
+                $dispLabels += "$($mc.id)$lab"
             }
-            Write-Host "  [a] 全部模型" -ForegroundColor Cyan
-            $msel = Read-Host "输入序号（逗号分隔，如 1,3,5）或 a 全选（默认 1）"
-            if ([string]::IsNullOrWhiteSpace($msel)) {
-                $selectedModels = $modelChoices[0].id
-            } elseif ($msel -eq "a" -or $msel -eq "A") {
-                $selectedModels = ($modelChoices | ForEach-Object { $_.id }) -join ","
-            } else {
-                $idxs = $msel -split "," | ForEach-Object { $_.Trim() }
+            $selNames = Select-FromList -Options $dispLabels -Title "选择模型" -AllLabel "全部模型"
+            if ($null -eq $selNames) {
+                Write-Host "已取消。" -ForegroundColor Yellow
+                Read-HostSafe "按回车" | Out-Null; return 1
+            }
+            if ($selNames.Count -eq 0) { $selectedModels = $modelChoices[0].id }
+            else {
+                # selNames 是带 label 的完整字符串，需要映射回 modelChoices
                 $selected = @()
-                foreach ($idx in $idxs) {
-                    if ($idx -match '^\d+$' -and [int]$idx -ge 1 -and [int]$idx -le $modelChoices.Count) {
-                        $selected += $modelChoices[[int]$idx - 1].id
-                    }
+                foreach ($nm in $selNames) {
+                    $matched = $modelChoices | Where-Object {
+                        $disp = $_.id + $(if ($_.label) { "  $($_.label)" } else { "" })
+                        $disp -eq $nm
+                    } | Select-Object -First 1
+                    if ($matched) { $selected += $matched.id }
                 }
-                if ($selected.Count -eq 0) {
-                    Write-Host "无效选择，返回主菜单。" -ForegroundColor Yellow
-                    Read-HostSafe "按回车" | Out-Null; return 1
-                }
-                $selectedModels = $selected -join ","
+                $selectedModels = ($selected | Select-Object -Unique) -join ","
             }
         }
 
         Write-Host ""
-        Write-Host "检测维度（默认全开）:" -ForegroundColor Yellow
-        Write-Host "  [1] text              文本探测"
-        Write-Host "  [2] streaming         流式探测"
-        Write-Host "  [3] model-consistency 模型路由比对"
-        Write-Host "  [4] metadata          元数据"
-        Write-Host "  [5] thinking          Thinking 能力"
-        Write-Host "  [6] tools             Tool use"
-        Write-Host "  [7] vision            视觉能力"
-        Write-Host "  [a] 全部维度（默认）" -ForegroundColor Cyan
-        $dimSel = Read-Host "输入序号（逗号分隔，如 1,2,3）或 a 全选（默认 a）"
-        $dimMap = @{
-            "1" = "text"
-            "2" = "streaming"
-            "3" = "model-consistency"
-            "4" = "metadata"
-            "5" = "thinking"
-            "6" = "tools"
-            "7" = "vision"
-        }
-        if ([string]::IsNullOrWhiteSpace($dimSel) -or $dimSel -eq "a" -or $dimSel -eq "A") {
-            $include = "text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools"
+        $dimOptions = @(
+            "text              文本探测"
+            "streaming         流式探测"
+            "model-consistency 模型路由比对"
+            "metadata          元数据"
+            "thinking          Thinking 能力"
+            "tools             Tool use"
+            "vision            视觉能力"
+        )
+        $dimIdxs = if ([Console]::IsInputRedirected) {
+            $idx = Select-MenuItem -Options $dimOptions -Title "检测维度（默认全选）"
+            if ($idx -lt 0) { $null } elseif ($null -eq $script:LastInput -or [string]::IsNullOrWhiteSpace($script:LastInput)) { @() } else { @($idx) }
         } else {
-            $dims = $dimSel -split "," | ForEach-Object { $_.Trim() }
-            $selected = @()
-            foreach ($d in $dims) {
-                if ($dimMap.ContainsKey($d)) {
-                    $selected += $dimMap[$d]
-                }
-            }
-            if ($selected.Count -eq 0) {
-                Write-Host "无效维度，使用默认全开。" -ForegroundColor Yellow
-                $include = "text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools"
-            } else {
-                # 自动加上 protocol 和 error-classification
-                $selected += "protocol", "error-classification"
-                $include = ($selected | Select-Object -Unique) -join ","
-            }
+            Show-ArrowSelect -Options $dimOptions -Multi -Title "检测维度（全选=直接回车，单独选用空格）"
         }
+        if ($null -eq $dimIdxs) { return 1 }
+        $dimMap = @("text", "streaming", "model-consistency", "metadata", "thinking", "tools", "vision")
+        if ($dimIdxs.Count -eq 0) {
+            # 默认全开（vision 除外，除非高级设置开了，由 Apply-AdvancedArgs 追加）
+            $selected = @("text", "streaming", "model-consistency", "protocol", "error-classification", "metadata", "thinking", "tools")
+        } else {
+            $selected = @()
+            foreach ($i in $dimIdxs) { $selected += $dimMap[$i] }
+            $selected += "protocol", "error-classification"
+        }
+        $include = $selected -join ","
 
         Write-Host ""
         Write-Host "已选模型: $selectedModels" -ForegroundColor Cyan
@@ -569,21 +908,18 @@ function Menu-Inspect {
 
         $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         Write-Host ""
-        Write-Host "  [1] 重新选择（重走 type → provider → 模式）" -ForegroundColor White
-        Write-Host "  [2] 返回主菜单" -ForegroundColor White
-        $again = Read-Host "选择（默认 2）"
-        if ($again -eq "1") { return (Menu-Inspect) }
+        $again = Select-MenuItem -Options @("返回主菜单", "重新选择（重走 type → provider → 模式）") -Title "下一步"
+        if ($again -eq 1) { return (Menu-Inspect) }
         return $code
     }
 
     if ($batchMode) {
-        Write-Host ""
-        Write-Host "批量检测范围:" -ForegroundColor Yellow
-        Write-Host "  [1] configured - cc-switch 配置档位"
-        Write-Host "  [2] listed     - 供应商 /v1/models 声明"
-        Write-Host "  [3] both       - 两者合并去重"
-        $srcChoice = Read-Host "选择（默认 1）"
-        $source = switch ($srcChoice) { "2" { "listed" } "3" { "both" } default { "configured" } }
+        $srcIdx = Select-MenuItem -Options @(
+            "configured - cc-switch 配置档位（默认）"
+            "listed     - 供应商 /v1/models 声明"
+        ) -Title "批量检测范围"
+        if ($srcIdx -lt 0) { return 1 }
+        $source = switch ($srcIdx) { 1 { "listed" } default { "configured" } }
         Write-Host ""
 
         $cmdArgs = [System.Collections.Generic.List[string]]::new()
@@ -602,10 +938,8 @@ function Menu-Inspect {
 
         $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         Write-Host ""
-        Write-Host "  [1] 重新选择（重走 type → provider → 模式）" -ForegroundColor White
-        Write-Host "  [2] 返回主菜单" -ForegroundColor White
-        $again = Read-Host "选择（默认 2）"
-        if ($again -eq "1") { return (Menu-Inspect) }
+        $again = Select-MenuItem -Options @("返回主菜单", "重新选择（重走 type → provider → 模式）") -Title "下一步"
+        if ($again -eq 1) { return (Menu-Inspect) }
         return $code
     }
 
@@ -628,18 +962,20 @@ function Menu-Inspect {
         }
     }
     if ($modelChoices.Count -gt 0) {
-        for ($i = 0; $i -lt $modelChoices.Count; $i++) {
-            $mc = $modelChoices[$i]
+        $dispLabels = @()
+        foreach ($mc in $modelChoices) {
             $lab = if ($mc.label) { "  $($mc.label)" } else { "" }
-            Write-Host ("  [{0}] {1}{2}" -f ($i + 1), $mc.id, $lab)
+            $dispLabels += "$($mc.id)$lab"
         }
-        $msel = Read-Host "输入序号选择，或直接输入模型 ID（默认 1）"
-        if ([string]::IsNullOrWhiteSpace($msel)) {
-            $model = $modelChoices[0].id
-        } elseif ($msel -match '^\d+$' -and [int]$msel -ge 1 -and [int]$msel -le $modelChoices.Count) {
-            $model = $modelChoices[[int]$msel - 1].id
+        $modelIdx = Select-MenuItem -Options $dispLabels -Title "选择模型（配置档位优先）" -Prompt "输入序号或模型 ID"
+        if ($modelIdx -eq -1) {
+            Write-Host "已取消。" -ForegroundColor Yellow
+            Read-HostSafe "按回车" | Out-Null; return 1
+        } elseif ($modelIdx -eq -2 -and $script:LastLiteral) {
+            # 管道模式：字面模型 ID
+            $model = $script:LastLiteral
         } else {
-            $model = $msel
+            $model = $modelChoices[$modelIdx].id
         }
     } else {
         Write-Host "  （未获取到模型列表，请手动输入）" -ForegroundColor Yellow
@@ -672,10 +1008,8 @@ function Menu-Inspect {
 
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Write-Host ""
-    Write-Host "  [1] 重新选择（重走 type → provider → model）" -ForegroundColor White
-    Write-Host "  [2] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择（默认 2）"
-    if ($again -eq "1") { return (Menu-Inspect) }
+    $again = Select-MenuItem -Options @("返回主菜单", "重新选择（重走 type → provider → model）") -Title "下一步"
+    if ($again -eq 1) { return (Menu-Inspect) }
     return $code
 }
 
@@ -684,50 +1018,52 @@ function Menu-Logs {
     if (-not (Show-Banner "运行日志 · 只读 cc-switch proxy 日志")) {
         Read-HostSafe "按回车返回主菜单" | Out-Null; return 1
     }
-    Write-Host "请选择:" -ForegroundColor Yellow
-    Write-Host "  [1] 最近失败日志        history --fails" -ForegroundColor White
-    Write-Host "  [2] 最近全部日志        history"
-    Write-Host "  [3] 供应商统计          stats --since 7d"
-    Write-Host "  [4] 静默路由排行        routing --since 7d"
-    Write-Host "  [5] 实时监控（轮询）    watch · 有新日志就打印"
-    Write-Host "  [6] 分析报表            analyze · 按天/模型/供应商交叉"
-    Write-Host "  [7] 返回主菜单"
-    $c = Read-Host "输入 1-7 (默认1)"
+    $logOptions = @(
+        "最近失败日志        history --fails"
+        "最近全部日志        history"
+        "供应商统计          stats --since 7d"
+        "静默路由排行        routing --since 7d"
+        "实时监控（轮询）    watch · 有新日志就打印"
+        "分析报表            analyze · 按天/模型/供应商交叉"
+        "返回主菜单"
+    )
+    $idx = Select-MenuItem -Options $logOptions -Title "请选择"
+    if ($idx -lt 0) { return 1 }
     $code = 0
-    switch ($c) {
-        "2" {
+    switch ($idx) {
+        1 {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--limit"); $cmdArgs.Add("30")
             Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "history"
             $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
-        "3" {
+        2 {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("stats"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
             $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
-        "4" {
+        3 {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("routing"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--since"); $cmdArgs.Add("7d"); $cmdArgs.Add("--limit"); $cmdArgs.Add("20")
             $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
-        "5" {
+        4 {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("watch"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--interval"); $cmdArgs.Add("3")
             Write-Host "实时监控中，Ctrl+C 结束…" -ForegroundColor Cyan
             $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
-        "6" {
+        5 {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("analyze"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
             $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
-        "7" { return 0 }
+        6 { return 0 }
         default {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
@@ -736,133 +1072,105 @@ function Menu-Logs {
         }
     }
     Write-Host ""
-    Write-Host "  [1] 重新选择日志子项" -ForegroundColor White
-    Write-Host "  [2] 返回主菜单" -ForegroundColor White
-    $again = Read-Host "选择（默认 2）"
-    if ($again -eq "1") { return (Menu-Logs) }
+    $again = Select-MenuItem -Options @("返回主菜单", "重新选择日志子项") -Title "下一步"
+    if ($again -eq 1) { return (Menu-Logs) }
     return $code
 }
 
 # ── [6] 高级设置（进程内有效） ───────────────────────────────────
 function Menu-AdvancedSettings {
     Show-Banner "高级设置（本进程有效，重开需重设）" | Out-Null
-    # 编号清单循环：输入项号改单值，q/空回车返回主菜单。避免改一项须回车 9 次。
+    # 编号清单循环：箭头选择项号，ESC/末项返回主菜单。避免改一项须回车 9 次。
     while ($true) {
-        Write-Host "当前设置（输入编号修改，q 或空回车返回主菜单）:" -ForegroundColor Yellow
-        Write-Host "  [1] JSON 输出         [check]        $(if ($script:AdvJson) {'开'} else {'关（默认）'})" -ForegroundColor Gray
-        Write-Host "  [2] probe-max-tokens  [check/inspect/list] $(if ($script:AdvMaxTokens) {$script:AdvMaxTokens} else {'1024（默认）'})" -ForegroundColor Gray
-        Write-Host "  [3] 允许 thinking     [check/inspect] $(if ($script:AdvEnableThinking) {'开'} else {'关（默认）'})" -ForegroundColor Gray
-        Write-Host "  [4] user-agent        [全部子命令]   $(if ($script:AdvUserAgent) {$script:AdvUserAgent} else {'本机版本（默认）'})" -ForegroundColor Gray
-        Write-Host "  [5] 上下文档位        [inspect]      $($script:AdvProbeContext)（无声明时冒烟）" -ForegroundColor Gray
-        Write-Host "  [6] vision 探测       [inspect]      $(if ($script:AdvVision) {'开'} else {'关（默认）'})" -ForegroundColor Gray
-        Write-Host "  [7] stealth 隐身      [check]        $(if ($script:AdvStealth) {'开'} else {'关（默认）'})" -ForegroundColor Gray
-        Write-Host "  [8] 快速体检类型      [快速体检]     $($script:AdvType)" -ForegroundColor Gray
-        Write-Host "  [9] 快速体检范围      [快速体检]     $(if ($script:AdvScope -eq 'all') {'全部'} else {'队列+当前（默认）'})" -ForegroundColor Gray
-        Write-Host ""
-        $pick = Read-HostSafe "输入 1-9 (q 退出)"
-        if ($null -eq $pick) { return }  # stdin EOF
-        $pick = $pick.Trim()
-        if ($pick -eq "" -or $pick -eq "q" -or $pick -eq "Q") { return }
+        $opts = @(
+            "JSON 输出         [check]        $(if ($script:AdvJson) {'开'} else {'关（默认）'})"
+            "probe-max-tokens  [check/inspect/list] $(if ($script:AdvMaxTokens) {$script:AdvMaxTokens} else {'1024（默认）'})"
+            "允许 thinking     [check/inspect] $(if ($script:AdvEnableThinking) {'开'} else {'关（默认）'})"
+            "user-agent        [全部子命令]   $(if ($script:AdvUserAgent) {$script:AdvUserAgent} else {'本机版本（默认）'})"
+            "上下文档位        [inspect]      $($script:AdvProbeContext)（无声明时冒烟）"
+            "vision 探测       [inspect]      $(if ($script:AdvVision) {'开'} else {'关（默认）'})"
+            "stealth 隐身      [check]        $(if ($script:AdvStealth) {'开'} else {'关（默认）'})"
+            "快速体检类型      [快速体检]     $($script:AdvType)"
+            "快速体检范围      [快速体检]     $(if ($script:AdvScope -eq 'all') {'全部'} else {'队列+当前（默认）'})"
+            "返回主菜单"
+        )
+        Write-Host "当前设置（箭头选择修改，ESC 或选末项返回主菜单）:" -ForegroundColor Yellow
+        $pick = Select-MenuItem -Options $opts -Title "高级设置" -Prompt "输入 1-10"
+        if ($pick -lt 0 -or $pick -eq 9) { return }
         switch ($pick) {
-            "1" {
+            0 {
                 $j = Read-HostSafe "JSON 输出？(y/N)"
                 if (-not [string]::IsNullOrWhiteSpace($j)) { $script:AdvJson = ($j -eq "y" -or $j -eq "Y") }
             }
-            "2" {
+            1 {
                 $mt = Read-HostSafe "probe-max-tokens（留空=1024；thinking 模型可调高）"
                 if (-not [string]::IsNullOrWhiteSpace($mt)) { $script:AdvMaxTokens = $mt }
             }
-            "3" {
+            2 {
                 $th = Read-HostSafe "允许 thinking？(y/N)"
                 if (-not [string]::IsNullOrWhiteSpace($th)) { $script:AdvEnableThinking = ($th -eq "y" -or $th -eq "Y") }
             }
-            "4" {
+            3 {
                 $ua = Read-HostSafe "user-agent 覆盖（留空=本机 claude 版本）"
                 if (-not [string]::IsNullOrWhiteSpace($ua)) { $script:AdvUserAgent = $ua }
             }
-            "5" {
-                $cx = Read-HostSafe "上下文档位 512k/1m（默认 512k）"
-                if (-not [string]::IsNullOrWhiteSpace($cx)) {
-                    $cxNorm = $cx.Trim().ToLower()
-                    if ($cxNorm -in @("512k", "1m")) { $script:AdvProbeContext = $cxNorm }
-                    else { Write-Host "  无效档位 '$cx'，保留 $($script:AdvProbeContext)" -ForegroundColor Yellow }
-                }
+            4 {
+                $cxIdx = Select-MenuItem -Options @("512k", "1m") -Title "上下文档位（默认 512k）"
+                if ($cxIdx -ge 0) { $script:AdvProbeContext = switch ($cxIdx) { 1 { "1m" } default { "512k" } } }
             }
-            "6" {
+            5 {
                 $vi = Read-HostSafe "inspect 开启 vision？(y/N)"
                 if (-not [string]::IsNullOrWhiteSpace($vi)) { $script:AdvVision = ($vi -eq "y" -or $vi -eq "Y") }
             }
-            "7" {
+            6 {
                 $st = Read-HostSafe "check 开启 stealth 隐身？(y/N)"
                 if (-not [string]::IsNullOrWhiteSpace($st)) { $script:AdvStealth = ($st -eq "y" -or $st -eq "Y") }
             }
-            "8" {
-                Write-Host "  [1] claude(默认) [2] codex [3] openclaw [4] all" -ForegroundColor Yellow
-                $ty = Read-HostSafe "输入 1-4（留空保留 $($script:AdvType)）"
-                if (-not [string]::IsNullOrWhiteSpace($ty)) {
-                    switch ($ty.Trim()) {
-                        "1" { $script:AdvType = "claude" }
-                        "2" { $script:AdvType = "codex" }
-                        "3" { $script:AdvType = "openclaw" }
-                        "4" { $script:AdvType = "all" }
-                        default { Write-Host "  无效类型 '$ty'，保留 $($script:AdvType)" -ForegroundColor Yellow }
-                    }
-                }
+            7 {
+                $tyIdx = Select-MenuItem -Options @("claude(默认)", "codex", "openclaw", "all") -Title "快速体检类型"
+                if ($tyIdx -ge 0) { $script:AdvType = switch ($tyIdx) { 1 { "codex" } 2 { "openclaw" } 3 { "all" } default { "claude" } } }
             }
-            "9" {
-                Write-Host "  [1] 队列+当前(默认,快) [2] 全部(完整)" -ForegroundColor Yellow
-                $sc = Read-HostSafe "输入 1-2（留空保留 $(if ($script:AdvScope -eq 'all') {'全部'} else {'队列+当前'})）"
-                if (-not [string]::IsNullOrWhiteSpace($sc)) {
-                    switch ($sc.Trim()) {
-                        "1" { $script:AdvScope = "failover" }
-                        "2" { $script:AdvScope = "all" }
-                        default { Write-Host "  无效范围 '$sc'，保留 $($script:AdvScope)" -ForegroundColor Yellow }
-                    }
-                }
+            8 {
+                $scIdx = Select-MenuItem -Options @("队列+当前(默认,快)", "全部(完整)") -Title "快速体检范围"
+                if ($scIdx -ge 0) { $script:AdvScope = if ($scIdx -eq 1) { "all" } else { "failover" } }
             }
-            default { Write-Host "无效输入: '$pick'，请输入 1-9 或 q。" -ForegroundColor Red }
         }
     }
 }
 
 # ── 主菜单循环 ──────────────────────────────────────────────────
 function Show-MainMenu {
-    Show-Banner | Out-Null
-    Write-Host "一键检查 AI 模型服务是否正常 —— 按 1 开始体检" -ForegroundColor Green
-    Write-Host "请选择操作:" -ForegroundColor Yellow
-    Write-Host "  [1] 健康检测 · 快速体检   一键（claude/队列）" -ForegroundColor White
-    Write-Host "  [2] 健康检测 · 自定义     选类型/范围"
-    Write-Host "  [3] 拉模型列表            GET /v1/models 目录"
-    Write-Host "  [4] 深度诊断 (inspect)    单一 (provider, model)"
-    Write-Host "  [5] 运行日志              失败/统计/路由/实时监控" -ForegroundColor White
-    Write-Host "  [6] 高级设置              JSON/stealth/thinking/UA/类型/范围"
-    Write-Host "  [7] 退出" -ForegroundColor White
-    Write-Host ""
-    # 用 ReadLine 而非 Read-Host：EOF（stdin 关闭/管道结束）返回 $null，
-    # 直接敲回车返回 ""，Read-Host 两者都给 ""，无法区分会导致主菜单死循环。
-    Write-Host "输入 1-7 (默认1): " -NoNewline
-    return [Console]::In.ReadLine()
+    if (-not (Show-Banner)) {
+        Read-HostSafe "按回车关闭" | Out-Null
+        return -1
+    }
+    $menuOptions = @(
+        "健康检测 · 快速体检   一键检测，完成后可深挖"
+        "健康检测 · 自定义     选类型/范围"
+        "拉模型列表            GET /v1/models 目录"
+        "深度诊断 (inspect)    单一 (provider, model)"
+        "运行日志              失败/统计/路由/实时监控"
+        "高级设置              JSON/stealth/thinking/UA/类型/范围"
+        "退出"
+    )
+    Write-Host "一键检查 AI 模型服务是否正常 —— 回车开始体检" -ForegroundColor Green
+    return Select-MenuItem -Options $menuOptions -Title "请选择操作"
 }
 
 $script:LastMenuCode = 0
 while ($true) {
-    $choice = Show-MainMenu
-    if ($null -eq $choice) { exit $script:LastMenuCode }  # stdin 结束，退出而非重绘
+    $idx = Show-MainMenu
+    if ($idx -eq -1) { exit $script:LastMenuCode }  # ESC 或数据库不存在
     $menuCode = $null
-    switch ($choice.Trim()) {
-        ""  { $menuCode = Menu-HealthCheckQuick }
-        "1" { $menuCode = Menu-HealthCheckQuick }
-        "2" { $menuCode = Menu-HealthCheckCustom }
-        "3" { $menuCode = Menu-ListModels }
-        "4" { $menuCode = Menu-Inspect }
-        "5" { $menuCode = Menu-Logs }
-        "6" { $menuCode = Menu-AdvancedSettings }
-        "7" { exit 0 }
-        default {
-            Write-Host "无效输入: '$choice'" -ForegroundColor Red
-            Read-HostSafe "按回车重试"
-            continue
-        }
+    switch ($idx) {
+        0 { $menuCode = Menu-HealthCheckQuick }
+        1 { $menuCode = Menu-HealthCheckCustom }
+        2 { $menuCode = Menu-ListModels }
+        3 { $menuCode = Menu-Inspect }
+        4 { $menuCode = Menu-Logs }
+        5 { $menuCode = Menu-AdvancedSettings }
+        6 { exit 0 }
+        default { continue }
     }
     if ($null -ne $menuCode) { $script:LastMenuCode = [int]$menuCode }
 }

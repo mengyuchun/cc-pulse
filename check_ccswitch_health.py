@@ -21,6 +21,7 @@ CC-Pulse — cc-switch 供应商健康检测脚本（独立运行，不改 cc-sw
 """
 
 import argparse
+import http.client
 import json
 import random
 import re
@@ -503,6 +504,8 @@ def _resolve_protocol(p: Provider) -> Protocol:
             else Protocol.UNKNOWN
         )
     if proto == Protocol.UNKNOWN:
+        # 无 apiFormat 时按 app_type 推断；claude/未知 app_type 保持 UNKNOWN，
+        # 由 _build_proto_url / _build_proto_payload 以 ANTHROPIC_MESSAGES 处理。
         if p.is_openrouter:
             proto = Protocol.OPENAI_CHAT_COMPLETIONS
         elif p.app_type == "codex":
@@ -894,7 +897,8 @@ def classify_error(resp_body: str, http_status: int = 0) -> tuple:
 def _sanitize_raw_body(body: str, api_key: str) -> str:
     """raw_body 脱敏：替换 API key 为掩码，防止写入报告时泄露。"""
     if api_key and api_key in body:
-        return body.replace(api_key, api_key[:6] + "***")
+        show = max(1, min(6, len(api_key) // 2))
+        return body.replace(api_key, api_key[:show] + "***")
     return body
 
 
@@ -921,17 +925,26 @@ class HttpResponse:
     content_type: str
     error_category: str | None
     error_msg: str
+    truncated: bool = False
 
 
 def _read_httperror_body(e: urllib.error.HTTPError) -> tuple[str, bytes]:
     """安全读取 HTTPError 的响应体，返回 (decoded_body, raw_bytes)。
 
     供 _http_request 与 probe_stream 复用，避免重复 try/except e.read()。
+    连接中途断开（IncompleteRead / PartialRead）时取已读部分，不抛异常。
     """
     try:
         raw = e.read()
     except (OSError, ValueError):
         raw = b""
+    except Exception as exc:
+        # http.client.IncompleteRead 等不在 OSError 分支里，但能从 .partial 取已读数据
+        partial = getattr(exc, "partial", None)
+        if isinstance(partial, bytes) and partial:
+            raw = partial
+        else:
+            raw = b""
     return raw.decode("utf-8", errors="replace"), raw
 
 
@@ -949,19 +962,30 @@ def _http_request(
     消除 probe_tier / fetch_models / probe_model_metadata 里重复的 urlopen 样板。
     流式探测（probe_stream）因需要逐块读取 resp，不适用本函数。
     max_retries: 网络层错误重试次数（仅对 URLError/TimeoutError/OSError 生效）。
+    HTTPError 不重试（已有 status code）。URLError 涵盖 DNS/连接拒绝/TLS 握手失败等，
+    对真正的证书问题重试无效但只会多耗几秒，换取对瞬时握手故障的容忍。
     """
     ctx = create_ssl_context(skip_tls_verify)
     req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
     for attempt in range(max_retries + 1):
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                raw = resp.read(2 << 20)  # 2MB 限长，防止异常响应耗尽内存
+                try:
+                    raw = resp.read(2 << 20)  # 2MB 限长，防止异常响应耗尽内存
+                except http.client.IncompleteRead as e:
+                    raw = e.partial or b""
+                    truncated = True
+                else:
+                    truncated = False
                 return HttpResponse(
                     status=resp.status,
                     body=raw.decode("utf-8", errors="replace"),
                     content_type=resp.headers.get("Content-Type", ""),
-                    error_category=None,
-                    error_msg="",
+                    error_category=(
+                        ErrorCategory.STREAM_INCOMPLETE.value if truncated else None
+                    ),
+                    error_msg="响应不完整" if truncated else "",
+                    truncated=truncated,
                 )
         except urllib.error.HTTPError as e:
             # HTTPError 有 status code，不算连接层错误；不重试
@@ -1241,8 +1265,17 @@ def _drain_non_sse_stream(resp, p: Provider) -> dict:
 
     返回 {text, response_model, raw_preview}。
     """
-    raw = resp.read(1 << 20)  # 限长 1MB，防无界读
-    stream_truncated = False
+    raw_truncated_by_error = False
+    try:
+        raw = resp.read(1 << 20)  # 限长 1MB，防无界读
+    except (OSError, ValueError):
+        raw = b""
+        raw_truncated_by_error = True
+    except Exception as exc:
+        partial = getattr(exc, "partial", None)
+        raw = partial if isinstance(partial, bytes) else b""
+        raw_truncated_by_error = True
+    stream_truncated = raw_truncated_by_error
     if len(raw) == 1 << 20:
         # 已到限长：再试探 1 字节判断是否还有内容
         try:
@@ -1522,6 +1555,9 @@ def probe_stream(
                 usage = extract_usage(
                     raw_preview.decode("utf-8", errors="replace") if raw_preview else ""
                 )
+                if drain["stream_truncated"]:
+                    error_category = ErrorCategory.STREAM_INCOMPLETE.value
+                    error_msg = "流式响应不完整"
             else:
                 proto_name = detect_protocol(p)["detected"]
                 ttft_deadline = ttft_timeout if ttft_timeout is not None else None
@@ -1532,6 +1568,9 @@ def probe_stream(
                 text = drain["text"]
                 raw_preview = drain["raw_preview"]
                 usage = drain["usage"]
+                if drain["stream_truncated"]:
+                    error_category = ErrorCategory.STREAM_INCOMPLETE.value
+                    error_msg = "流式响应不完整"
 
     except urllib.error.HTTPError as e:
         http_status = e.code
@@ -5484,6 +5523,11 @@ def _build_parser():
         help="按供应商名过滤（支持单个名、逗号分隔多个名或子串）",
     )
     p_check.add_argument(
+        "--select",
+        action="store_true",
+        help="交互式选择供应商（↑↓ 移动、空格多选、回车确认；非 TTY 自动忽略）",
+    )
+    p_check.add_argument(
         "--stealth",
         action="store_true",
         help=f"隐身模式：并发降至≤{STEALTH_MAX_WORKERS} 且每档请求前随机延迟，弱化脚本式流量尖峰（较慢；仅 check）",
@@ -5555,6 +5599,11 @@ def _build_parser():
         help="按供应商名过滤（支持单个名、逗号分隔多个名或子串）",
     )
     p_lm.add_argument(
+        "--select",
+        action="store_true",
+        help="交互式选择供应商（↑↓ 移动、空格多选、回车确认；非 TTY 自动忽略）",
+    )
+    p_lm.add_argument(
         "--probe",
         action="store_true",
         help="对每个模型发轻量探测（2+3 算术题），验证是否真能用",
@@ -5595,6 +5644,11 @@ def _build_parser():
         "--provider",
         default=None,
         help="供应商名称（与 cc-switch 中一致）；--compare 时可选",
+    )
+    p_inspect.add_argument(
+        "--select",
+        action="store_true",
+        help="交互式选择供应商（↑↓ 移动、空格多选、回车确认；非 TTY 自动忽略）",
     )
     p_inspect.add_argument(
         "--model",
@@ -5874,15 +5928,14 @@ def _main_with_args(args) -> int:
         say(f"数据库不存在: {args.db}")
         return 2
 
-    # --archive 路径安全检查：必须在 home 或当前目录下
+    # --archive 路径安全检查：复用 archive_path() 单一校验源，提前失败给清晰退出码
     if getattr(args, "archive", None):
-        _ap = Path(args.archive).resolve()
-        _home = Path.home()
-        if not (_ap.is_relative_to(_home) or _ap.is_relative_to(Path.cwd())):
-            print(
-                f"错误: --archive 路径必须在 {_home} 或当前目录下",
-                file=sys.stderr,
-            )
+        from ccpulse_archive import archive_path as _archive_path
+
+        try:
+            _archive_path(args.archive)
+        except ValueError as exc:
+            print(f"错误: {exc}", file=sys.stderr)
             return 2
 
     # 纯日志子命令：不加载 providers、不发 HTTP
@@ -5916,6 +5969,23 @@ def _main_with_args(args) -> int:
         before = len(providers)
         providers = [p for p in providers if p.in_failover or p.is_current]
         say(f"--failover-only: {before} → {len(providers)}（只保留队列内+当前激活）")
+
+    # --select: 交互式 TUI 选择供应商（非 TTY 自动降级到 --provider / 全量）
+    if getattr(args, "select", False) and providers and not getattr(
+        args, "compare", None
+    ):
+        from ccpulse_tui import select_providers
+
+        indices = select_providers(providers)
+        if indices is None:
+            say("--select: 非 TTY 环境，忽略（改用 --provider 或全量检测）")
+        elif not indices:
+            say("--select: 未选择任何供应商，退出")
+            return 2
+        else:
+            before = len(providers)
+            providers = [providers[i] for i in indices]
+            say(f"--select: {before} -> {len(providers)}（交互式选择）")
 
     # --compare 自带多 provider 目标，跳过全局 --provider 过滤以免裁掉对比对象
     if (

@@ -2560,10 +2560,11 @@ try:
         "\x9b" not in val and "\x9d" not in val,
         f"val={val!r}",
     )
+    sanitized_c1 = mod._sanitize_for_terminal("\x9b2J")
     test(
         "_sanitize_for_terminal 剥 C1 字节",
-        "\x9b" not in mod._sanitize_for_terminal("\x9b2J"),
-        f"s={mod._sanitize_for_terminal('\x9b2J')!r}",
+        "\x9b" not in sanitized_c1,
+        f"s={sanitized_c1!r}",
     )
 finally:
     mod._output_stream.reset(token)
@@ -3630,6 +3631,19 @@ if hasattr(mod, "_sanitize_raw_body"):
         "sanitize_raw_body: None key 原样返回",
         _sb4 == '{"model":"x"}',
         f"result={_sb4!r}",
+    )
+    # 短 key（≤6 字符）：掩码不得暴露完整 key
+    _sb5 = mod._sanitize_raw_body('{"key":"abc123"}', "abc123")
+    test(
+        "sanitize_raw_body: 短 key 不暴露完整 key",
+        "abc123" not in _sb5 and "***" in _sb5,
+        f"result={_sb5!r}",
+    )
+    _sb6 = mod._sanitize_raw_body('{"key":"ab"}', "ab")
+    test(
+        "sanitize_raw_body: 2 字符 key 仅留 1 字符前缀",
+        "ab" not in _sb6 and "a***" in _sb6,
+        f"result={_sb6!r}",
     )
 else:
     test("_sanitize_raw_body 未实现（TODO）", True)

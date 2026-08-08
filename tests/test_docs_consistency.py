@@ -28,6 +28,13 @@ REQUIRED_MARKERS = {
     "--probe-max-tokens": "--probe-enable-thinking",
     "--user-agent": "--stainless-version",
     "--since": "analyze",
+    "--select": "--provider",
+    "probe_history.jsonl": "cc-switch",
+}
+
+MENU_MARKERS = {
+    "README.md": ("快速体检", "高级设置", "运行日志", "五项深探"),
+    "README.en.md": ("Quick health check", "Advanced settings", "Runtime logs", "five-check"),
 }
 
 
@@ -44,6 +51,9 @@ def check_doc(name: str) -> list[str]:
     for marker, companion in REQUIRED_MARKERS.items():
         if marker not in text or companion not in text:
             failures.append(f"{name}: 缺少 {marker} 或配套文案 {companion}")
+    for marker in MENU_MARKERS[name]:
+        if marker not in text:
+            failures.append(f"{name}: 缺少菜单文案 {marker}")
     if "退出码" in text:
         exit_section = text[text.find("退出码") :]
     elif "Exit codes" in text:

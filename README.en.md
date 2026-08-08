@@ -208,6 +208,7 @@ python check_ccswitch_health.py inspect \
 | Fetch provider-declared models | `just models` | `GET /v1/models`; listed ≠ usable |
 | Deep-dive one (provider, model) | `inspect` | 7-dimension checkup: text/streaming/metadata/context/thinking/tools/vision + routing match |
 | Recent failures / success history | `history` / `just stats` | Read-only cc-switch DB, aggregated by provider / time window |
+| Passive cc-switch health | `health` | Read `provider_health` only; no HTTP, not a replacement for active probing |
 | Diagnose silent routing | `just env-check` / `routing` | env-check for env-var overrides; routing for request vs response model mismatch |
 | Cross-day degradation trend | `just trend` | Read local probe archive, aggregate by day |
 | Watch cc-switch logs live | `just watch` | Poll every 3s, prints new entries, Ctrl+C to stop |
@@ -244,6 +245,8 @@ Progress: print each tier as it finishes; print a provider summary when that pro
 | `--type claude\|codex\|openclaw\|all` | Provider type | `claude` |
 | `--failover-only` | Only failover queue + current provider |
 | `--current-only` | Only the active provider (narrowest; takes priority over `--failover-only` if both are set) | off |
+| `--provider name/substr` | Filter by provider name (comma-separated names or substring) | off |
+| `--select` | Interactive multi-provider selector (TTY only) | off |
 | `--json` | Structured JSON on stdout; human text on stderr | off |
 | `--workers N` | Concurrency | 6 |
 | `--timeout SEC` | Per-request timeout seconds | 30 |
@@ -256,9 +259,28 @@ Progress: print each tier as it finishes; print a provider summary when that pro
 
 ### `list-models` — fetch model catalogs
 
+By default, only runs `GET /v1/models`; `--probe` performs a light text check per model; `--deep` performs five checks per model: text, streaming, metadata, thinking, and tools. In probe modes, `--source configured|listed|both` chooses models from configured tiers, the declared catalog, or their deduplicated union.
+
 ```bash
 python check_ccswitch_health.py list-models
 python check_ccswitch_health.py list-models --failover-only --type all
+python check_ccswitch_health.py list-models --select --probe
+python check_ccswitch_health.py list-models --failover-only --deep --source both --timeout 60
+```
+
+### Interactive provider selection: `--select`
+
+`check` and `list-models` accept `--select` for a pure-stdlib, cross-platform keyboard multi-selector: arrow keys move, Space toggles, `a` selects/deselects all, Enter confirms, and Esc cancels. The CLI selector **does not support mouse input**. For `inspect`, specify the target provider with `--provider`.
+
+It runs only when both stdin and stdout are TTYs. In pipelines and CI, it is skipped; use `--provider` to filter explicitly.
+
+### `health` — passive health status
+
+Reads cc-switch's `provider_health` table for health state, consecutive failures, and recent errors derived from real proxied traffic. It sends no HTTP requests and does not replace `check`'s active answer verification.
+
+```bash
+python check_ccswitch_health.py health
+python check_ccswitch_health.py health --json
 ```
 
 ### `history` / `stats` / `routing` / `watch` — read-only cc-switch runtime logs
@@ -526,7 +548,7 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 
 ## Windows desktop launcher
 
-`run_health_check.ps1` provides an interactive menu — double-click, no flags required:
+`run_health_check.ps1` provides an interactive menu — double-click, no flags required (PowerShell 7+):
 
 ```
 [1] Health check · quick       one-click (claude / queue)
@@ -538,9 +560,24 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 [7] Exit
 ```
 
+### Menu paths
+
+| Entry | Hierarchy and behavior |
+|-------|------------------------|
+| Quick health check | Directly uses type and scope from Advanced settings; defaults to `claude` + failover queue/current provider |
+| Custom health check | Type → queue+current / all / current only / selected providers (multi-select) |
+| List models | Type → scope → catalog only / light probe / deep probe; probe modes then choose `listed/configured/both` source |
+| Deep diagnostics | Type → providers; multi-provider mode selects tiers and checks every provider×tier model, while one-provider mode offers one model, all models, or selected models and dimensions |
+| Runtime logs | Recent failures, all logs, statistics, silent routing, live watch, and analysis |
+| Advanced settings | JSON, token budget, thinking, UA, inspect context/vision, check stealth, plus quick-check type/scope; valid only for this launcher process and reset when the window closes |
+
+### Interaction
+
+Interactive terminals support arrow keys/mouse wheel to move, Enter to confirm, and Esc or right-click to cancel. Multi-select additionally uses Space to toggle and `a` to select/deselect all; left-click selects or toggles. With redirected input, ordinary menus and lists use compatible numbered or text input instead, but inspect's multi-provider tier and custom-dimension branches require an interactive console. Do not treat the launcher menu as an unattended automation interface.
+
 - Prefer interpreter from `CC_PULSE_PYTHON`, then `python` on PATH
 - DB path override: `CC_PULSE_DB`
-- Timeout override: `CC_PULSE_TIMEOUT` (seconds)
+- Timeout override: `CC_PULSE_TIMEOUT` (seconds; health-check default)
 - Uses `python -u` for unbuffered output so progress is live
 
 ### Environment variables
@@ -549,8 +586,10 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 |----------|---------|
 | `CC_PULSE_PYTHON` | Preferred Python interpreter for the launcher |
 | `CC_PULSE_DB` | Default cc-switch.db path for the launcher |
-| `CC_PULSE_TIMEOUT` | Default timeout seconds for the launcher |
+| `CC_PULSE_TIMEOUT` | Default timeout seconds for health checks |
 | `CC_PULSE_PWSH` | pwsh path used by tests |
+
+`CC_PULSE_*` variables configure the launcher. Provider routing and authentication variables (such as `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`) are audited by `env-check`; they are not the same variables.
 
 ---
 
@@ -559,7 +598,7 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 - **Read-only, zero intrusion**: open the DB with `file:...?mode=ro`; never modify cc-switch
 - **No path de-duplication**: always `base_url + /v1/messages`; a base ending with `/v1` becomes `/v1/v1/messages` — deliberately matching real Claude Code behavior
 - **Full error text passthrough**: JSON error `message` is not truncated; HTML / non-JSON shows the first 500 chars plus true length
-- **No file writes**: results go to the terminal / stdout only
+- **Local archive; never modify cc-switch data**: the DB always opens with `file:...?mode=ro`; `check`/`inspect` append CC-Pulse's own `~/.cc-pulse/probe_history.jsonl` for `trend`, and `--archive PATH` overrides its location. The cc-switch database is never written.
 - **Claude Code fingerprint headers**: UA from local `claude --version` (overridable via `--user-agent`; `x-stainless-*` version overridable via `--stainless-version`) to reduce Cloudflare 1010 false rejects
 - **Anti-detection by default**: the probe question is drawn at random from a pool (avoids fixed-prompt substring matching), `max_tokens` defaults to a natural `1024` (not the tell-tale `20`), and thinking-suppression fields are sent only to thinking-prone models (deepseek/glm etc.) — regular claude requests stay closer to real claude-cli
 - **`--stealth` timing camouflage**: caps concurrency at 3 and adds a random 0.3–1.5s delay before each probe to flatten script-like traffic spikes — off by default (slower); turn it on when a provider starts banning health-check traffic
@@ -615,7 +654,7 @@ Confirmed against `justfile`; available once [just](https://just.systems/) is in
 | `just check-stealth` | `check --failover-only --stealth` | Stealth mode (when flagged) |
 | `just models` | `list-models --failover-only` | Fetch queue models |
 | `just models-probe` | `list-models --failover-only --probe` | Fetch + light probe |
-| `just models-deep` | `list-models --failover-only --deep` | Fetch + 7-dim deep probe |
+| `just models-deep` | `list-models --failover-only --deep` | Fetch + five-check deep probe |
 | `just trend` | `trend --since 7d` | 7-day probe trend |
 | `just env-check` | `env-check` | Env var override detection |
 | `just stats` | `stats --since 7d` | 7-day stats |
@@ -645,7 +684,7 @@ Uses [ruff](https://github.com/astral-sh/ruff) for formatting and linting (dev-t
 
 ```
 CC-Pulse/
-├── check_ccswitch_health.py   # Main script: 8 subcommands (~3600 lines)
+├── check_ccswitch_health.py   # Main script: probes, catalogs, diagnostics, logs, trends, passive health
 ├── run_health_check.ps1       # Windows interactive menu launcher
 ├── justfile                   # Common tasks (check, format, lint, test)
 ├── requirements.txt           # Declares: stdlib only, no runtime deps

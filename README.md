@@ -209,6 +209,7 @@ python check_ccswitch_health.py inspect \
 | 拉供应商声明的模型清单 | `just models` | `GET /v1/models`，列出的 ≠ 能用 |
 | 给某供应商某模型做深度诊断 | `inspect` | 7 维度体检：text/streaming/metadata/context/thinking/tools/vision + 路由比对 |
 | 看最近失败日志 / 历史成功率 | `history` / `just stats` | 只读 cc-switch 库，按供应商 / 时间窗汇总 |
+| 看 cc-switch 被动健康状态 | `health` | 只读 `provider_health`，不发 HTTP；不替代主动探测 |
 | 排查静默路由 | `just env-check` / `routing` | env-check 查环境变量覆盖，routing 看请求 vs 响应模型不一致排行 |
 | 看跨天是否有降级趋势 | `just trend` | 读本地探测归档，按天聚合成功率 / 延迟 / 错误分类 |
 | 实时盯着 cc-switch 日志 | `just watch` | 每 3 秒轮询，有新日志就打印，Ctrl+C 结束 |
@@ -246,6 +247,7 @@ python check_ccswitch_health.py check --failover-only --json  # 机器可读
 | `--failover-only` | 只测故障转移队列里的供应商（含当前激活） | 关 |
 | `--current-only` | 只测当前激活的 1 个供应商（最窄；与 `--failover-only` 同时设时本项优先） | 关 |
 | `--provider 名/子串` | 按供应商名过滤（逗号多选或子串） | 关 |
+| `--select` | 交互式多选供应商（仅 TTY） | 关 |
 | `--json` | stdout 输出结构化 JSON，stderr 保留人类文本 | 关 |
 | `--workers N` | 并发数 | 6 |
 | `--timeout SEC` | 单请求超时秒 | 30 |
@@ -260,9 +262,28 @@ python check_ccswitch_health.py check --failover-only --json  # 机器可读
 
 ### `list-models` —— 拉取模型目录
 
+默认只执行 `GET /v1/models`；加 `--probe` 会逐模型做轻量文本验证，加 `--deep` 会逐模型执行 text / streaming / metadata / thinking / tools 五项诊断。探测模式可用 `--source configured|listed|both` 选择配置档位、接口声明或两者去重合并的模型来源。
+
 ```bash
 python check_ccswitch_health.py list-models
 python check_ccswitch_health.py list-models --failover-only --type all
+python check_ccswitch_health.py list-models --select --probe
+python check_ccswitch_health.py list-models --failover-only --deep --source both --timeout 60
+```
+
+### 交互式供应商选择 `--select`
+
+`check` 和 `list-models` 可加 `--select`，以纯标准库的跨平台键盘选择器多选供应商：↑↓ 移动、空格切换、`a` 全选/取消全选、回车确认、Esc 取消。CLI 选择器**不支持鼠标**。`inspect` 请用 `--provider` 指定目标供应商。
+
+它只在 stdin 和 stdout 都是 TTY 时启用；管道、CI 等非交互环境会跳过选择器，应改用 `--provider` 明确筛选。
+
+### `health` —— 被动健康度
+
+只读 cc-switch 的 `provider_health` 表，查看真实代理流量汇总出的健康状态、连续失败和最近错误；不发 HTTP，也不替代 `check` 的主动答案验证。
+
+```bash
+python check_ccswitch_health.py health
+python check_ccswitch_health.py health --json
 ```
 
 ### `history` / `stats` / `routing` / `watch` —— 只读 cc-switch 运行日志
@@ -537,7 +558,7 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 
 ## Windows 桌面启动器
 
-`run_health_check.ps1` 提供交互式菜单，双击即可，无需记参数：
+`run_health_check.ps1` 提供交互式菜单，双击即可，无需记参数（需要 PowerShell 7+）：
 
 ```
 [1] 健康检测 · 快速体检   一键（claude/队列）
@@ -549,9 +570,24 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 [7] 退出
 ```
 
+### 菜单路径
+
+| 入口 | 层级与行为 |
+|------|------------|
+| 快速体检 | 直接读取高级设置的类型和范围；默认 `claude` + 故障转移队列/当前激活 |
+| 自定义健康检测 | 类型 → 队列+当前 / 全部 / 仅当前 / 自选供应商（可多选） |
+| 拉模型列表 | 类型 → 范围 → 仅列表 / 轻量探测 / 深度探测；探测时再选 `listed/configured/both` 来源 |
+| 深度诊断 | 类型 → 供应商；多供应商时选档位并逐个检测供应商×档位模型，单供应商可选单模型、全部模型或自选模型和维度 |
+| 运行日志 | 最近失败、最近全部、统计、静默路由、实时监控、分析报表 |
+| 高级设置 | JSON、token 预算、thinking、UA、inspect 上下文/vision、check stealth，以及快速体检类型/范围；仅当前启动器进程有效，关闭窗口后重置 |
+
+### 交互方式
+
+交互式终端支持 ↑↓/滚轮移动、回车确认、Esc 或右键取消；多选再用空格切换、`a` 全选/取消全选，鼠标左键可选中或切换。输入被重定向时，普通菜单和列表会改走编号或文本输入兼容路径；但 inspect 的多供应商档位与自选维度分支要求交互式控制台。不要把启动器菜单当作无人值守自动化接口。
+
 - 优先用 `CC_PULSE_PYTHON` 指定的解释器，其次 PATH 中的 `python`
 - 数据库路径可用 `CC_PULSE_DB` 覆盖
-- 超时可用 `CC_PULSE_TIMEOUT` 覆盖（秒）
+- 超时可用 `CC_PULSE_TIMEOUT` 覆盖（秒；健康检测默认值）
 - 使用 `python -u` 无缓冲输出，进度实时可见
 
 ### 环境变量
@@ -560,8 +596,10 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 |---|---|
 | `CC_PULSE_PYTHON` | 启动器优先使用的 Python 解释器路径 |
 | `CC_PULSE_DB` | 启动器默认的 cc-switch.db 路径 |
-| `CC_PULSE_TIMEOUT` | 启动器默认超时秒 |
+| `CC_PULSE_TIMEOUT` | 健康检测的默认超时秒 |
 | `CC_PULSE_PWSH` | 测试用的 pwsh 路径 |
+
+`CC_PULSE_*` 是启动器变量；供应商路由与认证变量（如 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`）由 `env-check` 审计，二者并不相同。
 
 ---
 
@@ -570,7 +608,7 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 - **只读、零侵入**：以 `file:...?mode=ro` 打开数据库，绝不修改 cc-switch
 - **路径不去重**：一律 `base_url + /v1/messages`，`xxx/v1` 会拼成 `/v1/v1/messages`——故意对齐真实 Claude Code 行为
 - **错误原文透传**：JSON 错误的 `message` 完整不截断；HTML/非 JSON 显示前 500 字符并标注真实长度
-- **不写文件**：结果只打印到终端 / stdout，不落盘
+- **本地归档，不改 cc-switch 数据**：数据库始终以 `file:...?mode=ro` 打开；`check`/`inspect` 会追加 CC-Pulse 自己的 `~/.cc-pulse/probe_history.jsonl` 供 `trend` 使用，`--archive PATH` 可覆盖位置，绝不写入 cc-switch 数据库
 - **Claude Code 指纹头**：附本机 `claude --version` 探测的 UA（可用 `--user-agent` 覆盖），降低 Cloudflare 1010 误判；`x-stainless-*` 版本可用 `--stainless-version` 覆盖（无法从 `claude --version` 推导 SDK 版本）
 - **默认验证 TLS**：`--skip-tls-verify` 需显式开启（会暴露认证凭据）
 - **终端安全**：`say()` 输出自动剥离 ANSI 转义和控制字符，防止恶意供应商响应注入终端指令
@@ -627,7 +665,7 @@ just test-ps1
 | `just check-stealth` | `check --failover-only --stealth` | 隐身模式（被识别时） |
 | `just models` | `list-models --failover-only` | 拉队列内模型清单 |
 | `just models-probe` | `list-models --failover-only --probe` | 拉清单 + 轻量探活 |
-| `just models-deep` | `list-models --failover-only --deep` | 拉清单 + 7 维深探 |
+| `just models-deep` | `list-models --failover-only --deep` | 拉清单 + 五项深探 |
 | `just trend` | `trend --since 7d` | 7 天探测趋势 |
 | `just env-check` | `env-check` | 环境变量覆盖检测 |
 | `just stats` | `stats --since 7d` | 7 天统计 |
@@ -657,7 +695,7 @@ just lint
 
 ```
 CC-Pulse/
-├── check_ccswitch_health.py   # 主脚本：8 个子命令（~3600 行）
+├── check_ccswitch_health.py   # 主脚本：健康探测、模型目录、诊断、日志、趋势与被动健康度命令
 ├── run_health_check.ps1       # Windows 桌面交互菜单启动器
 ├── justfile                    # 常用任务（检查、格式化、lint、测试）
 ├── requirements.txt           # 声明：纯标准库，无运行时依赖
