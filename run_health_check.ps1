@@ -378,12 +378,20 @@ function Invoke-CcpulseJson {
     $proc.StartInfo.RedirectStandardError = $true
     $proc.StartInfo.CreateNoWindow = $true
     $null = $proc.Start()
+    # stdout 只有 JSON（体量小），异步读到底；stderr 是人类进度，逐行实时转发
     $outTask = $proc.StandardOutput.ReadToEndAsync()
-    $errTask = $proc.StandardError.ReadToEndAsync()
-    $proc.WaitForExit()
+    $errTask = $proc.StandardError.ReadLineAsync()
+    while (-not $proc.HasExited) {
+        Start-Sleep -Milliseconds 40
+        while ($errTask.IsCompleted -and $errTask.Result -ne $null) {
+            Write-Host $errTask.Result
+            $errTask = $proc.StandardError.ReadLineAsync()
+        }
+    }
+    # 进程退出后清空管道残留的 stderr 行
+    $rest = if ($errTask.IsCompleted) { $errTask.Result } else { $null }
+    while ($null -ne $rest) { Write-Host $rest; $rest = $proc.StandardError.ReadLine() }
     $jsonText = $outTask.Result
-    $errText = $errTask.Result
-    if ($errText) { Write-Host $errText.TrimEnd() }
     $code = $proc.ExitCode
     Write-Host ""
     if ($script:AdvJson -and $jsonText) { Write-Host $jsonText.TrimEnd() }
