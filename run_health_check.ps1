@@ -152,14 +152,17 @@ function Select-FromList {
         [string[]]$Options,
         [string]$Title = "选择",
         [switch]$AllowLiteral,
-        [string]$AllLabel = "全部"
+        [string]$AllLabel = "全部",
+        [switch]$DefaultAll
     )
     if ($Options.Count -eq 0) { return @() }
 
     if (-not [Console]::IsInputRedirected) {
         $selIdx = Show-ArrowSelect -Options $Options -Multi -Title $Title
         if ($null -eq $selIdx) { return $null }
-        if ($selIdx.Count -eq 0) { return @($Options[0]) }
+        if ($selIdx.Count -eq 0) {
+            return @(if ($DefaultAll) { $Options } else { @($Options[0]) })
+        }
         return $selIdx | ForEach-Object { $Options[$_] }
     }
 
@@ -168,8 +171,10 @@ function Select-FromList {
         Write-Host "  [$($i + 1)] $($Options[$i])"
     }
     Write-Host "  [a] $AllLabel" -ForegroundColor Cyan
-    $sel = Read-Host "输入序号（逗号分隔，如 1,3）或 a 全选（默认 1）"
-    if ([string]::IsNullOrWhiteSpace($sel)) { return @($Options[0]) }
+    $sel = Read-Host "输入序号（逗号分隔，如 1,3）或 a 全选（$($(if ($DefaultAll) { '空回车=全选' } else { '默认 1' }))）"
+    if ([string]::IsNullOrWhiteSpace($sel)) {
+        return @(if ($DefaultAll) { $Options } else { @($Options[0]) })
+    }
     if ($sel -eq "a" -or $sel -eq "A") { return @($Options) }
     $idxs = $sel -split "," | ForEach-Object { $_.Trim() }
     $result = @()
@@ -435,8 +440,8 @@ function Select-DeepDiveTargets {
     return $selected
 }
 
-# 对选中的供应商逐个做深度诊断（inspect）。复用 Menu-Inspect 的模型选择思路：
-# 用 check 结果里的 attempts[].model 作为候选模型列表。
+# 对选中的供应商做深度诊断（inspect）。先列出全部供应商的去重模型一次多选，
+# 再对每个 (供应商, 模型) 组合逐个跑。
 function Invoke-DeepDive {
     param(
         [object[]]$Providers,
@@ -444,39 +449,78 @@ function Invoke-DeepDive {
         [string]$DBPath,
         [string]$PythonPath
     )
-    foreach ($p in @($Providers)) {
-        Write-Host ""
-        Write-Host "========================================" -ForegroundColor Cyan
-        Write-Host "  深挖: $($p.name)  ($($p.type))" -ForegroundColor Cyan
-        Write-Host "========================================" -ForegroundColor Cyan
-        # 候选模型：attempts 里每档的 model，去重
-        $modelIds = [System.Collections.Generic.List[string]]::new()
-        $seen = @{}
+    $Providers = @($Providers | Where-Object { $_ })
+    if ($Providers.Count -eq 0) { return }
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  深挖: $($Providers.Count) 家供应商" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+
+    # 1. 收集全部选中供应商探测到的模型，去重保序
+    $modelIds = [System.Collections.Generic.List[string]]::new()
+    $seen = @{}
+    foreach ($p in $Providers) {
         foreach ($a in @($p.attempts)) {
             if ($a.model -and -not $seen.ContainsKey($a.model)) {
                 $seen[$a.model] = $true
                 $modelIds.Add($a.model)
             }
         }
-        if ($modelIds.Count -eq 0) {
-            Write-Host "  无候选模型，跳过。" -ForegroundColor Yellow
-            continue
+    }
+    if ($modelIds.Count -eq 0) {
+        Write-Host "  选中供应商无候选模型，跳过。" -ForegroundColor Yellow
+        return
+    }
+
+    # 2. 全局模型多选（a 全选 / 空回车全选）
+    Write-Host "  全部供应商探测到的模型:" -ForegroundColor Yellow
+    $selModels = Select-FromList -Options $modelIds.ToArray() -Title "选择要深挖的模型（多选，a 全选）" -DefaultAll -AllLabel "全部模型"
+    if ($null -eq $selModels) {
+        Write-Host "  未选择模型，跳过。" -ForegroundColor Yellow
+        return
+    }
+
+    # 3. 组合任务：选中供应商 × 选中模型
+    $tasks = [System.Collections.Generic.List[object]]::new()
+    foreach ($p in $Providers) {
+        foreach ($m in @($selModels)) {
+            $tasks.Add([pscustomobject]@{ provider = $p.name; type = $p.type; model = $m })
         }
-        Write-Host "  该供应商探测到的模型:" -ForegroundColor Yellow
-        $disp = @()
-        foreach ($m in $modelIds) { $disp += "$m" }
-        $model = ""
-        $midx = Select-MenuItem -Options $disp -Title "选择要深挖的模型"
-        if ($midx -lt 0) { continue }
-        if ($midx -eq -2 -and $script:LastLiteral) { $model = $script:LastLiteral }
-        else { $model = $modelIds[$midx] }
-        if ([string]::IsNullOrWhiteSpace($model)) { continue }
+    }
+    Write-Host "将检测 $($tasks.Count) 个 (供应商, 模型) 组合:" -ForegroundColor Green
+    foreach ($t in $tasks) { Write-Host "  · $($t.provider) -> $($t.model)" -ForegroundColor White }
+
+    # 4. 逐个跑
+    foreach ($t in $tasks) {
+        Write-Host ""
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "  深挖: $($t.provider)  ($($t.type))" -ForegroundColor Cyan
+        Write-Host "  Model: $($t.model)" -ForegroundColor Cyan
+        Write-Host "========================================" -ForegroundColor Cyan
         $cmdArgs = [System.Collections.Generic.List[string]]::new()
         $cmdArgs.Add("inspect")
-        $cmdArgs.Add("--provider"); $cmdArgs.Add($p.name)
-        $cmdArgs.Add("--model"); $cmdArgs.Add($model)
+        $cmdArgs.Add("--provider"); $cmdArgs.Add($t.provider)
+        $cmdArgs.Add("--model"); $cmdArgs.Add($t.model)
         $cmdArgs.Add("--source"); $cmdArgs.Add("manual")
-        $cmdArgs.Add("--type"); $cmdArgs.Add($p.type)
+        $cmdArgs.Add("--type"); $cmdArgs.Add($t.type)
+        $cmdArgs.Add("--db"); $cmdArgs.Add($DBPath)
+        $cmdArgs.Add("--timeout"); $cmdArgs.Add("30")
+        $cmdArgs.Add("--workers"); $cmdArgs.Add("1")
+        $cmdArgs.Add("--human")
+        Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "inspect"
+        $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+    }
+        Write-Host ""
+        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "  深挖: $($t.provider)  ($($t.type))" -ForegroundColor Cyan
+        Write-Host "  Model: $($t.model)" -ForegroundColor Cyan
+        Write-Host "========================================" -ForegroundColor Cyan
+        $cmdArgs = [System.Collections.Generic.List[string]]::new()
+        $cmdArgs.Add("inspect")
+        $cmdArgs.Add("--provider"); $cmdArgs.Add($t.provider)
+        $cmdArgs.Add("--model"); $cmdArgs.Add($t.model)
+        $cmdArgs.Add("--source"); $cmdArgs.Add("manual")
+        $cmdArgs.Add("--type"); $cmdArgs.Add($t.type)
         $cmdArgs.Add("--db"); $cmdArgs.Add($DBPath)
         $cmdArgs.Add("--timeout"); $cmdArgs.Add("30")
         $cmdArgs.Add("--workers"); $cmdArgs.Add("1")
