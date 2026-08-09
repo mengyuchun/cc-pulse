@@ -4462,6 +4462,8 @@ def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
                     "fail_cats": {},
                     "status_counts": {},
                     "cost_usd": 0.0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
                 }
                 buckets[pid] = b
             b["total"] += 1
@@ -4483,6 +4485,11 @@ def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
                     b["cost_usd"] += float(cost_raw)
                 except (TypeError, ValueError):
                     pass
+            # token 用量聚合
+            for tk, dk in (("input_tokens", "input_tokens"), ("output_tokens", "output_tokens")):
+                tv = d.get(dk)
+                if isinstance(tv, (int, float)) and tv >= 0:
+                    b[tk] += int(tv)
             if (
                 d.get("request_model")
                 and d.get("model")
@@ -4516,6 +4523,8 @@ def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
                     "fail_categories": b["fail_cats"],
                     "status_counts": b["status_counts"],
                     "cost_usd": round(b["cost_usd"], 4),
+                    "input_tokens": b["input_tokens"],
+                    "output_tokens": b["output_tokens"],
                 }
             )
         out.sort(key=lambda x: (-x["fail"], -x["total"]))
@@ -4729,10 +4738,10 @@ def run_stats(args, say) -> int:
         )
         hdr = (
             f"{_pad('供应商', 24)} {'请求':>6} {'成功%':>7} {'失败':>5} "
-            f"{_pad('主失败因', 22)} {'中位延迟':>9} {'路由≠%':>7} {'成本$':>8}"
+            f"{_pad('主失败因', 22)} {'中位延迟':>9} {'路由≠%':>7} {'成本$':>8} {'入token':>9} {'出token':>9}"
         )
         _say_colored(_c(hdr, "bold"))
-        say("-" * 100)
+        say("-" * 120)
         for s in stats:
             sr = s["success_rate"]
             rate_s = f"{sr * 100:.0f}%"
@@ -4765,10 +4774,14 @@ def run_stats(args, say) -> int:
             fail_c = _c(str(s["fail"]), "red") if s["fail"] > 0 else str(s["fail"])
             cost = s.get("cost_usd") or 0.0
             cost_s = f"{cost:.2f}" if cost > 0 else "-"
+            inp_tok = s.get("input_tokens") or 0
+            out_tok = s.get("output_tokens") or 0
+            inp_s = f"{inp_tok:,}" if inp_tok else "-"
+            out_s = f"{out_tok:,}" if out_tok else "-"
             pname = _sanitize_for_terminal(s["provider_name"][:24])
             _say_colored(
                 f"{_pad(pname, 24)} {s['total']:6d} {rate_c:>7} {fail_c:>5} "
-                f"{cat_c} {med_c:>9} {mm_c:>7} {cost_s:>8}"
+                f"{cat_c} {med_c:>9} {mm_c:>7} {cost_s:>8} {inp_s:>9} {out_s:>9}"
             )
     return 0
 
@@ -5950,9 +5963,155 @@ def _build_parser():
     )
     p_health.add_argument("--json", action="store_true", help="JSON 输出")
 
+    p_deep = sub.add_parser(
+        "deep-dive",
+        parents=[common],
+        help="从 check JSON 批量深挖失败/可用供应商（下沉自 PS1，CI 可串联）",
+    )
+    p_deep.add_argument(
+        "--from",
+        dest="from_file",
+        required=True,
+        help="check JSON 文件路径，或 - 读 stdin",
+    )
+    p_deep.add_argument(
+        "--target",
+        default="fail",
+        choices=["fail", "ok", "both"],
+        help="深挖目标：fail/ok/both（默认 fail）",
+    )
+    p_deep.add_argument(
+        "--models", default=None, help="指定模型（逗号分隔，默认全部去重）"
+    )
+    p_deep.add_argument(
+        "--yes", action="store_true", help="跳过容量确认（>20 组合时）"
+    )
+    p_deep.add_argument("--json", action="store_true", help="只输出任务列表 JSON 不执行")
+
     # 兜底默认（注入 check 后子解析器会覆盖这些）
     ap.set_defaults(command="check", type="claude", failover_only=False, json=False)
     return ap, common, p_check, p_lm, p_inspect, p_hist, p_stats, p_route, p_watch
+
+
+def run_deep_dive(args, say) -> int:
+    """从 check JSON 读结果，对失败/可用供应商批量深挖（逐个调 inspect）。
+
+    下沉自 PS1 的 Ask-DeepDive/Invoke-DeepDive，让 CI 可串联
+    `ccpulse check --json | ccpulse deep-dive --from - --target fail`。
+    """
+    src = args.from_file
+    try:
+        if src == "-":
+            data = json.load(sys.stdin)
+        else:
+            with open(src, encoding="utf-8") as f:
+                data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        say(f"读取 check JSON 失败: {e}")
+        return 2
+    providers = data.get("providers") or []
+    if not providers:
+        say("check JSON 无 providers")
+        return 2
+
+    # 过滤目标供应商
+    target = (args.target or "fail").lower()
+    if target == "fail":
+        targets = [p for p in providers if not p.get("overall_ok")]
+    elif target == "ok":
+        targets = [p for p in providers if p.get("overall_ok")]
+    elif target == "both":
+        targets = list(providers)
+    else:
+        say(f"未知 --target: {target}（fail/ok/both）")
+        return 2
+    if not targets:
+        say(f"无符合的供应商（target={target}）")
+        return 0
+
+    # 去重模型（attempts[].model）
+    seen: dict[str, bool] = {}
+    all_models: list[str] = []
+    for p in targets:
+        for a in (p.get("attempts") or []):
+            m = a.get("model")
+            if m and m not in seen:
+                seen[m] = True
+                all_models.append(m)
+    if args.models:
+        sel = {m.strip() for m in args.models.split(",") if m.strip()}
+        models = [m for m in all_models if m in sel] or list(sel)
+    else:
+        models = all_models
+    if not models:
+        say("无候选模型")
+        return 0
+
+    # 任务列表：供应商 × 模型
+    tasks = [(p["name"], p.get("type", "claude"), m) for p in targets for m in models]
+
+    # 容量保护
+    if len(tasks) > 20 and not args.yes:
+        est_min = len(tasks) * 35 // 60
+        say(f"⚠ 组合数较多（{len(tasks)} 个），预计约 {est_min} 分钟。加 --yes 跳过确认。")
+        if not sys.stdin.isatty():
+            say("非交互环境，加 --yes 确认执行。")
+            return 0
+        ans = input("继续？[y/N] ").strip().lower()
+        if ans != "y":
+            say("已取消")
+            return 0
+
+    # --json 只输出任务列表（dry-run），不执行
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "command": "deep-dive",
+                    "target": target,
+                    "tasks": [
+                        {"provider": p, "type": t, "model": m} for p, t, m in tasks
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            flush=True,
+        )
+        return 0
+
+    say(f"深挖: {len(targets)} 家供应商 × {len(models)} 模型 = {len(tasks)} 个组合")
+    script = str(Path(__file__).resolve())
+    overall = 0
+    for pname, ptype, model in tasks:
+        say(f"\n{'=' * 60}")
+        say(f"  深挖: {pname} ({ptype})  Model: {model}")
+        say(f"{'=' * 60}")
+        cmd = [
+            sys.executable,
+            script,
+            "inspect",
+            "--provider",
+            pname,
+            "--model",
+            model,
+            "--source",
+            "manual",
+            "--type",
+            ptype,
+            "--db",
+            args.db,
+            "--timeout",
+            str(args.timeout),
+            "--workers",
+            "1",
+            "--human",
+        ]
+        rc = subprocess.call(cmd)
+        if rc != 0 and overall == 0:
+            overall = 1
+    return overall
 
 
 def main():
@@ -6002,6 +6161,10 @@ def _main_with_args(args) -> int:
     # trend：读 CC-Pulse 自己的探测归档，不需要 cc-switch db
     if args.command == "trend":
         return run_trend(args, say)
+
+    # deep-dive：从 check JSON 读，不需要加载 cc-switch providers（自己 subprocess 调 inspect）
+    if args.command == "deep-dive":
+        return run_deep_dive(args, say)
 
     if not Path(args.db).exists():
         say(f"数据库不存在: {args.db}")

@@ -3239,6 +3239,11 @@ test(
     and bool(stats_report.get("providers")),
     f"report={stats_report}",
 )
+# token 用量汇总：r1 贡献 input=10 output=5
+_tot_in = sum(p.get("input_tokens") or 0 for p in stats_report.get("providers", []))
+_tot_out = sum(p.get("output_tokens") or 0 for p in stats_report.get("providers", []))
+test("stats 汇总 input_tokens", _tot_in >= 10, f"tot_in={_tot_in}")
+test("stats 汇总 output_tokens", _tot_out >= 5, f"tot_out={_tot_out}")
 
 rc, out, err = run_cli_db(["routing", "--json", "--limit", "1"], log_db)
 routing_report = json.loads(out) if out else {}
@@ -3956,6 +3961,81 @@ _cat, _disp = mod.classify_error(
 )
 test("429 -> rate_limit", _cat == mod.ErrorCategory.RATE_LIMIT, f"cat={_cat}")
 test("429 display 含恢复提示", "恢复" in _disp or "23:10:15" in _disp, f"disp={_disp!r}")
+
+
+# ============ P1：deep-dive 子命令（CI 串联，非交互） ============
+
+print("\n[End-to-end] deep-dive --json dry-run（CI 串联）")
+_dd_json = {
+    "schema_version": 2,
+    "providers": [
+        {
+            "name": "FailProv",
+            "type": "claude",
+            "overall_ok": False,
+            "attempts": [{"model": "m-fail"}],
+        },
+        {
+            "name": "OkProv",
+            "type": "claude",
+            "overall_ok": True,
+            "best_tier": "haiku",
+            "attempts": [{"model": "m-ok"}],
+        },
+    ],
+}
+_dd_file = os.path.join(tempfile.mkdtemp(prefix="ccpulse_dd_"), "dd_check.json")
+with open(_dd_file, "w", encoding="utf-8") as _f:
+    json.dump(_dd_json, _f)
+
+rc, out, err = run_cli(["deep-dive", "--from", _dd_file, "--target", "fail", "--json"])
+test("deep-dive fail exit 0", rc == 0, f"rc={rc} err={err[:200]}")
+_dd_rep = json.loads(out) if out else {}
+test("deep-dive command=deep-dive", _dd_rep.get("command") == "deep-dive")
+_fail_t = [t for t in _dd_rep.get("tasks", []) if t["provider"] == "FailProv"]
+_ok_t = [t for t in _dd_rep.get("tasks", []) if t["provider"] == "OkProv"]
+test(
+    "deep-dive --target fail 只含失败家",
+    len(_fail_t) == 1 and len(_ok_t) == 0,
+    f"fail={_fail_t} ok={_ok_t}",
+)
+
+rc2, out2, _ = run_cli(["deep-dive", "--from", _dd_file, "--target", "both", "--json"])
+_rep2 = json.loads(out2) if out2 else {}
+test(
+    "deep-dive --target both = 2家×2模型=4组合",
+    len(_rep2.get("tasks", [])) == 4,
+    f"n={len(_rep2.get('tasks', []))}",
+)
+
+rc3, out3, _ = run_cli(
+    ["deep-dive", "--from", _dd_file, "--target", "both", "--models", "m-fail", "--json"]
+)
+_rep3 = json.loads(out3) if out3 else {}
+test(
+    "deep-dive --models 过滤只含 m-fail",
+    len(_rep3.get("tasks", [])) == 2
+    and all(t["model"] == "m-fail" for t in _rep3.get("tasks", [])),
+    f"tasks={_rep3.get('tasks')}",
+)
+
+# stdin 读取
+import subprocess as _sp
+
+_p = _sp.run(
+    [PY, SCRIPT, "deep-dive", "--from", "-", "--target", "ok", "--json", "--db", db_path],
+    input=json.dumps(_dd_json),
+    capture_output=True,
+    text=True,
+    timeout=10,
+    check=False,
+)
+_rep4 = json.loads(_p.stdout) if _p.stdout else {}
+test(
+    "deep-dive --from - 读 stdin",
+    _p.returncode == 0 and len(_rep4.get("tasks", [])) == 1,
+    f"rc={_p.returncode} err={_p.stderr[:200]}",
+)
 
 
 # ============ 汇总 ============
