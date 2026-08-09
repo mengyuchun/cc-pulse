@@ -3016,6 +3016,7 @@ def run_health_check(args, providers, say) -> int:
                 "total": len(results),
                 "available": len(ok),
                 "unavailable": len(fail),
+                "available_ratio": round(len(ok) / len(results), 4) if results else 0,
             },
             "providers": results_sorted,
         }
@@ -3023,6 +3024,15 @@ def run_health_check(args, providers, say) -> int:
 
     # 归档：每次 check 探测结果追加一行 JSONL（供 trend 跨次聚合），失败不阻断
     _archive_check_results(args, providers, results)
+
+    # 告警阈值：可用率低于阈值时输出告警（cron 可据此触发）
+    alert_threshold = getattr(args, "alert_threshold", None)
+    if alert_threshold is not None and results:
+        ratio = len(ok) / len(results)
+        if ratio < alert_threshold:
+            say(
+                f"⚠ 告警: 可用率 {ratio * 100:.0f}% 低于阈值 {alert_threshold * 100:.0f}%",
+            )
     return 0 if ok else 1
 
 
@@ -5661,6 +5671,12 @@ def _build_parser():
         "--probe-enable-thinking",
         action="store_true",
         help="允许探测请求走 thinking 模式（默认禁用，避免 DeepSeek 等 thinking 模型耗光 max_tokens）",
+    )
+    p_check.add_argument(
+        "--alert-threshold",
+        type=float,
+        default=None,
+        help="可用率告警阈值（0-1，如 0.8 表示低于 80% 告警）；cron 巡检可据此触发",
     )
 
     # list-models：拉取供应商 /v1/models

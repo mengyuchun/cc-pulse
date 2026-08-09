@@ -186,6 +186,11 @@ test("trend Prov-A lat_p50=200", pa["lat_p50"] == 200.0, f"{pa['lat_p50']}")
 test("trend Prov-A lat_p95=290", pa["lat_p95"] == 290.0, f"{pa['lat_p95']}")
 test("trend Prov-A ttft_p50=65", pa["ttft_p50"] == 65.0, f"{pa['ttft_p50']}")
 test(
+    "trend Prov-A trend_direction 存在",
+    pa.get("trend_direction") in ("up", "down", "stable", None),
+    f"dir={pa.get('trend_direction')}",
+)
+test(
     "trend Prov-A error_categories",
     pa["error_categories"] == {"rate_limit": 1},
     f"{pa['error_categories']}",

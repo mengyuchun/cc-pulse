@@ -1367,6 +1367,11 @@ try:
     test("check JSON 顶层含 providers", "providers" in j)
     test("check JSON schema_version == 2", j.get("schema_version") == 2)
     test(
+        "check JSON summary.available_ratio 存在",
+        "available_ratio" in j.get("summary", {}),
+        f"summary={j.get('summary')}",
+    )
+    test(
         "check JSON probe_pool_size == len(PROBE_PROMPTS)",
         j.get("probe_pool_size") == len(mod.PROBE_PROMPTS),
     )

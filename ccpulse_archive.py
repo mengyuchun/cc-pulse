@@ -170,6 +170,19 @@ def build_trend(
             d["success_rate"] = round(d["ok"] / d["total"], 4)
         lats = sorted(b["latencies"])
         ttfts = sorted(b["ttfts"])
+        # 趋势方向：by_day 首尾成功率对比（>0.1 升 / <-0.1 降 / 其余稳定）
+        direction = None
+        if len(by_day) >= 2:
+            first_sr = by_day[0].get("success_rate")
+            last_sr = by_day[-1].get("success_rate")
+            if first_sr is not None and last_sr is not None:
+                diff = last_sr - first_sr
+                if diff > 0.1:
+                    direction = "up"
+                elif diff < -0.1:
+                    direction = "down"
+                else:
+                    direction = "stable"
         providers.append(
             {
                 "provider": b["provider"],
@@ -182,6 +195,7 @@ def build_trend(
                 "ttft_p50": _percentile(ttfts, 50),
                 "error_categories": b["error_categories"],
                 "by_day": by_day,
+                "trend_direction": direction,
             }
         )
     providers.sort(key=lambda x: -x["total"])
@@ -204,6 +218,9 @@ def format_trend_human(trend: dict) -> str:
     lines.append("-" * 88)
     for p in trend["providers"]:
         rate = f"{p['success_rate'] * 100:.0f}%"
+        dir_mark = {"up": "↑", "down": "↓", "stable": "→"}.get(p.get("trend_direction"), "")
+        if dir_mark:
+            rate += dir_mark
         p50 = f"{p['lat_p50']:.0f}ms" if p["lat_p50"] is not None else "-"
         p95 = f"{p['lat_p95']:.0f}ms" if p["lat_p95"] is not None else "-"
         cats = p.get("error_categories") or {}
