@@ -128,7 +128,9 @@ function Show-ArrowSelect {
                 if ($Multi) {
                     $sel = @()
                     for ($i = 0; $i -lt $n; $i++) { if ($checked[$i]) { $sel += $i } }
-                    return $sel  # 无空格选中项时返回空数组，调用方按「全选/默认」处理
+                    # 空回车 = 确认「默认/全选」：返回 -1 sentinel，与 ESC($null) 区分
+                    if ($sel.Count -eq 0) { return @(-1) }
+                    return $sel
                 }
                 return @($cursor)
             }
@@ -157,9 +159,9 @@ function Select-FromList {
     if ($Options.Count -eq 0) { return @() }
 
     if (-not [Console]::IsInputRedirected) {
-        $selIdx = @(Show-ArrowSelect -Options $Options -Multi -Title $Title)
+        $selIdx = Show-ArrowSelect -Options $Options -Multi -Title $Title
         if ($null -eq $selIdx) { return $null }
-        if ($selIdx.Count -eq 0) {
+        if ($selIdx[0] -eq -1) {
             return @(if ($DefaultAll) { $Options } else { @($Options[0]) })
         }
         return $selIdx | ForEach-Object { $Options[$_] }
@@ -202,7 +204,7 @@ function Select-MenuItem {
     if ($Options.Count -eq 0) { return -1 }
 
     if (-not [Console]::IsInputRedirected) {
-        $selIdx = @(Show-ArrowSelect -Options $Options -Title $Title)
+        $selIdx = Show-ArrowSelect -Options $Options -Title $Title
         if ($null -eq $selIdx -or $selIdx.Count -eq 0) { return -1 }
         return $selIdx[0]
     }
@@ -776,9 +778,11 @@ function Menu-Inspect {
             $idx = Select-MenuItem -Options $tierOptions -Title "选择档位（从每家配置中取对应模型）"
             if ($idx -lt 0) { $null } else { @($idx) }
         } else {
-            @(Show-ArrowSelect -Options $tierOptions -Multi -Title "选择档位（从每家配置中取对应模型）")
+            Show-ArrowSelect -Options $tierOptions -Multi -Title "选择档位（从每家配置中取对应模型）"
         }
         if ($null -eq $tierIdxs) { return 1 }
+        # 空回车（-1 sentinel）→ 按默认 haiku 处理
+        if ($tierIdxs.Count -eq 1 -and $tierIdxs[0] -eq -1) { $tierIdxs = @() }
         $tierMap = @("haiku", "sonnet", "opus", "fable", "default")
         $selectedTiers = @()
         foreach ($i in $tierIdxs) { $selectedTiers += $tierMap[$i] }
@@ -913,9 +917,11 @@ function Menu-Inspect {
             $idx = Select-MenuItem -Options $dimOptions -Title "检测维度（默认全选）"
             if ($idx -lt 0) { $null } elseif ($null -eq $script:LastInput -or [string]::IsNullOrWhiteSpace($script:LastInput)) { @() } else { @($idx) }
         } else {
-            @(Show-ArrowSelect -Options $dimOptions -Multi -Title "检测维度（全选=直接回车，单独选用空格）")
+            Show-ArrowSelect -Options $dimOptions -Multi -Title "检测维度（全选=直接回车，单独选用空格）"
         }
         if ($null -eq $dimIdxs) { return 1 }
+        # 空回车（-1 sentinel）→ 按默认全开处理
+        if ($dimIdxs.Count -eq 1 -and $dimIdxs[0] -eq -1) { $dimIdxs = @() }
         $dimMap = @("text", "streaming", "model-consistency", "metadata", "thinking", "tools", "vision")
         if ($dimIdxs.Count -eq 0) {
             # 默认全开（vision 除外，除非高级设置开了，由 Apply-AdvancedArgs 追加）

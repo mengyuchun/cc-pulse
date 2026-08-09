@@ -3760,6 +3760,170 @@ test(
 )
 
 
+# ============ 修复回归验证：小数匹配 / 脱敏 / 截断 / SSE 提前关闭 ============
+
+print("\n[Unit] _answer_correct 小数等价")
+test("_answer_correct: '5.0' == '5'", mod._answer_correct("5.0", "5") is True)
+test(
+    "_answer_correct: '答案是 5.0' == '5'",
+    mod._answer_correct("答案是 5.0", "5") is True,
+)
+test(
+    "_answer_correct: 多个数字仍拒绝",
+    mod._answer_correct("5.0 or 5.5", "5") is False,
+)
+
+
+print("\n[Unit] _sanitize_display 脱敏 + ANSI")
+if hasattr(mod, "_sanitize_display"):
+    _sd1 = mod._sanitize_display(
+        '{"message":"invalid api key sk-secret123"}', "sk-secret123"
+    )
+    test(
+        "sanitize_display: key 掩码",
+        "sk-secret123" not in _sd1 and "***" in _sd1,
+        f"r={_sd1!r}",
+    )
+    _sd2 = mod._sanitize_display("err\x1b[31mred\x1b[0m end", "k")
+    test("sanitize_display: ANSI 剥离", "\x1b" not in _sd2, f"r={_sd2!r}")
+    _sd3 = mod._sanitize_display("", "sk-x")
+    test("sanitize_display: 空文本原样", _sd3 == "", f"r={_sd3!r}")
+else:
+    test("_sanitize_display 未实现", True)
+
+
+print("\n[End-to-end] 错误响应体含 key → probe_tier error/raw_body 脱敏")
+
+
+class KeyEchoErrorHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        body = '{"error":{"message":"invalid api key sk-echo-key-123456789"}}'
+        self.wfile.write(body.encode())
+        self.wfile.flush()
+
+    def log_message(self, *a):
+        pass
+
+
+srv, port = start_server(KeyEchoErrorHandler)
+try:
+    _pe = mod.Provider(
+        "P",
+        "claude",
+        f"http://127.0.0.1:{port}/v1",
+        "sk-echo-key-123456789",
+        "authtoken",
+        [mod.ModelTier("default", "m", "m")],
+    )
+    _re = mod.probe_tier(_pe, _pe.tiers[0], 3, False)
+    test(
+        "probe_tier error 不含完整 key",
+        "sk-echo-key-123456789" not in (_re.get("error") or ""),
+        f"err={_re.get('error')!r}",
+    )
+    test(
+        "probe_tier raw_body 不含完整 key",
+        "sk-echo-key-123456789" not in (_re.get("raw_body") or ""),
+        f"raw={_re.get('raw_body')!r}",
+    )
+finally:
+    srv.shutdown()
+
+
+print("\n[End-to-end] Content-Length 虚增 → IncompleteRead → truncated")
+
+
+class IncompleteReadHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "5000")  # 虚增：实际只发一小段
+        self.end_headers()
+        self.wfile.write(
+            b'{"id":"m","type":"message","content":[{"type":"text","text":"5"}],"model":"m"}'
+        )
+        self.wfile.flush()
+        self.wfile.close()  # 关连接，未发送声明的 5000 字节
+
+    def log_message(self, *a):
+        pass
+
+
+srv, port = start_server(IncompleteReadHandler)
+try:
+    _pi = mod.Provider(
+        "P",
+        "claude",
+        f"http://127.0.0.1:{port}/v1",
+        "k",
+        "authtoken",
+        [mod.ModelTier("default", "m", "m")],
+    )
+    _resp = mod._http_request(
+        f"http://127.0.0.1:{port}/v1/messages", "POST", body=b'{}', timeout=3
+    )
+    test(
+        "IncompleteRead → truncated=True",
+        _resp.truncated is True,
+        f"truncated={_resp.truncated}",
+    )
+    test(
+        "IncompleteRead → error_category=STREAM_INCOMPLETE",
+        _resp.error_category == mod.ErrorCategory.STREAM_INCOMPLETE.value,
+        f"cat={_resp.error_category}",
+    )
+finally:
+    srv.shutdown()
+
+
+print("\n[End-to-end] SSE 无 done marker 提前断 → 标记截断")
+
+
+class SseNoDoneHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for chunk in [
+            'event: message_start\ndata: {"type":"message_start","message":{"model":"m"}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"5"}}\n\n',
+        ]:
+            self.wfile.write(chunk.encode())
+            self.wfile.flush()
+        self.wfile.close()  # 无 message_stop 直接关连接
+
+    def log_message(self, *a):
+        pass
+
+
+srv, port = start_server(SseNoDoneHandler)
+try:
+    _ps = mod.Provider(
+        "P",
+        "claude",
+        f"http://127.0.0.1:{port}/v1",
+        "k",
+        "authtoken",
+        [mod.ModelTier("default", "m", "m")],
+    )
+    _rs = mod.probe_stream(_ps, _ps.tiers[0], 3, False)
+    test(
+        "SSE 提前断 → status=error",
+        _rs.get("status") == "error",
+        f"status={_rs.get('status')}",
+    )
+    test(
+        "SSE 提前断 → error_category=STREAM_INCOMPLETE",
+        _rs.get("error_category") == mod.ErrorCategory.STREAM_INCOMPLETE.value,
+        f"cat={_rs.get('error_category')}",
+    )
+finally:
+    srv.shutdown()
+
+
 # ============ 汇总 ============
 
 print("\n" + "=" * 60)

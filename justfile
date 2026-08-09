@@ -36,7 +36,7 @@ models-probe:
 models-probe-all:
     {{PYTHON}} {{SCRIPT}} list-models --probe --source both
 
-# 拉列表 + 深度探测每个模型（7 维度：text/streaming/metadata/context/thinking/tools/vision）
+# 拉列表 + 深度探测每个模型（5 维度：text/streaming/metadata/thinking/tools）
 models-deep:
     {{PYTHON}} {{SCRIPT}} list-models --failover-only --deep --timeout 60
 
@@ -87,6 +87,8 @@ test-all:
     {{PYTHON}} tests/test_ps1_launcher.py
     {{PYTHON}} tests/test_env_check.py
     {{PYTHON}} tests/test_archive_trend.py
+    {{PYTHON}} tests/test_tui.py
+    {{PYTHON}} tests/test_docs_consistency.py
 
 # 探测历史趋势（归档跨次聚合）
 trend:

@@ -140,9 +140,14 @@ def _answer_correct(answer: str, expected: str) -> bool:
     if a == exp:
         return True
     if exp.lstrip("-").isdigit():
-        nums = re.findall(r"-?\d+", a)
-        if len(nums) == 1 and nums[0] == exp:
-            return True
+        # 提取含小数的数字并数值比较，容忍 "5.0"、"5.00" 等等价表述
+        nums = re.findall(r"-?\d+(?:\.\d+)?", a)
+        if len(nums) == 1:
+            try:
+                if float(nums[0]) == float(exp):
+                    return True
+            except ValueError:
+                pass
     return False
 
 
@@ -902,6 +907,13 @@ def _sanitize_raw_body(body: str, api_key: str) -> str:
     return body
 
 
+def _sanitize_display(text: str, api_key: str | None) -> str:
+    """错误消息/evidence 脱敏：先掩码 API key，再剥 ANSI 控制字符。"""
+    if not text:
+        return text
+    return _sanitize_for_terminal(_sanitize_raw_body(text, api_key or ""))
+
+
 def create_ssl_context(skip_tls_verify: bool) -> ssl.SSLContext:
     """默认验证 TLS 证书；仅在显式请求时跳过验证。"""
     if skip_tls_verify:
@@ -977,6 +989,15 @@ def _http_request(
                     truncated = True
                 else:
                     truncated = False
+                    # read(amt) 不抛 IncompleteRead：声明长度 > 实际读取且未达上限 → 截断
+                    declared = resp.headers.get("Content-Length")
+                    if declared:
+                        try:
+                            declared_n = int(declared)
+                            if declared_n > len(raw) and len(raw) < (2 << 20):
+                                truncated = True
+                        except ValueError:
+                            pass
                 return HttpResponse(
                     status=resp.status,
                     body=raw.decode("utf-8", errors="replace"),
@@ -1344,6 +1365,9 @@ def _drain_sse_stream(
             "text_delta",
         ):
             first_event_at = time.time()
+            # TTFT 已达标：恢复原始 socket 超时，避免首事件后残余短超时误杀慢流
+            if stream_socket is not None and ttft_deadline is not None:
+                stream_socket.settimeout(original_socket_timeout)
         if ev.get("kind") == "first_chunk":
             event_count += 1
             return
@@ -1415,6 +1439,8 @@ def _drain_sse_stream(
             try:
                 line = next(stream_iter)
             except StopIteration:
+                if not sse_done:
+                    stream_truncated = True  # 连接提前关闭，未收到完成标记
                 break
             if (
                 first_event_at is None
@@ -1597,6 +1623,7 @@ def probe_stream(
             if _is_tls_error(e)
             else ErrorCategory.UNKNOWN.value
         )
+        error_msg = f"异常: {type(e).__name__}: {e}"
 
     elapsed = round(time.time() - start, 3)
     ttft = round(first_event_at - start, 3) if first_event_at else None
@@ -1613,6 +1640,9 @@ def probe_stream(
                 if first_event_at is None
                 else ErrorCategory.NETWORK.value
             )
+        elif is_sse and error_category == ErrorCategory.UNKNOWN.value:
+            # SSE 流遭遇未预期异常（IncompleteRead/RemoteDisconnected 等）→ 归为流不完整
+            error_category = ErrorCategory.STREAM_INCOMPLETE.value
         status = "error"
     elif not is_sse:
         if http_status == 200 and answer_text:
@@ -1629,7 +1659,12 @@ def probe_stream(
             error_msg = f"非 SSE 响应，Content-Type={content_type!r}"
     else:
         # P0：SSE 路径同样使用已计算的宽松 correct（统一 text 和 stream 答案判定）
-        if answer_text:
+        if drain.get("stream_truncated"):
+            # 连接提前断（无 done marker）或缓冲丢弃 → 视为不完整，即使答案已完整也不再判 pass
+            status = "error"
+            error_category = ErrorCategory.STREAM_INCOMPLETE.value
+            error_msg = error_msg or "流式响应不完整"
+        elif answer_text:
             status = "pass" if correct else "fail"
             error_category = (
                 ErrorCategory.NONE.value
@@ -1653,13 +1688,15 @@ def probe_stream(
         "event_count": event_count,
         "text": _sanitize_for_terminal(text[:80]),
         "is_sse": is_sse,
-        "error": _sanitize_for_terminal(error_msg),
+        "error": _sanitize_display(error_msg, p.api_key),
         "error_category": error_category,
-        "raw_preview": _sanitize_for_terminal(
-            raw_preview.decode("utf-8", errors="replace")
-        )
-        if raw_preview
-        else "",
+        "raw_preview": (
+            _sanitize_display(
+                raw_preview.decode("utf-8", errors="replace"), p.api_key
+            )
+            if raw_preview
+            else ""
+        ),
         "usage": usage,
     }
 
@@ -1759,7 +1796,7 @@ def probe_tier(
             "model": tier.model,
             "status": resp.status,
             "elapsed": elapsed,
-            "error": display,
+            "error": _sanitize_display(display, p.api_key),
             "error_category": category.value,
             "answer": "",
             "question": question,
@@ -1887,7 +1924,7 @@ def fetch_models(
             "base_url": p.base_url,
             "status": resp.status,
             "elapsed": elapsed,
-            "error": display,
+            "error": _sanitize_display(display, p.api_key),
             "error_category": category.value,
             "models": [],
         }
@@ -2334,8 +2371,8 @@ def _probe_tools(
             "tool_name_seen": None,
             "http_status": resp.status,
             "error_category": ErrorCategory.PROTOCOL_INCOMPATIBLE.value,
-            "error": classify_error(resp.body, resp.status)[1],
-            "evidence": (resp.body or "")[:200],
+            "error": _sanitize_display(classify_error(resp.body, resp.status)[1], p.api_key),
+            "evidence": _sanitize_display((resp.body or "")[:200], p.api_key),
             "elapsed_seconds": elapsed,
         }
 
@@ -2347,8 +2384,8 @@ def _probe_tools(
             "tool_name_seen": None,
             "http_status": resp.status,
             "error_category": cat.value,
-            "error": disp,
-            "evidence": (resp.body or "")[:200],
+            "error": _sanitize_display(disp, p.api_key),
+            "evidence": _sanitize_display((resp.body or "")[:200], p.api_key),
             "elapsed_seconds": elapsed,
         }
 
@@ -2387,7 +2424,7 @@ def _probe_tools(
         if status == "pass"
         else ErrorCategory.ANSWER_MISMATCH.value,
         "error": None if status == "pass" else f"protocol_support={support}",
-        "evidence": body_s[:240],
+        "evidence": _sanitize_display(body_s[:240], p.api_key),
         "elapsed_seconds": elapsed,
     }
 
@@ -2493,9 +2530,9 @@ def _probe_vision(
             "status": "fail",
             "http_status": resp.status,
             "error_category": ErrorCategory.PROTOCOL_INCOMPATIBLE.value,
-            "error": classify_error(resp.body, resp.status)[1],
+            "error": _sanitize_display(classify_error(resp.body, resp.status)[1], p.api_key),
             "answer": "",
-            "evidence": (resp.body or "")[:200],
+            "evidence": _sanitize_display((resp.body or "")[:200], p.api_key),
             "elapsed_seconds": elapsed,
         }
 
@@ -2505,9 +2542,9 @@ def _probe_vision(
             "status": "error",
             "http_status": resp.status,
             "error_category": cat.value,
-            "error": disp,
+            "error": _sanitize_display(disp, p.api_key),
             "answer": "",
-            "evidence": (resp.body or "")[:200],
+            "evidence": _sanitize_display((resp.body or "")[:200], p.api_key),
             "elapsed_seconds": elapsed,
         }
 
