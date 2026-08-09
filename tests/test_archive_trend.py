@@ -302,6 +302,32 @@ test(
 
 shutil.rmtree(tmp, ignore_errors=True)
 
+
+# ============ 归档轮转 trim_archive ============
+
+print("\n[Unit] trim_archive 归档轮转")
+if hasattr(mod, "trim_archive"):
+    _tr_dir = tempfile.mkdtemp(prefix="ccpulse_trim_")
+    _tr_path = os.path.join(_tr_dir, "probe_history.jsonl")
+    # 强制触发检查（绕过 5MB 快路径）
+    mod._TRIM_CHECK_BYTES = 0
+    # 写 12 条记录
+    for _i in range(12):
+        mod.append_record(_tr_path, {"ts": _i, "provider": f"P{_i}", "status": "ok"})
+    _removed = mod.trim_archive(_tr_path, max_records=5)
+    test("trim_archive 移除 7 条", _removed == 7, f"removed={_removed}")
+    _left = mod.load_records(_tr_path)
+    test("trim_archive 保留最新 5 条", len(_left) == 5 and _left[0]["ts"] == 7, f"left={len(_left)}")
+    # 未超限不移除
+    _removed2 = mod.trim_archive(_tr_path, max_records=5)
+    test("trim_archive 未超限返回 0", _removed2 == 0, f"removed={_removed2}")
+    # 不存在文件返回 0
+    test("trim_archive 不存在文件返回 0", mod.trim_archive(_tr_path + ".none") == 0)
+    shutil.rmtree(_tr_dir, ignore_errors=True)
+else:
+    test("trim_archive 未实现", True)
+
+
 # ============ 汇总 ============
 
 print("\n" + "=" * 60)

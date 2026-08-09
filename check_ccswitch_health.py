@@ -2810,7 +2810,7 @@ def _archive_check_results(args, providers, results) -> None:
     失败不阻断探测：IO 或数据异常全部吞掉。
     """
     try:
-        from ccpulse_archive import append_record, archive_path
+        from ccpulse_archive import append_record, archive_path, trim_archive
 
         path = archive_path(getattr(args, "archive", None))
         now = int(time.time())
@@ -2833,6 +2833,8 @@ def _archive_check_results(args, providers, results) -> None:
                 "error_category": (attempt or {}).get("error_category"),
             }
             append_record(path, record)
+        # 归档轮转：超 5MB 且 >10000 条时保留最新
+        trim_archive(path)
     except Exception as e:  # noqa: BLE001 - 归档失败不影响健康检测
         sys.stderr.write(f"警告: check 结果归档失败: {e}\n")
 

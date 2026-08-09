@@ -69,6 +69,36 @@ def load_records(path: str) -> list[dict]:
     return out
 
 
+# 归档轮转：长期使用防止 JSONL 无限膨胀
+DEFAULT_MAX_RECORDS = 10000
+_TRIM_CHECK_BYTES = 5 * 1024 * 1024  # 文件 < 5MB 跳过检查（快路径，不读）
+
+
+def trim_archive(path: str, max_records: int = DEFAULT_MAX_RECORDS) -> int:
+    """归档超限时保留最新 max_records 条，返回移除条数。
+
+    快路径：文件 < 5MB 直接返回 0（不读不写）。
+    超限时重写文件保留最新记录，避免长期累积膨胀磁盘。
+    """
+    if not os.path.exists(path):
+        return 0
+    try:
+        if os.path.getsize(path) < _TRIM_CHECK_BYTES:
+            return 0
+        recs = load_records(path)
+        if len(recs) <= max_records:
+            return 0
+        keep = recs[-max_records:]
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for r in keep:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+        return len(recs) - len(keep)
+    except OSError:
+        return 0
+
+
 def _percentile(sorted_vals: list[float], p: float) -> float | None:
     """线性插值分位数；p 取 0-100，sorted_vals 需已排序。"""
     if not sorted_vals:
