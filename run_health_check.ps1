@@ -510,24 +510,6 @@ function Invoke-DeepDive {
         Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "inspect"
         $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     }
-        Write-Host ""
-        Write-Host "========================================" -ForegroundColor Cyan
-        Write-Host "  深挖: $($t.provider)  ($($t.type))" -ForegroundColor Cyan
-        Write-Host "  Model: $($t.model)" -ForegroundColor Cyan
-        Write-Host "========================================" -ForegroundColor Cyan
-        $cmdArgs = [System.Collections.Generic.List[string]]::new()
-        $cmdArgs.Add("inspect")
-        $cmdArgs.Add("--provider"); $cmdArgs.Add($t.provider)
-        $cmdArgs.Add("--model"); $cmdArgs.Add($t.model)
-        $cmdArgs.Add("--source"); $cmdArgs.Add("manual")
-        $cmdArgs.Add("--type"); $cmdArgs.Add($t.type)
-        $cmdArgs.Add("--db"); $cmdArgs.Add($DBPath)
-        $cmdArgs.Add("--timeout"); $cmdArgs.Add("30")
-        $cmdArgs.Add("--workers"); $cmdArgs.Add("1")
-        $cmdArgs.Add("--human")
-        Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "inspect"
-        $null = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-    }
 }
 
 # check 完成后的深挖入口：问是否深挖失败/可用供应商。
