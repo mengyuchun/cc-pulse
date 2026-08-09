@@ -863,6 +863,10 @@ def classify_error(resp_body: str, http_status: int = 0) -> tuple:
     # 有明确 status code 时优先用它（body 关键词仅作补充）
     status_cat = _category_from_status(http_status)
     if status_cat is not None:
+        if status_cat == ErrorCategory.RATE_LIMIT:
+            retry = _parse_retry_after(msg)
+            if retry:
+                msg = f"{msg} [{retry}]" if msg else retry
         return status_cat, msg
 
     # 无 status（如流式解析后或 status=200 异常体）：回退到关键词推断
@@ -870,6 +874,9 @@ def classify_error(resp_body: str, http_status: int = 0) -> tuple:
     if any(
         k in low for k in ("rate limit", "rate_limit", "too many requests", "quota")
     ):
+        retry = _parse_retry_after(msg)
+        if retry:
+            msg = f"{msg} [{retry}]" if msg else retry
         return ErrorCategory.RATE_LIMIT, msg
     if any(
         k in low
@@ -912,6 +919,33 @@ def _sanitize_display(text: str, api_key: str | None) -> str:
     if not text:
         return text
     return _sanitize_for_terminal(_sanitize_raw_body(text, api_key or ""))
+
+
+# 限流恢复时间提取：中转站常在 429 响应体里带"重置/恢复/retry-after/XX:XX:XX"等提示
+_RATE_RESET_PATTERNS = [
+    re.compile(r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})"),  # 2026-08-07 23:10:15
+    re.compile(r"(\d{2}:\d{2}:\d{2})"),  # 23:10:15
+    re.compile(r"retry[\s-]*after[:\s]+(\d+)", re.IGNORECASE),  # retry-after: 60
+    re.compile(r"(?:重置|恢复|reset)[^0-9]*?(\d{2}:\d{2}:\d{2})", re.IGNORECASE),
+]
+
+
+def _parse_retry_after(body: str) -> str | None:
+    """从 429 响应体提取限流恢复时间提示，返回可展示文本或 None。"""
+    if not body:
+        return None
+    for pat in _RATE_RESET_PATTERNS:
+        m = pat.search(body)
+        if m:
+            val = m.group(1)
+            # 纯秒数 -> 转成"约 N 分钟后"
+            if val.isdigit() and len(val) <= 6:
+                secs = int(val)
+                if secs >= 60:
+                    return f"约 {secs // 60} 分钟后恢复"
+                return f"约 {secs} 秒后恢复"
+            return f"预计恢复: {val}"
+    return None
 
 
 def create_ssl_context(skip_tls_verify: bool) -> ssl.SSLContext:
@@ -2942,6 +2976,14 @@ def run_health_check(args, providers, say) -> int:
             say(
                 f'  ✅ {r["name"][:24]:24} 档位:{bt:8} {a["model"]:28} {a["elapsed"]}s 回答:"{a["answer"]}"'
             )
+
+    # 健康供应商推荐：只读不改库，输出可消费的切换提示
+    if ok and fail:
+        say("\n💡 推荐切换到健康供应商（只读提示，不会自动改库）:")
+        rec = min(ok, key=lambda x: next(a["elapsed"] for a in x["attempts"] if a["tier"] == x["best_tier"]))
+        rec_a = next(a for a in rec["attempts"] if a["tier"] == rec["best_tier"])
+        say(f"  首选: {rec['name']}（{rec['best_tier']} 档位 {rec_a['model']}，{rec_a['elapsed']}s）")
+        say(f"  → 在 cc-switch 切换到「{rec['name']}」即可")
 
     # JSON 模式：最后输出结构化报告到 stdout
     if getattr(args, "json", False):

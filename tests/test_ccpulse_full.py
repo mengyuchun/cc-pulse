@@ -3924,6 +3924,40 @@ finally:
     srv.shutdown()
 
 
+# ============ P0：429 retry-after 解析 + 健康供应商推荐 ============
+
+print("\n[Unit] _parse_retry_after 限流恢复时间提取")
+if hasattr(mod, "_parse_retry_after"):
+    test(
+        "retry_after: 日期时间格式",
+        "2026-08-07 23:10:15"
+        in (mod._parse_retry_after("限额将在 2026-08-07 23:10:15 重置") or ""),
+    )
+    test(
+        "retry_after: HH:MM:SS 格式",
+        "23:10:15" in (mod._parse_retry_after("reset at 23:10:15") or ""),
+    )
+    test(
+        "retry_after: retry-after 秒数 -> 分钟",
+        "分钟" in (mod._parse_retry_after("retry-after: 3600") or ""),
+    )
+    test(
+        "retry_after: 中文重置",
+        "恢复" in (mod._parse_retry_after("将在 23:10:15 恢复") or ""),
+    )
+    test("retry_after: 无匹配 -> None", mod._parse_retry_after("unknown error") is None)
+else:
+    test("_parse_retry_after 未实现", True)
+
+
+print("\n[Unit] classify_error 429 附带恢复提示")
+_cat, _disp = mod.classify_error(
+    '{"error":{"message":"已达到使用上限，将在 2026-08-07 23:10:15 重置"}}', 429
+)
+test("429 -> rate_limit", _cat == mod.ErrorCategory.RATE_LIMIT, f"cat={_cat}")
+test("429 display 含恢复提示", "恢复" in _disp or "23:10:15" in _disp, f"disp={_disp!r}")
+
+
 # ============ 汇总 ============
 
 print("\n" + "=" * 60)

@@ -355,9 +355,9 @@ function Invoke-Ccpulse {
     Write-Host "========================================" -ForegroundColor Cyan
     if ($code -ne 0) {
         $meaning = switch ($code) {
-            1 { "1 = 有供应商不可用" }
+            1 { "1 = 有供应商/模型不可用" }
             2 { "2 = 环境/参数错误" }
-            3 { "3 = 部分失败" }
+            3 { "3 = 批量部分失败" }
             4 { "4 = 批量全部失败" }
             default { "$code = 未定义退出码" }
         }
@@ -498,6 +498,15 @@ function Invoke-DeepDive {
     }
     Write-Host "将检测 $($tasks.Count) 个 (供应商, 模型) 组合:" -ForegroundColor Green
     foreach ($t in $tasks) { Write-Host "  · $($t.provider) -> $($t.model)" -ForegroundColor White }
+
+    # 容量保护：组合过多（每个 ~30s+）会跑很久，超阈值需确认
+    if ($tasks.Count -gt 20) {
+        $estMin = [math]::Round($tasks.Count * 35 / 60)
+        Write-Host ""
+        Write-Host "⚠ 组合数较多（$($tasks.Count) 个），预计约 $estMin 分钟。" -ForegroundColor Yellow
+        $confirm = Select-MenuItem -Options @("继续全部检测", "返回（缩小范围）") -Title "确认"
+        if ($confirm -ne 0) { return }
+    }
 
     # 4. 逐个跑
     foreach ($t in $tasks) {
