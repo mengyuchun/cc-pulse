@@ -128,8 +128,7 @@ function Show-ArrowSelect {
                 if ($Multi) {
                     $sel = @()
                     for ($i = 0; $i -lt $n; $i++) { if ($checked[$i]) { $sel += $i } }
-                    if ($sel.Count -eq 0) { $sel = @($cursor) }
-                    return $sel
+                    return $sel  # 无空格选中项时返回空数组，调用方按「全选/默认」处理
                 }
                 return @($cursor)
             }
@@ -158,7 +157,7 @@ function Select-FromList {
     if ($Options.Count -eq 0) { return @() }
 
     if (-not [Console]::IsInputRedirected) {
-        $selIdx = Show-ArrowSelect -Options $Options -Multi -Title $Title
+        $selIdx = @(Show-ArrowSelect -Options $Options -Multi -Title $Title)
         if ($null -eq $selIdx) { return $null }
         if ($selIdx.Count -eq 0) {
             return @(if ($DefaultAll) { $Options } else { @($Options[0]) })
@@ -203,7 +202,7 @@ function Select-MenuItem {
     if ($Options.Count -eq 0) { return -1 }
 
     if (-not [Console]::IsInputRedirected) {
-        $selIdx = Show-ArrowSelect -Options $Options -Title $Title
+        $selIdx = @(Show-ArrowSelect -Options $Options -Title $Title)
         if ($null -eq $selIdx -or $selIdx.Count -eq 0) { return -1 }
         return $selIdx[0]
     }
@@ -312,9 +311,17 @@ function Apply-AdvancedArgs {
             $CmdArgs.Add("--probe-context"); $CmdArgs.Add($script:AdvProbeContext)
         }
         if ($script:AdvVision) {
-            # 在默认 include 基础上追加 vision（CLI 默认不含 vision）
-            $CmdArgs.Add("--include")
-            $CmdArgs.Add("text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools,vision")
+            # vision 追加到已有 --include（自定义维度），否则用全量+vision
+            $incIdx = $CmdArgs.IndexOf("--include")
+            if ($incIdx -ge 0 -and $incIdx + 1 -lt $CmdArgs.Count) {
+                $base = [string]$CmdArgs[$incIdx + 1]
+                if ($base -notmatch '(^|,)vision($|,)') {
+                    $CmdArgs[$incIdx + 1] = $base.TrimEnd(',') + ",vision"
+                }
+            } else {
+                $CmdArgs.Add("--include")
+                $CmdArgs.Add("text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools,vision")
+            }
         }
     }
     # --user-agent 所有子命令都支持
@@ -769,7 +776,7 @@ function Menu-Inspect {
             $idx = Select-MenuItem -Options $tierOptions -Title "选择档位（从每家配置中取对应模型）"
             if ($idx -lt 0) { $null } else { @($idx) }
         } else {
-            Show-ArrowSelect -Options $tierOptions -Multi -Title "选择档位（从每家配置中取对应模型）"
+            @(Show-ArrowSelect -Options $tierOptions -Multi -Title "选择档位（从每家配置中取对应模型）")
         }
         if ($null -eq $tierIdxs) { return 1 }
         $tierMap = @("haiku", "sonnet", "opus", "fable", "default")
@@ -906,7 +913,7 @@ function Menu-Inspect {
             $idx = Select-MenuItem -Options $dimOptions -Title "检测维度（默认全选）"
             if ($idx -lt 0) { $null } elseif ($null -eq $script:LastInput -or [string]::IsNullOrWhiteSpace($script:LastInput)) { @() } else { @($idx) }
         } else {
-            Show-ArrowSelect -Options $dimOptions -Multi -Title "检测维度（全选=直接回车，单独选用空格）"
+            @(Show-ArrowSelect -Options $dimOptions -Multi -Title "检测维度（全选=直接回车，单独选用空格）")
         }
         if ($null -eq $dimIdxs) { return 1 }
         $dimMap = @("text", "streaming", "model-consistency", "metadata", "thinking", "tools", "vision")
