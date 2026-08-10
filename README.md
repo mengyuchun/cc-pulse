@@ -214,6 +214,8 @@ python check_ccswitch_health.py inspect \
 | 看跨天是否有降级趋势 | `just trend` | 读本地探测归档，按天聚合成功率 / 延迟 / 错误分类 |
 | 实时盯着 cc-switch 日志 | `just watch` | 每 3 秒轮询，有新日志就打印，Ctrl+C 结束 |
 | 多维交叉聚合分析 | `just analyze` | 按天 / 模型 / 供应商×日期矩阵，自带 sparkline |
+| check 后批量深挖失败/可用供应商 | `deep-dive` | 读 check JSON 逐个 inspect，CI 可串联 |
+| cron 定时巡检 + 可用率告警 | `check --alert-threshold` | 低于阈值输出告警，cron 可据此触发 |
 
 ### `check` —— 日常健康检测
 
@@ -259,6 +261,8 @@ python check_ccswitch_health.py check --failover-only --json  # 机器可读
 | `--skip-tls-verify` | ⚠️ 跳过 TLS 证书验证 | 关 |
 | `--with-history` | 每个供应商后附加近 24h 日志摘要 | 关 |
 | `--history-since` | 历史摘要时间窗 | `24h` |
+| `--alert-threshold 0.8` | 可用率低于阈值（0-1）输出告警，cron 巡检可据此触发 | 关 |
+| `--archive PATH` | 探测归档文件路径（默认 `~/.cc-pulse/probe_history.jsonl`，超 5MB/万条自动轮转） | 默认 |
 
 ### `list-models` —— 拉取模型目录
 
@@ -276,6 +280,29 @@ python check_ccswitch_health.py list-models --failover-only --deep --source both
 `check` 和 `list-models` 可加 `--select`，以纯标准库的跨平台键盘选择器多选供应商：↑↓ 移动、空格切换、`a` 全选/取消全选、回车确认、Esc 取消。CLI 选择器**不支持鼠标**。`inspect` 请用 `--provider` 指定目标供应商。
 
 它只在 stdin 和 stdout 都是 TTY 时启用；管道、CI 等非交互环境会跳过选择器，应改用 `--provider` 明确筛选。
+
+### `deep-dive` —— check 后批量深挖（CI 可串联）
+
+读 check 的 JSON 结果，按 `--target fail|ok|both` 过滤供应商，去重模型，逐个调 `inspect`。下沉自 PS1 的深挖流程，让 CI / 脚本能串联 `check --json | deep-dive`，不必走交互菜单。
+
+```bash
+# 与 PS1 交互等价的 CLI 串联
+python check_ccswitch_health.py check --failover-only --json > check.json
+python check_ccswitch_health.py deep-dive --from check.json --target fail
+# 直接管道（stdin 读 check JSON）
+python check_ccswitch_health.py check --failover-only --json | \
+  python check_ccswitch_health.py deep-dive --from - --target both --yes
+# 只看会跑哪些组合（dry-run，不执行）
+python check_ccswitch_health.py deep-dive --from check.json --target both --json
+```
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--from PATH\|-` | check JSON 文件路径，或 `-` 读 stdin | 必填 |
+| `--target fail\|ok\|both` | 深挖失败 / 可用 / 全部供应商 | `fail` |
+| `--models m1,m2` | 指定模型（逗号分隔，默认全部去重） | 全部 |
+| `--yes` | 组合 >20 时跳过确认 | 关 |
+| `--json` | 只输出任务列表 JSON，不执行 | 关 |
 
 ### `health` —— 被动健康度
 
@@ -390,7 +417,9 @@ python check_ccswitch_health.py trend --archive ~/my_history.jsonl
 python check_ccswitch_health.py trend --since 7d --json
 ```
 
-`check`/`inspect` 可用 `--archive PATH` 覆盖归档路径，便于按项目/机器隔离历史。
+`check`/`inspect` 可用 `--archive PATH` 覆盖归档路径，便于按项目/机器隔离历史。归档超 5MB 且 >10000 条时自动轮转保留最新（`trim_archive`），防长期膨胀。
+
+trend 输出带趋势方向标记：成功率按天首尾对比，`↑` 上升 / `↓` 下降 / `→` 稳定，一眼看降级。
 
 | 参数 | 说明 | 默认 |
 |------|------|------|

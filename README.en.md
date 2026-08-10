@@ -213,6 +213,8 @@ python check_ccswitch_health.py inspect \
 | Cross-day degradation trend | `just trend` | Read local probe archive, aggregate by day |
 | Watch cc-switch logs live | `just watch` | Poll every 3s, prints new entries, Ctrl+C to stop |
 | Multi-dimensional aggregation | `just analyze` | By day / model / provider×day matrix with sparklines |
+| Batch deep-dive after check | `deep-dive` | Read check JSON, inspect each; CI-pipeable |
+| Scheduled patrol + alert | `check --alert-threshold` | Warns when availability below threshold; cron-friendly |
 
 ### `check` — daily health check
 
@@ -282,6 +284,26 @@ Reads cc-switch's `provider_health` table for health state, consecutive failures
 python check_ccswitch_health.py health
 python check_ccswitch_health.py health --json
 ```
+
+### `deep-dive` - batch deep-dive after check (CI-pipeable)
+
+Reads check's JSON output, filters providers by `--target fail|ok|both`, deduplicates models, and inspects each. The CLI counterpart of the PS1 deep-dive flow, so CI / scripts can chain `check --json | deep-dive` without an interactive menu.
+
+```bash
+python check_ccswitch_health.py check --failover-only --json > check.json
+python check_ccswitch_health.py deep-dive --from check.json --target fail
+python check_ccswitch_health.py check --failover-only --json | \
+  python check_ccswitch_health.py deep-dive --from - --target both --yes
+python check_ccswitch_health.py deep-dive --from check.json --target both --json  # dry-run
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--from PATH\|-` | check JSON path, or `-` for stdin | required |
+| `--target fail\|ok\|both` | Which providers to deep-dive | `fail` |
+| `--models m1,m2` | Specific models (default: all deduped) | all |
+| `--yes` | Skip confirmation when >20 combos | off |
+| `--json` | Output task list JSON, no execution | off |
 
 ### `history` / `stats` / `routing` / `watch` — read-only cc-switch runtime logs
 
