@@ -402,7 +402,10 @@ function Invoke-CcpulseJson {
             $errTask = $proc.StandardError.ReadLineAsync()
         }
     }
-    # 进程退出后清空管道残留的 stderr 行
+    # 进程退出后清空管道残留的 stderr 行：等待最后一个 async 读完成再 drain（修退出竞态丢尾行）
+    if (-not $errTask.IsCompleted) {
+        try { $errTask.Wait(500) | Out-Null } catch { }
+    }
     $rest = if ($errTask.IsCompleted) { $errTask.Result } else { $null }
     while ($null -ne $rest) { Write-Host $rest; $rest = $proc.StandardError.ReadLine() }
     $jsonText = $outTask.Result
