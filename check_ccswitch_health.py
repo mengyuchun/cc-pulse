@@ -3588,13 +3588,13 @@ def _run_inspect_compare(args, providers, say) -> int:
     else:
         print(json.dumps(out, ensure_ascii=False, indent=2), flush=True)
 
-    # 退出码：全 healthy → 0；部分 → 3；全失败 → 4
+    # 退出码：全 healthy → 0；部分 → 1；全失败 → 3
     ok = sum(1 for r in rows if r["verdict"] in ("healthy", "skipped"))
     if ok == len(rows):
         return 0
     if ok > 0:
-        return 3
-    return 4
+        return 1
+    return 3
 
 
 def _format_compare_human(rows: list) -> str:
@@ -4114,12 +4114,12 @@ def _run_inspect_all(args, providers, say) -> int:
             v = (r.get("summary") or {}).get("verdict", "error")
             m = r.get("model", "?")
             print(f"{i:>3}  {m[:40]:<42}  {v}")
-    # 退出码粒度：0 全成功 / 3 部分失败 / 4 全部失败（仅批量模式）
+    # 退出码粒度：0 全成功 / 1 部分失败 / 3 全部失败（仅批量模式）
     if fail_count == 0:
         return 0
     if fail_count < len(models):
-        return 3  # 部分失败
-    return 4  # 全部失败
+        return 1  # 部分失败
+    return 3  # 全部失败
 
 
 def format_inspect_human(r: dict) -> str:

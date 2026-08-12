@@ -2136,7 +2136,7 @@ finally:
     srv.shutdown()
 
 
-print("\n[End-to-end] inspect --quiet + 退出码 0/3/4")
+print("\n[End-to-end] inspect --quiet + 退出码 0/1/3")
 # 1) 全成功：2 个配置档位都健康 → exit 0；--quiet 时 stderr 无进度
 srv, port = start_server(MockAnthropicHandler)
 try:
@@ -2182,7 +2182,7 @@ finally:
     srv.shutdown()
 
 
-# 2) 真正的 exit 4：用 401 handler 让所有模型都 fail
+# 2) 真正的 exit 3：用 401 handler 让所有模型都 fail
 class AuthFailHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -2215,14 +2215,14 @@ try:
         ],
         timeout=30,
     )
-    test("quiet 全部 401 → exit 4", rc == 4, f"rc={rc} out={out[:200]} err={err[:150]}")
+    test("quiet 全部 401 → exit 3", rc == 3, f"rc={rc} out={out[:200]} err={err[:150]}")
     lines = [ln for ln in out.strip().splitlines() if ln.strip()]
     test("quiet all-fail 仍输出 NDJSON", len(lines) >= 1, f"n={len(lines)}")
 finally:
     srv.shutdown()
 
 
-# 3) 部分失败 exit 3：sonnet 通、haiku 401
+# 3) 部分失败 exit 1：sonnet 通、haiku 401
 class PartialFailHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -2279,7 +2279,7 @@ try:
         ],
         timeout=30,
     )
-    test("quiet 部分失败 exit 3", rc == 3, f"rc={rc} out={out[:300]} err={err[:150]}")
+    test("quiet 部分失败 exit 1", rc == 1, f"rc={rc} out={out[:300]} err={err[:150]}")
     lines = [ln for ln in out.strip().splitlines() if ln.strip()]
     test("quiet 部分失败 NDJSON 2 行", len(lines) == 2, f"n={len(lines)}")
 finally:

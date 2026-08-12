@@ -94,8 +94,8 @@ def run_pwsh(stdin_text, timeout=30):
 write_fake_db()
 
 
-print("\n[PS1] 主菜单 - 退出选项 7")
-rc, out, err = run_pwsh("7\n")
+print("\n[PS1] 主菜单 - 退出选项 5")
+rc, out, err = run_pwsh("5\n")
 test("退出码 == 0", rc == 0, f"rc={rc} stderr={err[:200]}")
 test("输出含主菜单标题", "CC-Pulse" in out or "CC-Pulse" in err)
 test("输出含 inspect 入口", "深度诊断" in (out + err) or "inspect" in (out + err))
@@ -103,9 +103,9 @@ test("输出含高级设置入口", "高级设置" in (out + err))
 test("输出含退出提示", "退出" in (out + err))
 
 
-print("\n[PS1] 健康检测 · 快速体检 - 选项 1（零子提示）")
-# 主菜单 1 -> 体检后选择“不深挖” -> 7 退出
-rc, out, err = run_pwsh("1\n4\n7\n", timeout=120)
+print("\n[PS1] 体检 · 快速 - 选项 1 -> 子菜单 1")
+# 主菜单 1(体检) -> 子菜单 1(快速) -> 深挖选"不深挖"(4) -> 5 退出
+rc, out, err = run_pwsh("1\n1\n4\n5\n", timeout=120)
 test("退出码 0 或 1", rc in (0, 1), f"rc={rc}")
 combined = out + err
 test("输出含 '健康检测'", "健康检测" in combined)
@@ -120,14 +120,15 @@ test(
 test("快速体检带 --failover-only", "--failover-only" in combined)
 
 
-print("\n[PS1] 健康检测 · 自定义 - 选项 2 -> 当前激活供应商")
-# 主菜单 2 -> type 默认 -> range 3 (当前激活) -> 深挖选“不深挖” -> 7 退出
+print("\n[PS1] 体检 · 自定义 - 选项 1 -> 子菜单 2 -> 当前激活供应商")
+# 主菜单 1(体检) -> 子菜单 2(自定义) -> type 默认 -> range 3(当前激活) -> 深挖选"不深挖"(4) -> 5 退出
 stdin_text = (
-    "2\n"  # 主菜单: 健康检测 · 自定义
+    "1\n"  # 主菜单: 体检
+    "2\n"  # 子菜单: 自定义
     "\n"  # type: 默认 claude
     "3\n"  # 范围: 3 (当前激活)
     "4\n"  # 深挖选择：不深挖
-    "7\n"  # 退出
+    "5\n"  # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=120)
 combined = out + err
@@ -135,25 +136,26 @@ test("自定义当前供应商检测 exit 0/1", rc in (0, 1), f"rc={rc}")
 test("输出含 '--current-only'", "--current-only" in combined)
 
 
-print("\n[PS1] 拉模型列表 - 选项 3 -> 默认 claude/队列/只拉列表")
-# 主菜单3 -> type默认 -> scope默认(1) -> probeMode默认(1) -> 返回 -> 7退出
+print("\n[PS1] 拉模型列表 - 选项 2 -> 子菜单 1 -> 默认 claude/队列/只拉列表")
+# 主菜单 2(深度诊断) -> 子菜单 1(拉模型) -> type默认 -> scope默认(1) -> probeMode默认(1) -> 返回 -> 5退出
 # 新交互：每个 Select-MenuItem 降级走 Read-Host，空行=默认第一项
-rc, out, err = run_pwsh("3\n\n\n\n\n7\n", timeout=120)
+rc, out, err = run_pwsh("2\n1\n\n\n\n\n5\n", timeout=120)
 test("退出码 0 或 1", rc in (0, 1), f"rc={rc}")
 combined = out + err
 test("输出含 '拉模型' 标识", "拉模型" in combined or "list-models" in combined)
 
 
-print("\n[PS1] inspect - 选项 4 -> 精简 3 步交互（箭头选择降级为数字输入）")
-# 主菜单4 -> type默认(1) -> provider序号1 -> 模式默认(1) -> model序号1 -> 回车返回 -> 7退出
+print("\n[PS1] inspect - 选项 2 -> 子菜单 2 -> 精简 3 步交互（箭头选择降级为数字输入）")
+# 主菜单 2(深度诊断) -> 子菜单 2(inspect) -> type默认(1) -> provider序号1 -> 模式默认(1) -> model序号1 -> 回车返回 -> 5退出
 stdin_text = (
-    "4\n"  # 主菜单: inspect
+    "2\n"  # 主菜单: 深度诊断
+    "2\n"  # 子菜单: inspect
     "\n"  # type: 默认 claude
     "1\n"  # provider: 序号 1 (Mock-Provider)
     "\n"  # 检测模式: 默认 1 (单一模型)
     "1\n"  # model: 序号 1 (claude-haiku-4-5)
     "\n"  # 返回主菜单
-    "7\n"  # 退出
+    "5\n"  # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=180)
 combined = out + err
@@ -173,9 +175,9 @@ test(
 )
 
 
-print("\n[PS1] 高级设置 - 选项 6")
-# 新编号菜单：进入后直接 q 返回主菜单 -> 7 退出
-rc, out, err = run_pwsh("6\nq\n7\n", timeout=60)
+print("\n[PS1] 高级设置 - 选项 4")
+# 新编号菜单：进入后直接 q 返回主菜单 -> 5 退出
+rc, out, err = run_pwsh("4\nq\n5\n", timeout=60)
 combined = out + err
 test("退出码 0", rc == 0, f"rc={rc}")
 test("输出含 '高级设置'", "高级设置" in combined)
@@ -185,15 +187,16 @@ test("显示 vision 设置", "vision" in combined.lower())
 
 
 print("\n[PS1] 高级设置端到端：开启 JSON 后快速体检输出 JSON")
-# 新交互：[6]主菜单 -> 1(JSON项) -> y 开 -> 10/返主菜单 -> [1] 快速体检 -> 回车返回 -> [7] 退出
+# [4]高级设置 -> 1(JSON项) -> y 开 -> 10/返主菜单 -> [1]体检 -> [1]快速 -> 不深挖(4) -> [5]退出
 stdin_text = (
-    "6\n"  # 主菜单: 高级设置
+    "4\n"  # 主菜单: 高级设置
     "1\n"  # 选第 1 项: JSON
     "y\n"  # JSON: 开
     "10\n"  # 返回主菜单（末项）
-    "1\n"  # 主菜单: 快速体检
+    "1\n"  # 主菜单: 体检
+    "1\n"  # 子菜单: 快速
     "4\n"  # 深挖选择：不深挖
-    "7\n"  # 退出
+    "5\n"  # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=120)
 combined = out + err
@@ -203,22 +206,23 @@ test("stdout 含 JSON 报告", '"schema_version"' in combined or '"providers"' i
 
 
 print("\n[PS1] 高级设置：上下文档位 1m + vision 后 inspect 带参")
-# [6] -> 5(上下文档位,选1m) -> 6(vision) y -> 10 返主菜单
-#        -> [4] inspect: type默认 -> provider序号1 -> 模式默认 -> model序号1 -> 返回 -> [7] 退出
+# [4]高级设置 -> 5(上下文档位,选1m) -> 6(vision) y -> 10 返主菜单
+#        -> [1]体检 -> [2]inspect: type默认 -> provider序号1 -> 模式默认 -> model序号1 -> 返回 -> [5]退出
 stdin_text = (
-    "6\n"  # 主菜单: 高级设置
+    "4\n"  # 主菜单: 高级设置
     "5\n"  # 第 5 项: 上下文档位
     "2\n"  # 上下文档位选择: 2 = 1m
     "6\n"  # 第 6 项: vision
     "y\n"  # vision: 开
     "10\n"  # 返回主菜单（末项）
-    "4\n"  # inspect
+    "2\n"  # 主菜单: 深度诊断
+    "2\n"  # 子菜单: inspect
     "\n"  # type 默认 claude
     "1\n"  # provider: 序号 1 (Mock-Provider)
     "\n"  # 检测模式: 默认 1 (单一模型)
     "1\n"  # model: 序号 1 (claude-haiku-4-5)
     "\n"  # 返回主菜单
-    "7\n"
+    "5\n"
 )
 rc, out, err = run_pwsh(stdin_text, timeout=180)
 combined = out + err
@@ -235,9 +239,9 @@ test(
 )
 
 
-print("\n[PS1] 运行日志入口 - 选项 5")
-# 主菜单5 -> 日志菜单选7(返回主菜单) -> 主菜单7退出
-rc, out, err = run_pwsh("5\n7\n7\n", timeout=60)
+print("\n[PS1] 运行日志入口 - 选项 3")
+# 主菜单 3(运行日志) -> 日志菜单选 7(返回主菜单) -> 主菜单 5 退出
+rc, out, err = run_pwsh("3\n7\n5\n", timeout=60)
 combined = out + err
 test(
     "运行日志菜单可见",
@@ -246,17 +250,17 @@ test(
 test("运行日志菜单可返回", rc == 0, f"rc={rc}")
 
 
-print("\n[PS1] 退出选项 7（直接退出）")
-rc, out, err = run_pwsh("7\n")
+print("\n[PS1] 退出选项 5（直接退出）")
+rc, out, err = run_pwsh("5\n")
 test("退出码 0", rc == 0, f"rc={rc}")
 
 
 print("\n[PS1] 错误输入 -> 默认首项 -> 退出")
 # 主菜单输入非法 "9"：降级 Select-MenuItem 返回 -2（字面），主菜单 default continue 重绘；
 # 再给空行(默认0=快速体检) 会跑检测。改用直接 7 退出验证主菜单容错。
-rc, out, err = run_pwsh("9\n7\n", timeout=60)
+rc, out, err = run_pwsh("9\n5\n", timeout=60)
 combined = out + err
-test("退出码 0（最终选 7 退出）", rc == 0, f"rc={rc}")
+test("退出码 0（最终选 5 退出）", rc == 0, f"rc={rc}")
 
 
 print("\n[PS1] 菜单失败返回主菜单不崩溃")
@@ -265,7 +269,7 @@ missing_db = db_path + ".missing"
 original_db = db_path
 try:
     db_path = missing_db
-    rc, out, err = run_pwsh("1\n\n7\n")
+    rc, out, err = run_pwsh("1\n1\n\n5\n")
 finally:
     db_path = original_db
 combined = out + err
@@ -279,7 +283,7 @@ sqlite3.connect(empty_db).close()
 original_db = db_path
 try:
     db_path = empty_db
-    rc, out, err = run_pwsh("4\n\n\n\n7\n")
+    rc, out, err = run_pwsh("2\n2\n\n\n\n5\n")
 finally:
     db_path = original_db
 combined = out + err
@@ -290,8 +294,8 @@ sqlite3.connect(empty_db).close()
 original_db = db_path
 try:
     db_path = empty_db
-    # 主菜单5(日志) -> 1(历史) -> again回车(默认2返回) -> 主菜单7退出
-    rc, out, err = run_pwsh("5\n1\n\n7\n", timeout=60)
+    # 主菜单 3(运行日志) -> 1(历史) -> again回车(默认返回) -> 主菜单 5 退出
+    rc, out, err = run_pwsh("3\n1\n\n5\n", timeout=60)
 finally:
     db_path = original_db
 combined = out + err

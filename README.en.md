@@ -560,13 +560,13 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 
 | Code | Meaning |
 |------|---------|
-| 0 | Healthy (`check` has at least one usable provider / `inspect` healthy or skipped / `list-models` finished) |
-| 1 | All health checks failed / `inspect` unusable / wrong answer |
-| 2 | DB missing, no matching providers, or resolve failed (`inspect` target not found) |
-| 3 | `inspect --all-models` / `--models` / `--compare` **batch/compare: partial failure** |
-| 4 | `inspect --all-models` / `--models` / `--compare` **batch/compare: all failed** |
+| 0 | Success (`check` has at least one usable provider / `inspect` healthy or skipped / `list-models` finished) |
+| 1 | Partial failure (`check` found unusable providers / `inspect` some models failed / wrong answer) |
+| 2 | Environment / parameter error (DB missing, no matching providers, resolve failed) |
+| 3 | All failed (`inspect` all models failed) |
+| 4 | User cancelled (PS1 launcher ESC) |
 
-> Batch/compare mode uses 3/4 for finer granularity so CI and `&&` chains can branch. Pair with `--quiet` for pure NDJSON output — one JSON object per model on stdout, all progress messages silenced.
+> Batch/compare mode uses 1/3 for finer granularity so CI and `&&` chains can branch. Pair with `--quiet` for pure NDJSON output — one JSON object per model on stdout, all progress messages silenced.
 
 ---
 
@@ -575,13 +575,11 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 `run_health_check.ps1` provides an interactive menu — double-click, no flags required (PowerShell 7+):
 
 ```
-[1] Health check · quick       one-click (claude / queue)
-[2] Health check · custom      choose type / scope / providers
-[3] List models                GET /v1/models catalog
-[4] Deep diagnostics (inspect) single (provider, model) diagnosis
-[5] Runtime logs               fails / stats / routing / watch
-[6] Advanced settings          JSON / stealth / thinking / UA / type / scope
-[7] Exit
+[1] Health check          quick / custom, deep-dive after check
+[2] Deep diagnostics      list models / inspect
+[3] Runtime logs          fails / stats / routing / watch
+[4] Advanced settings     JSON / stealth / thinking / UA
+[5] Exit
 ```
 
 ### Menu paths

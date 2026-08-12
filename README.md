@@ -472,7 +472,7 @@ python check_ccswitch_health.py inspect \
 | `--max-retries N` | 429 重试次数 | `1` |
 | `--format human\|json` | 输出格式 | `json` |
 | `--human` | 人类可读输出（默认 JSON） | 关 |
-| `--quiet` | 批量静默 NDJSON + 退出码 0/3/4 | 关 |
+| `--quiet` | 批量静默 NDJSON + 退出码 0/1/3 | 关 |
 
 **`--include` 检查项**：
 
@@ -575,13 +575,13 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 
 | 码 | 含义 |
 |---|---|
-| 0 | 全部健康（`check` 至少一个供应商可用 / `inspect` healthy 或 skipped / `list-models` 完成） |
-| 1 | 健康检查全部失败 / `inspect` 不可用 / 答案错误 |
-| 2 | 数据库不存在、没有符合条件供应商、resolve 失败（inspect 找不到目标） |
-| 3 | `inspect --all-models` / `--models` / `--compare` **批量/对比：部分失败** |
-| 4 | `inspect --all-models` / `--models` / `--compare` **批量/对比：全部失败** |
+| 0 | 全部成功（`check` 至少一个供应商可用 / `inspect` healthy 或 skipped / `list-models` 完成） |
+| 1 | 部分失败（`check` 有供应商不可用 / `inspect` 部分模型失败 / 答案错误） |
+| 2 | 环境/参数错误（数据库不存在、没有符合条件供应商、resolve 失败） |
+| 3 | 全部失败（`inspect` 所有模型失败） |
+| 4 | 用户取消（PS1 启动器 ESC 取消） |
 
-> 批量/对比模式用 3/4 区分粒度，方便 CI 与 `&&` 链判断。配 `--quiet` 输出纯 NDJSON，每模型一行 JSON 到 stdout，关闭所有进度提示。
+> 批量/对比模式用 1/3 区分粒度，方便 CI 与 `&&` 链判断。配 `--quiet` 输出纯 NDJSON，每模型一行 JSON 到 stdout，关闭所有进度提示。
 
 ---
 
@@ -590,13 +590,11 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 `run_health_check.ps1` 提供交互式菜单，双击即可，无需记参数（需要 PowerShell 7+）：
 
 ```
-[1] 健康检测 · 快速体检   一键（claude/队列）
-[2] 健康检测 · 自定义     选类型/范围/供应商
-[3] 拉模型列表            GET /v1/models 目录
-[4] 深度诊断 (inspect)    单一 (provider, model) 诊断
-[5] 运行日志              失败/统计/路由/实时监控
-[6] 高级设置              JSON/stealth/thinking/UA/类型/范围
-[7] 退出
+[1] 体检              快速/自定义，检测完可深挖
+[2] 深度诊断          拉模型列表/inspect
+[3] 运行日志          失败/统计/路由/实时监控
+[4] 高级设置          JSON/stealth/thinking/UA
+[5] 退出
 ```
 
 ### 菜单路径

@@ -355,10 +355,9 @@ function Invoke-Ccpulse {
     Write-Host "========================================" -ForegroundColor Cyan
     if ($code -ne 0) {
         $meaning = switch ($code) {
-            1 { "1 = 有供应商/模型不可用" }
+            1 { "1 = 部分失败（有供应商/模型不可用）" }
             2 { "2 = 环境/参数错误" }
-            3 { "3 = 批量部分失败" }
-            4 { "4 = 批量全部失败" }
+            3 { "3 = 全部失败" }
             default { "$code = 未定义退出码" }
         }
         Write-Host "释义: $meaning" -ForegroundColor Yellow
@@ -688,6 +687,17 @@ function Menu-HealthCheckCustom {
         if ($again -eq 1) { return (Menu-HealthCheckCustom) }
     }
     return $res.Code
+}
+
+# ── 体检入口（合并快速体检/自定义） ───────────────────────────────────
+function Menu-HealthCheck {
+    $mode = Select-MenuItem -Options @(
+        "快速体检  用高级设置（$($script:AdvType)/$($script:AdvScope)）一键跑"
+        "自定义     选类型/范围"
+    ) -Title "体检模式"
+    if ($mode -lt 0) { return 1 }
+    if ($mode -eq 0) { return Menu-HealthCheckQuick }
+    return Menu-HealthCheckCustom
 }
 
 # ── [3] 拉模型列表 ──────────────────────────────────────────────
@@ -1072,6 +1082,17 @@ function Menu-Inspect {
     return $code
 }
 
+# ── 深度诊断入口（合并拉模型/inspect） ───────────────────────────────────
+function Menu-DeepDiag {
+    $mode = Select-MenuItem -Options @(
+        "拉模型列表  GET /v1/models 目录"
+        "深度诊断    inspect 单一/多/对比 (provider, model)"
+    ) -Title "深度诊断"
+    if ($mode -lt 0) { return 1 }
+    if ($mode -eq 0) { return Menu-ListModels }
+    return Menu-Inspect
+}
+
 # ── [5] 运行日志（只读 cc-switch 历史） ──────────────────────────
 function Menu-Logs {
     if (-not (Show-Banner "运行日志 · 只读 cc-switch proxy 日志")) {
@@ -1204,12 +1225,10 @@ function Show-MainMenu {
         return -1
     }
     $menuOptions = @(
-        "健康检测 · 快速体检   一键检测，完成后可深挖"
-        "健康检测 · 自定义     选类型/范围"
-        "拉模型列表            GET /v1/models 目录"
-        "深度诊断 (inspect)    单一 (provider, model)"
-        "运行日志              失败/统计/路由/实时监控"
-        "高级设置              JSON/stealth/thinking/UA/类型/范围"
+        "体检              快速/自定义，检测完可深挖"
+        "深度诊断          拉模型列表/inspect"
+        "运行日志          失败/统计/路由/实时监控"
+        "高级设置          JSON/stealth/thinking/UA"
         "退出"
     )
     Write-Host "一键检查 AI 模型服务是否正常 —— 回车开始体检" -ForegroundColor Green
@@ -1219,16 +1238,14 @@ function Show-MainMenu {
 $script:LastMenuCode = 0
 while ($true) {
     $idx = Show-MainMenu
-    if ($idx -eq -1) { exit $script:LastMenuCode }  # ESC 或数据库不存在
+    if ($idx -eq -1) { exit 0 }  # ESC 或数据库不存在
     $menuCode = $null
     switch ($idx) {
-        0 { $menuCode = Menu-HealthCheckQuick }
-        1 { $menuCode = Menu-HealthCheckCustom }
-        2 { $menuCode = Menu-ListModels }
-        3 { $menuCode = Menu-Inspect }
-        4 { $menuCode = Menu-Logs }
-        5 { $menuCode = Menu-AdvancedSettings }
-        6 { exit 0 }
+        0 { $menuCode = Menu-HealthCheck }
+        1 { $menuCode = Menu-DeepDiag }
+        2 { $menuCode = Menu-Logs }
+        3 { $menuCode = Menu-AdvancedSettings }
+        4 { exit 0 }
         default { continue }
     }
     if ($null -ne $menuCode) { $script:LastMenuCode = [int]$menuCode }
