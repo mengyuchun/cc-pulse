@@ -132,22 +132,26 @@ def _answer_correct(answer: str, expected: str) -> bool:
     """宽松校验回答是否正确。
 
     max_tokens 提到 1024 后，话痨模型可能回「答案是 5」而非纯「5」，
-    精确匹配会误判。策略：先 strip 精确匹配；否则当期望为纯数字时，
-    从回答里提取所有数字，唯一且相等即通过。
+    精确匹配会误判。策略：先 strip 精确匹配；否则当期望为数值时，
+    从回答里提取所有数字（含小数/科学计数/负数），唯一且数值相等即通过。
     """
     a = (answer or "").strip()
     exp = (expected or "").strip()
     if a == exp:
         return True
-    if exp.lstrip("-").isdigit():
-        # 提取含小数的数字并数值比较，容忍 "5.0"、"5.00" 等等价表述
-        nums = re.findall(r"-?\d+(?:\.\d+)?", a)
-        if len(nums) == 1:
-            try:
-                if float(nums[0]) == float(exp):
-                    return True
-            except ValueError:
-                pass
+    # 期望是否为数值（含整数/小数/负数/科学计数）
+    try:
+        exp_val = float(exp)
+    except ValueError:
+        return False
+    # 提取回答中的数值（含小数、科学计数、负数），唯一且数值相等即通过
+    nums = re.findall(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", a)
+    if len(nums) == 1:
+        try:
+            if float(nums[0]) == exp_val:
+                return True
+        except ValueError:
+            pass
     return False
 
 
@@ -2255,7 +2259,7 @@ def probe_context_smoke(
             "token_estimate": te,
             "http_status": resp.status,
             "error_category": ErrorCategory.PROTOCOL_INCOMPATIBLE.value,
-            "error": classify_error(resp.body, resp.status)[1],
+            "error": _sanitize_display(classify_error(resp.body, resp.status)[1], p.api_key),
             "elapsed_seconds": elapsed,
         }
 
@@ -2266,7 +2270,7 @@ def probe_context_smoke(
         "token_estimate": te,
         "http_status": resp.status,
         "error_category": category.value,
-        "error": display,
+        "error": _sanitize_display(display, p.api_key),
         "elapsed_seconds": elapsed,
     }
 
@@ -4443,17 +4447,19 @@ def query_proxy_logs(
 
 
 def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
-    """按供应商汇总：请求数、成功、失败、主失败因、中位延迟近似、路由不一致率。"""
+    """按供应商汇总：请求数、成功、失败、主失败因、中位延迟近似、路由不一致率。
+
+    无 since_ts 时默认拉最近 30 天，防止大库全表扫描 OOM。
+    """
+    if since_ts is None:
+        since_ts = int(time.time()) - 30 * 86400
     id_map = load_provider_id_map(db_path)
     conn = _open_ro(db_path)
     try:
         if not _table_exists(conn, "proxy_request_logs"):
             return []
-        where = ""
-        args: list = []
-        if since_ts is not None:
-            where = "WHERE created_at >= ?"
-            args.append(since_ts)
+        where = "WHERE created_at >= ?"
+        args: list = [since_ts]
         # 拉原始行做聚合（2万级可接受）
         cols = [c[1] for c in conn.execute("PRAGMA table_info(proxy_request_logs)")]
         sql = f"SELECT * FROM proxy_request_logs {where}"
@@ -5000,16 +5006,18 @@ def _day_key(ts) -> str | None:
 
 
 def query_analyze_raw(db_path: str, *, since_ts: int | None = None) -> list:
-    """一次拉全分析用行；比 query_proxy_logs 更瘦（只取必要列）。"""
+    """一次拉全分析用行；比 query_proxy_logs 更瘦（只取必要列）。
+
+    无 since_ts 时默认拉最近 30 天，防止大库全表扫描 OOM。
+    """
+    if since_ts is None:
+        since_ts = int(time.time()) - 30 * 86400
     conn = _open_ro(db_path)
     try:
         if not _table_exists(conn, "proxy_request_logs"):
             return []
-        where = ""
-        args: list = []
-        if since_ts is not None:
-            where = "WHERE created_at >= ?"
-            args.append(since_ts)
+        where = "WHERE created_at >= ?"
+        args: list = [since_ts]
         sql = (
             "SELECT created_at, provider_id, status_code, error_message, "
             "request_model, model, latency_ms, first_token_ms, "

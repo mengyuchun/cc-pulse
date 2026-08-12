@@ -1384,6 +1384,147 @@ finally:
     srv.shutdown()
 
 
+print("\n[End-to-end] --alert-threshold 告警阈值")
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    # 阈值 1.0（100%）：mock server 全成功 → 无告警
+    rc, out, err = run_cli(["check", "--failover-only", "--alert-threshold", "1.0"])
+    test("alert-threshold=1.0 全成功无告警", "告警" not in out, f"out tail={out[-200:]}")
+    test("alert-threshold=1.0 exit 0", rc == 0, f"rc={rc}")
+    # summary.available_ratio 存在
+    _, json_out, _ = run_cli(["check", "--failover-only", "--json"])
+    j2 = json.loads(json_out) if json_out else {}
+    test(
+        "check JSON summary.available_ratio 存在",
+        "available_ratio" in j2.get("summary", {}),
+        f"summary={j2.get('summary')}",
+    )
+finally:
+    srv.shutdown()
+
+
+print("\n[End-to-end] deep-dive 真实执行路径")
+# monkeypatch subprocess.call 代替真正 inspect 子进程，验证任务聚合和退出码
+_real_call = subprocess.call
+_dd_calls = []
+
+
+def _mock_call(cmd, **kw):
+    _dd_calls.append(list(cmd))
+    return 1  # 模拟 inspect 失败
+
+
+subprocess.call = _mock_call
+_dd_json = {
+    "schema_version": 2,
+    "providers": [
+        {
+            "name": "FailProv",
+            "type": "claude",
+            "overall_ok": False,
+            "attempts": [{"model": "m-a"}, {"model": "m-b"}],
+        },
+        {
+            "name": "OkProv",
+            "type": "claude",
+            "overall_ok": True,
+            "best_tier": "haiku",
+            "attempts": [{"model": "m-c"}],
+        },
+    ],
+}
+_dd_dir = tempfile.mkdtemp(prefix="ccpulse_ddexec_")
+_dd_file = os.path.join(_dd_dir, "check.json")
+with open(_dd_file, "w", encoding="utf-8") as _f:
+    json.dump(_dd_json, _f)
+try:
+    _dd_calls.clear()
+    _ns = lambda **kw: type("Args", (), kw)()  # noqa: E731
+    args_ns = _ns(
+        from_file=_dd_file,
+        target="fail",
+        models=None,
+        yes=True,
+        json=False,
+        db=db_path,
+        timeout=3,
+        workers=1,
+        skip_tls_verify=False,
+        user_agent=None,
+        stainless_version=None,
+        probe_max_tokens=None,
+        probe_enable_thinking=False,
+        probe_context=None,
+        vision=False,
+        stealth=False,
+        archive=None,
+    )
+    rc_dd = mod.run_deep_dive(args_ns, mod.say)
+    test("deep-dive fail rc=1（模拟失败）", rc_dd == 1, f"rc={rc_dd}")
+    test(
+        "deep-dive fail 2 任务（FailProv×m-a + FailProv×m-b）",
+        len(_dd_calls) == 2,
+        f"calls={len(_dd_calls)}",
+    )
+    test(
+        "deep-dive 每个命令含 inspect",
+        all("inspect" in c for c in _dd_calls),
+    )
+    # --models 过滤
+    _dd_calls.clear()
+    args_ns2 = _ns(
+        from_file=_dd_file,
+        target="both",
+        models="m-a",
+        yes=True,
+        json=False,
+        db=db_path,
+        timeout=3,
+        workers=1,
+        skip_tls_verify=False,
+        user_agent=None,
+        stainless_version=None,
+        probe_max_tokens=None,
+        probe_enable_thinking=False,
+        probe_context=None,
+        vision=False,
+        stealth=False,
+        archive=None,
+    )
+    rc_dd2 = mod.run_deep_dive(args_ns2, mod.say)
+    test("deep-dive --models m-a = 2任务", len(_dd_calls) == 2, f"calls={len(_dd_calls)}")
+    test(
+        "deep-dive m-a 两供应商",
+        {c[c.index("--provider") + 1] for c in _dd_calls} == {"FailProv", "OkProv"},
+    )
+    # --json dry-run
+    args_ns3 = _ns(
+        from_file=_dd_file,
+        target="both",
+        models=None,
+        yes=True,
+        json=True,
+        db=db_path,
+        timeout=3,
+        workers=1,
+        skip_tls_verify=False,
+        user_agent=None,
+        stainless_version=None,
+        probe_max_tokens=None,
+        probe_enable_thinking=False,
+        probe_context=None,
+        vision=False,
+        stealth=False,
+        archive=None,
+    )
+    rc_dd3 = mod.run_deep_dive(args_ns3, mod.say)
+    test("deep-dive --json exit 0", rc_dd3 == 0, f"rc={rc_dd3}")
+finally:
+    subprocess.call = _real_call
+    shutil.rmtree(_dd_dir, ignore_errors=True)
+
+
 print("\n[End-to-end] 无子命令默认进 check")
 srv, port = start_server(MockAnthropicHandler)
 try:
