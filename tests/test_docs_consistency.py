@@ -30,6 +30,10 @@ REQUIRED_MARKERS = {
     "--since": "analyze",
     "--select": "--provider",
     "probe_history.jsonl": "cc-switch",
+    "deep-dive": "--target",
+    "--alert-threshold": "cron",
+    "trim_archive": "5MB",
+    "trend_direction": "↑",
 }
 
 MENU_MARKERS = {

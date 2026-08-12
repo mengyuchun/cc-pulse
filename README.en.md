@@ -386,7 +386,9 @@ Exit code: **2** when conflicts exist (env would override the current provider),
 
 ### `trend` — probe history trends
 
-Each `check`/`inspect` probe appends one line to a local archive (default `~/.cc-pulse/probe_history.jsonl`, never touches cc-switch's database). `trend` reads that archive and aggregates success rate / latency percentiles / error categories / per-day trend per provider — surfacing degradation instead of a single snapshot.
+Each `check`/`inspect` probe appends one line to a local archive (default `~/.cc-pulse/probe_history.jsonl`, never touches cc-switch's database). `trend` reads that archive and aggregates success rate / latency percentiles / error categories / per-day trend per provider — surfacing degradation instead of a single snapshot. The archive auto-rotates when exceeding 5MB or 10000 records (`trim_archive`), keeping only the newest entries.
+
+trend output includes a `trend_direction` marker: success rate compared across first and last days in the window — `↑` rising / `↓` falling / `→` stable.
 
 ```bash
 # Last 7 days

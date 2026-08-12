@@ -419,7 +419,7 @@ python check_ccswitch_health.py trend --since 7d --json
 
 `check`/`inspect` 可用 `--archive PATH` 覆盖归档路径，便于按项目/机器隔离历史。归档超 5MB 且 >10000 条时自动轮转保留最新（`trim_archive`），防长期膨胀。
 
-trend 输出带趋势方向标记：成功率按天首尾对比，`↑` 上升 / `↓` 下降 / `→` 稳定，一眼看降级。
+trend 输出带趋势方向标记（`trend_direction`）：成功率按天首尾对比，`↑` 上升 / `↓` 下降 / `→` 稳定，一眼看降级。
 
 | 参数 | 说明 | 默认 |
 |------|------|------|

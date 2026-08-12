@@ -911,10 +911,20 @@ def classify_error(resp_body: str, http_status: int = 0) -> tuple:
 
 
 def _sanitize_raw_body(body: str, api_key: str) -> str:
-    """raw_body 脱敏：替换 API key 为掩码，防止写入报告时泄露。"""
-    if api_key and api_key in body:
-        show = max(1, min(6, len(api_key) // 2))
-        return body.replace(api_key, api_key[:show] + "***")
+    """raw_body 脱敏：替换 API key 为掩码，防止写入报告时泄露。
+
+    同时尝试 URL 编码后的 key（中转站错误体可能回显编码形态）。
+    """
+    if not api_key:
+        return body
+    show = max(1, min(6, len(api_key) // 2))
+    mask = api_key[:show] + "***"
+    if api_key in body:
+        body = body.replace(api_key, mask)
+    # 中转站错误体可能回显 URL 编码的 key
+    encoded = urllib.parse.quote(api_key, safe="")
+    if encoded != api_key and encoded in body:
+        body = body.replace(encoded, mask)
     return body
 
 
@@ -1336,11 +1346,15 @@ def _drain_non_sse_stream(resp, p: Provider) -> dict:
         raw_truncated_by_error = True
     stream_truncated = raw_truncated_by_error
     if len(raw) == 1 << 20:
-        # 已到限长：再试探 1 字节判断是否还有内容
-        try:
-            stream_truncated = bool(resp.read(1))
-        except (OSError, ValueError):
-            stream_truncated = True
+        # 已到限长：先查 Content-Length 判断是否已读完
+        cl = resp.headers.get("Content-Length")
+        if cl and cl.isdigit() and int(cl) <= (1 << 20):
+            stream_truncated = False  # 声明长度 ≤ 已读，未截断
+        else:
+            try:
+                stream_truncated = bool(resp.read(1))
+            except (OSError, ValueError):
+                stream_truncated = True
     text = ""
     response_model = None
     content_type = resp.headers.get("Content-Type", "")
@@ -1381,6 +1395,7 @@ def _drain_sse_stream(
     got_done = False
     sse_done = False
     stream_truncated = False
+    event_too_large = False
     raw_buf = bytearray()
     stream_socket = getattr(
         getattr(getattr(resp, "fp", None), "raw", None), "_sock", None
@@ -1491,8 +1506,10 @@ def _drain_sse_stream(
             else:
                 sse_buffer += line.encode("utf-8", errors="replace")
             if len(sse_buffer) > 65536:
-                # 事件过大：整体丢弃当前待处理事件，避免截断后误解析残缺 JSON
+                # 事件过大（>64KB 未找到 SSE 分隔符）：丢弃当前待处理事件，
+                # 避免截断后误解析残缺 JSON。标记 stream_truncated 让调用方感知。
                 stream_truncated = True
+                event_too_large = True
                 sse_buffer = b""
 
             while True:
@@ -1546,6 +1563,7 @@ def _drain_sse_stream(
         "raw_preview": bytes(raw_buf),
         "usage": usage,
         "stream_truncated": stream_truncated,
+        "event_too_large": event_too_large,
     }
 
 
@@ -2705,7 +2723,19 @@ def run_list_models(args, providers, say) -> int:
             for p in providers
         }
         for i, fut in enumerate(as_completed(futs), 1):
-            r = fut.result()
+            try:
+                r = fut.result()
+            except Exception as exc:  # noqa: BLE001 - 防御性兜底
+                p = futs[fut]
+                r = {
+                    "name": getattr(p, "name", "?"),
+                    "base_url": getattr(p, "base_url", "?"),
+                    "status": 0,
+                    "elapsed": 0,
+                    "error": f"内部异常: {type(exc).__name__}: {exc}",
+                    "error_category": ErrorCategory.UNKNOWN.value,
+                    "models": [],
+                }
             results.append(r)
             if r["status"] == 200:
                 say(
@@ -2920,7 +2950,28 @@ def run_health_check(args, providers, say) -> int:
     with ThreadPoolExecutor(max_workers=_workers) as ex:
         futs = {ex.submit(_probe_in_parent_context, p): p for p in providers}
         for i, fut in enumerate(as_completed(futs), 1):
-            r = fut.result()
+            try:
+                r = fut.result()
+            except Exception as exc:  # noqa: BLE001 - 防御性兜底，防 worker 异常穿透
+                p = futs[fut]
+                r = {
+                    "name": p.name,
+                    "type": p.app_type,
+                    "base_url": p.base_url,
+                    "auth_mode": p.auth_mode,
+                    "overall_ok": False,
+                    "best_tier": None,
+                    "attempts": [
+                        {
+                            "tier": "?",
+                            "model": "?",
+                            "status": 0,
+                            "elapsed": 0,
+                            "error": f"内部异常: {type(exc).__name__}: {exc}",
+                            "error_category": ErrorCategory.UNKNOWN.value,
+                        }
+                    ],
+                }
             results.append(r)
             icon = "✅" if r["overall_ok"] else "❌"
             if r["overall_ok"]:
