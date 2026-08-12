@@ -2514,6 +2514,10 @@ def fake_probe_tier(
 
 
 mod.probe_tier = fake_probe_tier
+import ccpulse_probe as _ccpulse_probe
+
+_orig_probe_tier_mod = _ccpulse_probe.probe_tier
+_ccpulse_probe.probe_tier = fake_probe_tier
 try:
     p = mod.Provider(
         name="P",
@@ -2546,6 +2550,7 @@ try:
     test("probe 未探测 opus", len(r["attempts"]) == 2)
 finally:
     mod.probe_tier = orig_probe_tier
+    _ccpulse_probe.probe_tier = _orig_probe_tier_mod
 
 
 print("\n[Unit] probe_tier 从问题池抽题 + 宽松校验")

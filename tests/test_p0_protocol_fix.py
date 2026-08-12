@@ -41,7 +41,7 @@ class ProbeStreamConsistency(unittest.TestCase):
         self.assertTrue(mod._answer_correct(answer, "13"))
         self.assertFalse(mod._answer_correct(answer, "5"))
         with open(
-            os.path.join(_ROOT, "check_ccswitch_health.py"), encoding="utf-8"
+            os.path.join(_ROOT, "ccpulse_probe.py"), encoding="utf-8"
         ) as file:
             source = file.read()
         start = source.index("def probe_stream(")
