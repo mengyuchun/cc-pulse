@@ -103,6 +103,7 @@ from ccpulse_probe import (  # noqa: F401
     _TOOL_DESC,
     _TOOL_NAME,
     _answer_correct,
+    _authenticity_verdict,
     _build_context_filler,
     _build_proto_payload,
     _build_proto_url,
@@ -110,8 +111,11 @@ from ccpulse_probe import (  # noqa: F401
     _claude_code_headers,
     _collect_models_for_probe,
     _detect_claude_cli_version,
+    _detect_crosspack_fields,
     _drain_non_sse_stream,
     _drain_sse_stream,
+    _extract_thinking_signatures,
+    _has_valid_thinking_signature,
     _inspect_model_consistency,
     _inspect_one_model,
     _inspect_text,
@@ -963,6 +967,25 @@ def run_inspect(args, providers, say) -> int:
         text_result, model_consistency, thinking_result, tools_result
     )
 
+    # 保真鉴别 P0：换芯字段检测（复用 text/streaming 响应体）+ thinking 签名（复用 enable 响应体）
+    auth_body = ""
+    if text_raw and text_raw.get("status") == 200:
+        auth_body = text_raw.get("raw_body", "")
+    elif streaming_result and streaming_result.get("raw_preview"):
+        auth_body = streaming_result.get("raw_preview", "")
+    crosspack = _detect_crosspack_fields(auth_body, inspect_p.app_type)
+    enabled_body = thinking_result.pop("_enabled_raw_body", "") if isinstance(thinking_result, dict) else ""
+    _sigs = _extract_thinking_signatures(enabled_body)
+    thinking_signature = {
+        "has_valid_signature": _has_valid_thinking_signature(_sigs),
+        "blocks": _sigs,
+    }
+    auth_verdict, auth_evidence = _authenticity_verdict(
+        {"crosspack": crosspack, "thinking_signature": thinking_signature}
+    )
+    if auth_verdict == "suspicious":
+        recommended.append("保真告警：" + "；".join(auth_evidence))
+
     report = {
         "schema_version": 1,
         "command": "inspect",
@@ -986,6 +1009,12 @@ def run_inspect(args, providers, say) -> int:
         "vision": vision_result,
         "model_consistency": model_consistency,
         "usage": usage,
+        "authenticity": {
+            "crosspack": crosspack,
+            "thinking_signature": thinking_signature,
+            "verdict": auth_verdict,
+            "evidence": auth_evidence,
+        },
         "summary": {
             "verdict": verdict,
             "model_routing_anomaly": anomaly,

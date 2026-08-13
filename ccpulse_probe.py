@@ -578,6 +578,151 @@ def _response_has_thinking_signal(resp_body: str) -> bool:
     return False
 
 
+# ── 模型保真鉴别 P0：换芯字段检测 + thinking 签名提取 ────────────────
+
+# Anthropic 响应里本不该出现的 OpenAI 专属字段（出现=中转套壳穿帮）
+_OPENAI_ONLY_FIELDS = ("system_fingerprint", "prompt_tokens", "completion_tokens")
+# OpenAI 响应里本不该出现的 Anthropic 专属 usage 字段
+_ANTHROPIC_ONLY_USAGE_FIELDS = (
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "input_tokens",
+    "output_tokens",
+)
+
+
+def _detect_crosspack_fields(resp_body: str, app_type: str) -> dict:
+    """换芯字段检测：响应里出现"本协议不该有"的字段 → 中转把请求偷转给异协议后端。
+
+    原理借鉴 veridrop（AGPL-3.0）：原生 OpenAI usage 只有 prompt/completion/total
+    三键；冒出 cache_creation_input_tokens 等 Anthropic 专属字段 → 后端是 Claude。
+    反之 Anthropic 响应出现 system_fingerprint → 后端是 OpenAI 系。
+    纯 JSON 解析，零依赖，一次请求即可（复用已有响应体）。
+    """
+    empty = {"suspicious": False, "findings": []}
+    if not resp_body:
+        return {**empty, "note": "空响应体，无法解析"}
+    try:
+        j = json.loads(resp_body)
+    except (json.JSONDecodeError, TypeError):
+        return {**empty, "note": "响应非 JSON，无法解析"}
+    if not isinstance(j, dict):
+        return {**empty, "note": "响应非对象，无法解析"}
+
+    is_openai = app_type in ("codex", "openclaw")
+    is_anthropic = app_type == "claude"
+    findings: list[dict] = []
+
+    usage = j.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+
+    if is_openai:
+        # OpenAI 响应里出现 Anthropic 专属 usage 字段 → 后端疑似 Claude
+        for f in _ANTHROPIC_ONLY_USAGE_FIELDS:
+            if f in usage:
+                findings.append(
+                    {"field": f"usage.{f}", "reason": "Anthropic 专属字段出现在 OpenAI 格式响应，疑似后端换芯为 Claude"}
+                )
+        # 顶层 usage_source 自曝来源
+        if isinstance(j.get("usage_source"), str) and "anthropic" in j["usage_source"].lower():
+            findings.append(
+                {"field": "usage_source", "reason": "中转自曝后端来源为 anthropic"}
+            )
+        # model 字段含 claude（OpenAI 响应回 claude 模型名）
+        m = j.get("model")
+        if isinstance(m, str) and "claude" in m.lower():
+            findings.append(
+                {"field": "model", "reason": "OpenAI 协议响应回 Claude 模型名，疑似后端换芯"}
+            )
+    elif is_anthropic:
+        # Anthropic 响应里出现 OpenAI 专属字段 → 后端疑似 OpenAI 系
+        for f in _OPENAI_ONLY_FIELDS:
+            if f in j or f in usage:
+                loc = "usage." + f if f in usage else f
+                findings.append(
+                    {"field": loc, "reason": "OpenAI 专属字段出现在 Anthropic 格式响应，疑似后端换芯为 OpenAI 系"}
+                )
+        m = j.get("model")
+        if isinstance(m, str) and ("gpt" in m.lower() or "o1" in m.lower() or "o3" in m.lower()):
+            findings.append(
+                {"field": "model", "reason": "Anthropic 协议响应回 GPT/o 系模型名，疑似后端换芯"}
+            )
+
+    return {"suspicious": bool(findings), "findings": findings}
+
+
+def _extract_thinking_signatures(resp_body: str) -> list[dict]:
+    """从响应提取 thinking/reasoning 块的签名信息。
+
+    Anthropic：content[].type == "thinking" 且带 signature（服务端密钥签名，不可伪造）。
+    OpenAI：choices[].message.reasoning_content（无签名 → signature_present=False）。
+    返回每块的 {signature_present, signature_length}；无 thinking 块 → 空列表。
+    """
+    if not resp_body:
+        return []
+    try:
+        j = json.loads(resp_body)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(j, dict):
+        return []
+
+    out: list[dict] = []
+    # Anthropic content[]
+    for blk in j.get("content", []) or []:
+        if isinstance(blk, dict) and blk.get("type") == "thinking":
+            sig = blk.get("signature")
+            out.append(
+                {
+                    "signature_present": bool(sig),
+                    "signature_length": len(sig) if isinstance(sig, str) else 0,
+                }
+            )
+    # OpenAI choices[].message.reasoning_content（无签名字段）
+    if not out:
+        for ch in j.get("choices", []) or []:
+            if not isinstance(ch, dict):
+                continue
+            msg = ch.get("message") or {}
+            if isinstance(msg, dict) and (msg.get("reasoning_content") or msg.get("reasoning")):
+                out.append({"signature_present": False, "signature_length": 0})
+    return out
+
+
+def _has_valid_thinking_signature(sigs: list[dict]) -> bool | None:
+    """汇总：任一 thinking 块有签名 → True；有块但全无签名 → False；无块 → None。"""
+    if not sigs:
+        return None
+    return any(s.get("signature_present") for s in sigs)
+
+
+def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
+    """汇总保真判据 → (verdict, evidence)。
+
+    verdict: clean / suspicious / inconclusive。
+    结论是概率信号非铁证（GhostPrint 攻击理论上可骗过）。
+    """
+    crosspack = auth.get("crosspack") or {}
+    tsig = auth.get("thinking_signature") or {}
+    cp_susp = bool(crosspack.get("suspicious"))
+    has_sig = tsig.get("has_valid_signature")  # True/False/None
+
+    evidence: list[str] = []
+    for f in crosspack.get("findings", []) or []:
+        evidence.append(f"换芯疑似：{f.get('field')} — {f.get('reason')}")
+    if has_sig is False:
+        evidence.append("thinking 块无签名，疑似非真 Claude 服务端产出或第三方模型伪装")
+
+    if cp_susp or has_sig is False:
+        return "suspicious", evidence
+    if has_sig is None and not crosspack:
+        return "inconclusive", evidence
+    if has_sig is None:
+        # 换芯干净但无 thinking 块（非 Claude 协议或未触发）→ 不足以证伪，标 inconclusive
+        return "inconclusive", evidence
+    return "clean", evidence
+
+
 
 def _drain_non_sse_stream(resp, p: Provider) -> dict:
     """消费非 SSE 响应（供应商对 stream=true 仍返回普通 JSON）。
@@ -2182,6 +2327,8 @@ def _inspect_thinking(p, tier, text_raw, timeout, skip_tls, *, max_tokens, user_
             result["verdict"] = "supports_disable"
     elif not disable_ok and not r_en.get("correct"):
         result["verdict"] = "breaks_on_short_budget"
+    # 暴露 enable-thinking 响应体，供保真鉴权复用（提取签名），不新增请求
+    result["_enabled_raw_body"] = r_en.get("raw_body", "")
     return result
 
 
@@ -2348,6 +2495,26 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
     verdict, anomaly, recommended = _inspect_verdict(
         text_result, model_consistency, thinking_result, tools_result
     )
+
+    # 保真鉴别 P0：换芯字段检测（复用 text/streaming 响应体）+ thinking 签名提取（复用 thinking enable 响应体）
+    auth_body = ""
+    if text_raw and text_raw.get("status") == 200:
+        auth_body = text_raw.get("raw_body", "")
+    elif streaming_result and streaming_result.get("raw_preview"):
+        auth_body = streaming_result.get("raw_preview", "")
+    crosspack = _detect_crosspack_fields(auth_body, inspect_p.app_type)
+    enabled_body = thinking_result.pop("_enabled_raw_body", "") if isinstance(thinking_result, dict) else ""
+    sigs = _extract_thinking_signatures(enabled_body)
+    thinking_signature = {
+        "has_valid_signature": _has_valid_thinking_signature(sigs),
+        "blocks": sigs,
+    }
+    auth_verdict, auth_evidence = _authenticity_verdict(
+        {"crosspack": crosspack, "thinking_signature": thinking_signature}
+    )
+    if auth_verdict == "suspicious":
+        recommended.append("保真告警：" + "；".join(auth_evidence))
+
     return {
         "schema_version": 1,
         "command": "inspect",
@@ -2364,6 +2531,12 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
         "tools": tools_result,
         "vision": vision_result,
         "model_consistency": model_consistency,
+        "authenticity": {
+            "crosspack": crosspack,
+            "thinking_signature": thinking_signature,
+            "verdict": auth_verdict,
+            "evidence": auth_evidence,
+        },
         "summary": {
             "verdict": verdict,
             "model_routing_anomaly": anomaly,

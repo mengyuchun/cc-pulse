@@ -2057,6 +2057,30 @@ try:
         j.get("vision", {}).get("status") == "skipped",
         f"vision={j.get('vision')}",
     )
+    # 保真鉴别 P0：报告含 authenticity 维度（换芯字段 + thinking 签名）
+    auth = j.get("authenticity") or {}
+    test(
+        "inspect 报告含 authenticity 字段",
+        bool(auth),
+        f"authenticity={auth}",
+    )
+    test(
+        "authenticity.verdict 在 clean/suspicious/inconclusive 之内",
+        auth.get("verdict") in ("clean", "suspicious", "inconclusive"),
+        f"verdict={auth.get('verdict')}",
+    )
+    test(
+        "authenticity 含 crosspack 子字段",
+        isinstance(auth.get("crosspack"), dict)
+        and "suspicious" in auth["crosspack"],
+        f"crosspack={auth.get('crosspack')}",
+    )
+    test(
+        "authenticity 含 thinking_signature 子字段",
+        isinstance(auth.get("thinking_signature"), dict)
+        and "has_valid_signature" in auth["thinking_signature"],
+        f"tsig={auth.get('thinking_signature')}",
+    )
 finally:
     srv.shutdown()
 
