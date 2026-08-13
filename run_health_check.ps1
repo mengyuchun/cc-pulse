@@ -538,7 +538,8 @@ function Ask-DeepDive {
         [object]$CheckResult,
         [string]$Type,
         [string]$DBPath,
-        [string]$PythonPath
+        [string]$PythonPath,
+        [string[]]$RecheckCmdArgs = @()
     )
     if (-not $CheckResult -or -not $CheckResult.providers) { return }
     $failP = @($CheckResult.providers | Where-Object { -not $_.overall_ok })
@@ -567,6 +568,10 @@ function Ask-DeepDive {
         $choices.Add("两者都深挖")
         $choiceData.Add("both")
     }
+    if ($RecheckCmdArgs.Count -gt 0) {
+        $choices.Add("用相同配置再测一次")
+        $choiceData.Add("recheck")
+    }
     $choices.Add("不深挖，返回主菜单")
     $choiceData.Add("none")
 
@@ -576,6 +581,16 @@ function Ask-DeepDive {
     else { $choice = $choiceData[$idx] }
 
     if ($choice -eq "none") { return }
+    if ($choice -eq "recheck") {
+        Write-Host ""
+        Write-Host "  重新检测中（相同配置）…" -ForegroundColor DarkGray
+        $res2 = Invoke-CcpulseJson -CmdArgs $RecheckCmdArgs
+        if ($res2.Data -and $res2.Data.providers) {
+            Ask-DeepDive -CheckResult $res2.Data -Type $Type -DBPath $DBPath `
+                -PythonPath $PythonPath -RecheckCmdArgs $RecheckCmdArgs
+        }
+        return
+    }
     if ($choice -eq "fail") {
         $targets = Select-DeepDiveTargets -FailProviders $failP -OkProviders @()
     } elseif ($choice -eq "ok") {
@@ -608,13 +623,13 @@ function Menu-HealthCheckQuick {
     # 深挖需要 check 的 JSON 结果；若高级设置已开 --json 则已含
     if ($cmdArgs -notcontains "--json") { $cmdArgs.Add("--json") }
     $res = Invoke-CcpulseJson -CmdArgs $cmdArgs.ToArray()
-    # 深挖入口：check 完成后询问
+    # 深挖入口：check 完成后询问（Ask-DeepDive 内含"再测一次"，用 RecheckCmdArgs 原样重跑）
     if ($res.Data -and $res.Data.providers) {
-        Ask-DeepDive -CheckResult $res.Data -Type $script:AdvType -DBPath $DB -PythonPath $Python
+        Ask-DeepDive -CheckResult $res.Data -Type $script:AdvType -DBPath $DB -PythonPath $Python `
+            -RecheckCmdArgs $cmdArgs.ToArray()
     } else {
         Write-Host ""
-        $again = Select-MenuItem -Options @("返回主菜单", "重新选择（类型/范围）") -Title "下一步"
-        if ($again -eq 1) { return (Menu-HealthCheckQuick) }
+        $again = Select-MenuItem -Options @("返回主菜单") -Title "下一步（无可用供应商）"
     }
     return $res.Code
 }
@@ -678,12 +693,13 @@ function Menu-HealthCheckCustom {
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "check"
     if ($cmdArgs -notcontains "--json") { $cmdArgs.Add("--json") }
     $res = Invoke-CcpulseJson -CmdArgs $cmdArgs.ToArray()
-    # 深挖入口：check 完成后询问
+    # 深挖入口：check 完成后询问（Ask-DeepDive 内含"再测一次"，用 RecheckCmdArgs 原样重跑）
     if ($res.Data -and $res.Data.providers) {
-        Ask-DeepDive -CheckResult $res.Data -Type $type -DBPath $DB -PythonPath $Python
+        Ask-DeepDive -CheckResult $res.Data -Type $type -DBPath $DB -PythonPath $Python `
+            -RecheckCmdArgs $cmdArgs.ToArray()
     } else {
         Write-Host ""
-        $again = Select-MenuItem -Options @("返回主菜单", "重新选择（类型/范围）") -Title "下一步"
+        $again = Select-MenuItem -Options @("返回主菜单", "重新选择（类型/范围）") -Title "下一步（无可用供应商）"
         if ($again -eq 1) { return (Menu-HealthCheckCustom) }
     }
     return $res.Code
