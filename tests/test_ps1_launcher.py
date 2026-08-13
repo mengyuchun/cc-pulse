@@ -118,6 +118,28 @@ test(
     or " -u " in combined,
 )
 test("快速体检带 --failover-only", "--failover-only" in combined)
+test("深挖菜单含'再测一次'项", "再测一次" in combined)
+
+
+print("\n[PS1] 体检 · 再测一次 - 深挖菜单选'再测一次'重跑 check")
+# 主菜单 1(体检) -> 子菜单 1(快速) -> 深挖选"再测一次"(在 fail 之后) -> 深挖选"不深挖"(末项) -> 5 退出
+# Mock-Provider 必失败 → 深挖菜单: [1]对失败深挖 [2]再测一次 [3]不深挖
+stdin_text = (
+    "1\n"  # 主菜单: 体检
+    "1\n"  # 子菜单: 快速
+    "2\n"  # 深挖: 再测一次
+    "3\n"  # 深挖(重测后): 不深挖（末项）
+    "5\n"  # 退出
+)
+rc, out, err = run_pwsh(stdin_text, timeout=180)
+combined = out + err
+test("再测一次 exit 0 或 1", rc in (0, 1), f"rc={rc}")
+test("输出含 '重新检测中'", "重新检测中" in combined)
+# check 应被调用两次（首测 + 重测）：stderr 里 Invoke-CcpulseJson 的命令行出现 2 次
+check_count = combined.count("check --type") + combined.count(
+    "check_ccswitch_health.py check"
+) + combined.count("-u check_ccswitch_health.py check")
+test("check 被调用 2 次（首测+重测）", check_count >= 2, f"check_count={check_count}")
 
 
 print("\n[PS1] 体检 · 自定义 - 选项 1 -> 子菜单 2 -> 当前激活供应商")
