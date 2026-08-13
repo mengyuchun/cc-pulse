@@ -1307,7 +1307,7 @@ def probe_model_metadata(
             "capabilities": {},
             "source": "provider_metadata",
             "error_category": category.value,
-            "error": display,
+            "error": _sanitize_display(display, p.api_key),
             "elapsed_seconds": elapsed,
         }
 
