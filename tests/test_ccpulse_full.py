@@ -2081,6 +2081,12 @@ try:
         and "has_valid_signature" in auth["thinking_signature"],
         f"tsig={auth.get('thinking_signature')}",
     )
+    test(
+        "authenticity 含 usage_consistency 子字段（P1）",
+        isinstance(auth.get("usage_consistency"), dict)
+        and "suspicious" in auth["usage_consistency"],
+        f"usage_consistency={auth.get('usage_consistency')}",
+    )
 finally:
     srv.shutdown()
 

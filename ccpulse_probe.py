@@ -696,6 +696,46 @@ def _has_valid_thinking_signature(sigs: list[dict]) -> bool | None:
     return any(s.get("signature_present") for s in sigs)
 
 
+def _check_usage_consistency(usage: dict, answer: str, app_type: str) -> dict:
+    """usage 自洽静态校验：检测计费注水（total 伪造、output 虚高无内容）。
+
+    纯静态分析已有 usage + answer，零新请求。
+    - OpenAI 系有 total_tokens 时校验 total == prompt + completion（允许 ±1 误差）
+    - output_tokens > 0 但 answer 文本为空 -> 扣费但无输出
+    """
+    empty = {"suspicious": False, "findings": []}
+    if not isinstance(usage, dict) or not usage.get("present"):
+        return {**empty, "note": "无 usage"}
+    inp = usage.get("input_tokens")
+    out = usage.get("output_tokens")
+    findings: list[dict] = []
+
+    total = usage.get("total_tokens")
+    if (
+        app_type in ("codex", "openclaw")
+        and isinstance(total, (int, float))
+        and isinstance(inp, (int, float))
+        and isinstance(out, (int, float))
+        and abs(total - (inp + out)) > 1
+    ):
+        findings.append(
+            {
+                "check": "total_inconsistent",
+                "reason": f"total_tokens({int(total)}) != prompt({int(inp)})+completion({int(out)})={int(inp + out)}，疑似 usage 伪造",
+            }
+        )
+
+    if isinstance(out, (int, float)) and out > 0 and not str(answer or "").strip():
+        findings.append(
+            {
+                "check": "output_no_content",
+                "reason": f"output_tokens={int(out)} 但回答文本为空，疑似扣费注水",
+            }
+        )
+
+    return {"suspicious": bool(findings), "findings": findings}
+
+
 def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     """汇总保真判据 → (verdict, evidence)。
 
@@ -704,7 +744,9 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     """
     crosspack = auth.get("crosspack") or {}
     tsig = auth.get("thinking_signature") or {}
+    usage_c = auth.get("usage_consistency") or {}
     cp_susp = bool(crosspack.get("suspicious"))
+    uc_susp = bool(usage_c.get("suspicious"))
     has_sig = tsig.get("has_valid_signature")  # True/False/None
 
     evidence: list[str] = []
@@ -712,8 +754,10 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
         evidence.append(f"换芯疑似：{f.get('field')} — {f.get('reason')}")
     if has_sig is False:
         evidence.append("thinking 块无签名，疑似非真 Claude 服务端产出或第三方模型伪装")
+    for f in usage_c.get("findings", []) or []:
+        evidence.append(f"计费疑似：{f.get('check')} - {f.get('reason')}")
 
-    if cp_susp or has_sig is False:
+    if cp_susp or has_sig is False or uc_susp:
         return "suspicious", evidence
     if has_sig is None and not crosspack:
         return "inconclusive", evidence
@@ -2509,8 +2553,16 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
         "has_valid_signature": _has_valid_thinking_signature(sigs),
         "blocks": sigs,
     }
+    # P1: usage 自洽静态校验（复用 text_raw 的 usage + answer，零新请求）
+    _usage = (text_raw or {}).get("usage") if text_raw else None
+    _answer = (text_raw or {}).get("answer", "") if text_raw else ""
+    usage_consistency = _check_usage_consistency(_usage, _answer, inspect_p.app_type)
     auth_verdict, auth_evidence = _authenticity_verdict(
-        {"crosspack": crosspack, "thinking_signature": thinking_signature}
+        {
+            "crosspack": crosspack,
+            "thinking_signature": thinking_signature,
+            "usage_consistency": usage_consistency,
+        }
     )
     if auth_verdict == "suspicious":
         recommended.append("保真告警：" + "；".join(auth_evidence))
@@ -2534,6 +2586,7 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
         "authenticity": {
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
+            "usage_consistency": usage_consistency,
             "verdict": auth_verdict,
             "evidence": auth_evidence,
         },

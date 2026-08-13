@@ -107,6 +107,7 @@ from ccpulse_probe import (  # noqa: F401
     _build_context_filler,
     _build_proto_payload,
     _build_proto_url,
+    _check_usage_consistency,
     _claude_cli_version,
     _claude_code_headers,
     _collect_models_for_probe,
@@ -980,8 +981,16 @@ def run_inspect(args, providers, say) -> int:
         "has_valid_signature": _has_valid_thinking_signature(_sigs),
         "blocks": _sigs,
     }
+    # P1: usage 自洽静态校验（复用 text_raw 的 usage + answer，零新请求）
+    _usage_raw = text_raw.get("usage") if text_raw else None
+    _answer_raw = text_raw.get("answer", "") if text_raw else ""
+    usage_consistency = _check_usage_consistency(_usage_raw, _answer_raw, inspect_p.app_type)
     auth_verdict, auth_evidence = _authenticity_verdict(
-        {"crosspack": crosspack, "thinking_signature": thinking_signature}
+        {
+            "crosspack": crosspack,
+            "thinking_signature": thinking_signature,
+            "usage_consistency": usage_consistency,
+        }
     )
     if auth_verdict == "suspicious":
         recommended.append("保真告警：" + "；".join(auth_evidence))
@@ -1012,6 +1021,7 @@ def run_inspect(args, providers, say) -> int:
         "authenticity": {
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
+            "usage_consistency": usage_consistency,
             "verdict": auth_verdict,
             "evidence": auth_evidence,
         },
