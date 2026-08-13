@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import subprocess
@@ -880,6 +881,115 @@ def _probe_knowledge_cutoff(
     }
 
 
+# ── P2-C 单 token 随机数分布指纹（JSD）─────────────────────────────────
+
+# LLM 通用偏置参考分布（程序化构造，零外部数据）：
+# 起点 1/100 均匀，偏好数加权 ×3，整数抑制 ×0.3，再归一化。
+_JS_BIAS_NUMS = {7, 17, 23, 42, 73, 37, 47, 67, 77, 83}
+_JS_ROUND_NUMS = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100}
+
+
+def _build_llm_bias_reference() -> list[float]:
+    """构造 LLM 通用偏置参考分布（100 桶，索引 0→数 1）。"""
+    raw = [1.0 / 100] * 100
+    for n in _JS_BIAS_NUMS:
+        raw[n - 1] *= 3.0
+    for n in _JS_ROUND_NUMS:
+        raw[n - 1] *= 0.3
+    s = sum(raw)
+    return [v / s for v in raw]
+
+
+LLM_BIAS_REFERENCE = _build_llm_bias_reference()
+_JS_UNIF = [1.0 / 100] * 100
+_JS_MIN_SAMPLES = 20
+
+
+def _jsd(p_dist: list[float], q_dist: list[float]) -> float:
+    """Jensen-Shannon 散度（base 2，∈[0,1]）。两分布等长、已归一化。"""
+    m = [0.5 * (pi + qi) for pi, qi in zip(p_dist, q_dist)]
+
+    def _kl(a: list[float], b: list[float]) -> float:
+        s = 0.0
+        for ai, bi in zip(a, b):
+            if ai <= 0.0:
+                continue
+            s += ai * math.log2(ai / bi)
+        return s
+
+    return 0.5 * _kl(p_dist, m) + 0.5 * _kl(q_dist, m)
+
+
+def _js_parse_number(text: str) -> int | None:
+    """从回答里取首个 1-100 整数；范围外/无数字返回 None。"""
+    for m in re.finditer(r"\d+", str(text or "")):
+        n = int(m.group())
+        if 1 <= n <= 100:
+            return n
+    return None
+
+
+def _probe_js_fingerprint(
+    p: Provider,
+    tier: ModelTier,
+    timeout: int,
+    skip_tls: bool,
+    *,
+    samples: int,
+    max_tokens: int,
+    user_agent: str | None,
+) -> dict:
+    """单 token 随机数分布指纹：问 N 次"给个 1-100 随机数"，统计 JSD。
+
+    真 LLM 永远不均匀（有偏置）；脚本 random.randint 近似均匀。
+    jsd_unif < jsd_ref → 观测更接近均匀 → suspicious（疑似非 LLM 后端）。
+    """
+    q = "Pick a random number between 1 and 100. Reply with only the number."
+    counts = [0] * 100
+    ok = 0
+    failures = 0
+    for _ in range(samples):
+        r = probe_tier(
+            p, tier, timeout, skip_tls, max_tokens=max_tokens,
+            disable_thinking=True, user_agent=user_agent,
+            question=q,
+        )
+        if r.get("status") != 200:
+            failures += 1
+            continue
+        n = _js_parse_number(r.get("answer", ""))
+        if n is None:
+            continue
+        counts[n - 1] += 1
+        ok += 1
+
+    if ok < _JS_MIN_SAMPLES:
+        return {
+            "suspicious": False,
+            "samples": ok,
+            "jsd_ref": None,
+            "jsd_unif": None,
+            "note": f"有效样本 {ok} 不足（需 ≥{_JS_MIN_SAMPLES}），无法判定",
+        }
+
+    total = float(sum(counts))
+    obs = [c / total for c in counts]
+    jsd_ref = _jsd(obs, LLM_BIAS_REFERENCE)
+    jsd_unif = _jsd(obs, _JS_UNIF)
+    suspicious = jsd_unif < jsd_ref
+    if suspicious:
+        note = f"分布更接近均匀（jsd_unif={jsd_unif:.3f} < jsd_ref={jsd_ref:.3f}），疑似非 LLM 后端"
+    else:
+        note = f"符合 LLM 偏置特征（jsd_ref={jsd_ref:.3f} ≤ jsd_unif={jsd_unif:.3f}），样本 {ok}"
+    return {
+        "suspicious": suspicious,
+        "samples": ok,
+        "jsd_ref": round(jsd_ref, 4),
+        "jsd_unif": round(jsd_unif, 4),
+        "note": note,
+    }
+
+
 def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     """汇总保真判据 → (verdict, evidence)。
 
@@ -891,10 +1001,12 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     usage_c = auth.get("usage_consistency") or {}
     cache_r = auth.get("cache_replay") or {}
     kc = auth.get("knowledge_cutoff") or {}
+    js = auth.get("js_fingerprint") or {}
     cp_susp = bool(crosspack.get("suspicious"))
     uc_susp = bool(usage_c.get("suspicious"))
     cr_susp = bool(cache_r.get("suspicious"))
     kc_susp = bool(kc.get("suspicious"))
+    js_susp = bool(js.get("suspicious"))
     has_sig = tsig.get("has_valid_signature")  # True/False/None
 
     evidence: list[str] = []
@@ -908,8 +1020,10 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
         evidence.append(f"缓存/钳温疑似：{cache_r.get('note', '')}")
     if kc_susp:
         evidence.append(f"知识截止疑似：{kc.get('note', '')}")
+    if js_susp:
+        evidence.append(f"分布指纹疑似：{js.get('note', '')}")
 
-    if cp_susp or has_sig is False or uc_susp or cr_susp or kc_susp:
+    if cp_susp or has_sig is False or uc_susp or cr_susp or kc_susp or js_susp:
         return "suspicious", evidence
     if has_sig is None and not crosspack:
         return "inconclusive", evidence
@@ -2731,6 +2845,14 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
             max_tokens=32, user_agent=_ua,
         )
+    # P2-C: 单 token 随机数分布指纹（可选 --include js-fingerprint；默认 50 次新请求）
+    js_samples = getattr(args, "js_samples", 50) or 50
+    js_fingerprint = {"suspicious": False, "note": "未启用（--include js-fingerprint 开启）"}
+    if "js-fingerprint" in include:
+        js_fingerprint = _probe_js_fingerprint(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            samples=js_samples, max_tokens=16, user_agent=_ua,
+        )
     auth_verdict, auth_evidence = _authenticity_verdict(
         {
             "crosspack": crosspack,
@@ -2738,6 +2860,7 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
             "knowledge_cutoff": knowledge_cutoff,
+            "js_fingerprint": js_fingerprint,
         }
     )
     if auth_verdict == "suspicious":
@@ -2765,6 +2888,7 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
             "knowledge_cutoff": knowledge_cutoff,
+            "js_fingerprint": js_fingerprint,
             "verdict": auth_verdict,
             "evidence": auth_evidence,
         },

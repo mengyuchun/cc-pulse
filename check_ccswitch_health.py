@@ -130,6 +130,7 @@ from ccpulse_probe import (  # noqa: F401
     _probe_vision,
     _probe_cache_replay,
     _probe_knowledge_cutoff,
+    _probe_js_fingerprint,
     _resolve_protocol,
     _response_has_thinking_signal,
     _status_badge,
@@ -1001,6 +1002,14 @@ def run_inspect(args, providers, say) -> int:
             inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
             max_tokens=32, user_agent=_ua,
         )
+    # P2-C: 单 token 随机数分布指纹（可选 --include js-fingerprint；默认 50 次新请求）
+    js_samples = getattr(args, "js_samples", 50) or 50
+    js_fingerprint = {"suspicious": False, "note": "未启用（--include js-fingerprint 开启）"}
+    if "js-fingerprint" in include:
+        js_fingerprint = _probe_js_fingerprint(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            samples=js_samples, max_tokens=16, user_agent=_ua,
+        )
     auth_verdict, auth_evidence = _authenticity_verdict(
         {
             "crosspack": crosspack,
@@ -1008,6 +1017,7 @@ def run_inspect(args, providers, say) -> int:
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
             "knowledge_cutoff": knowledge_cutoff,
+            "js_fingerprint": js_fingerprint,
         }
     )
     if auth_verdict == "suspicious":
@@ -1042,6 +1052,7 @@ def run_inspect(args, providers, say) -> int:
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
             "knowledge_cutoff": knowledge_cutoff,
+            "js_fingerprint": js_fingerprint,
             "verdict": auth_verdict,
             "evidence": auth_evidence,
         },
@@ -2261,10 +2272,17 @@ def _build_parser():
         "--include",
         default=None,
         help="要执行的检查项，逗号分隔；支持：text,streaming,"
-        "model-consistency,protocol,error-classification,metadata,thinking,tools,vision,cache-replay,knowledge-cutoff。"
-        "默认全开（不含 vision/cache-replay/knowledge-cutoff）；--compare 默认仅 text,streaming。"
+        "model-consistency,protocol,error-classification,metadata,thinking,tools,vision,cache-replay,knowledge-cutoff,js-fingerprint。"
+        "默认全开（不含 vision/cache-replay/knowledge-cutoff/js-fingerprint）；--compare 默认仅 text,streaming。"
         "cache-replay=temp=1 双发查缓存回放/钳温（2 次额外请求）；"
-        "knowledge-cutoff=before/after 题库查模型版本/世代（6 次额外请求）",
+        "knowledge-cutoff=before/after 题库查模型版本/世代（6 次额外请求）；"
+        "js-fingerprint=单 token 随机数分布指纹 JSD（默认 --js-samples 50 次额外请求）",
+    )
+    p_inspect.add_argument(
+        "--js-samples",
+        type=int,
+        default=50,
+        help="js-fingerprint 采样次数（默认 50；建议 ≥200 高置信，<20 不判定）",
     )
     p_inspect.add_argument(
         "--ttft-timeout",
