@@ -10,7 +10,7 @@ Don't trust "it connected". Trust "it works". With so many providers, see at a g
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-280%20pass-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/tests-659%20pass-brightgreen.svg)](#tests)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -142,6 +142,34 @@ For a given `(provider, model)`, run text / streaming / metadata / context smoke
 | **tools** | Minimal side-effect-free tool: native / text_only / rejected |
 | **vision** | Embedded 1×1 PNG, checks whether images are accepted (off by default) |
 | **model-consistency** | Request model vs response model field, catches silent routing |
+| **authenticity** | Model authenticity detection (see below; P0/P1 on by default, P2 probes opt-in) |
+
+### 4. Model authenticity detection `authenticity` — is the relay swapping/downgrading the model?
+
+The biggest hidden pit with relays: advertised as Claude Sonnet 4.5, but the backend is swapped to GPT / an older version / a quantized model / even a script fallback. The `authenticity` field of the `inspect` report uses 6 probes for probabilistic detection — **the verdict is a signal, not a cryptographic proof** (GhostPrint-style attacks can theoretically fool it).
+
+| Probe | Default | Principle | Signal |
+|-------|---------|-----------|--------|
+| **Crosspack fields** `crosspack` | ✅ on | A native OpenAI response has only prompt/completion/total tokens; surfacing `cache_creation_input_tokens` / `usage_source: anthropic` means the relay forwarded an OpenAI request to a Claude backend then rewrapped. Zero new requests, reuses text/streaming raw body | Suspicious field → suspicious |
+| **Thinking signature** `thinking_signature` | ✅ on | The `signature` on a Claude thinking block is an Anthropic server-side key signature; clients can only verify, not forge. A relay cannot fake it — it can only pass through real Claude output verbatim. Reuses thinking-enable response, zero new requests | thinking block present but no signature → suspicious |
+| **Usage consistency** `usage_consistency` | ✅ on | A very short reply ("just OK") but a high `completion_tokens` → unexplainable billing. Reuses text_raw usage, zero new requests | Billing not self-consistent → suspicious |
+| **Cache replay / temp-clamp** `cache_replay` | ❌ `--include cache-replay` | Send the same prompt twice at temp=1; byte-identical output → suspected cache replay or forced temperature clamp (a real model at temp=1 should vary). 2 new requests | Twin fire byte-identical → suspicious |
+| **Knowledge cutoff** `knowledge_cutoff` | ❌ `--include knowledge-cutoff` | "before" questions (pre-2023 facts) every model should get right — a wrong answer is abnormal; "after" questions (2024-2025 events) only newer models should know. Distinguishes model version/generation. 6 new requests | before wrong → suspicious; after all wrong → note old model |
+| **Distribution fingerprint** `js_fingerprint` | ❌ `--include js-fingerprint` | Ask N times "give a random number 1-100"; a real LLM is never uniform (has bias), only a script `random.randint` is near-uniform. JSD decides: closer to uniform than to the LLM-bias reference → suspected non-LLM backend. Default 50 (`--js-samples N`), <20 no verdict | Near-uniform distribution → suspicious |
+
+```bash
+# Default: crosspack + thinking_signature + usage_consistency (zero/low new requests, always on)
+python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-sonnet-4-6" --human
+
+# Full authenticity detection (burns ~58 extra requests, high confidence)
+python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-sonnet-4-6" \
+    --include text,streaming,metadata,thinking,tools,cache-replay,knowledge-cutoff,js-fingerprint \
+    --js-samples 200 --human
+```
+
+The report's `authenticity.verdict` ∈ `clean` / `suspicious` / `inconclusive`, with `evidence` listing each suspicious proof. See [docs/PRD-authenticity-p0.md](docs/PRD-authenticity-p0.md) ~ `p2c.md`.
+
+**Capability ceiling** (stated in the report, no exaggeration): 8-bit quantization / same-generation neighbor-tier downgrade (haiku vs sonnet) can't be detected with a few black-box requests; GhostPrint attack (arXiv:2606.16100) can theoretically fine-tune a weak model to fool the fingerprint; temperature=0 can only falsify one way (inconsistency → suspicious) but not prove authenticity.
 
 ---
 
@@ -211,6 +239,7 @@ python check_ccswitch_health.py inspect \
 | Passive cc-switch health | `health` | Read `provider_health` only; no HTTP, not a replacement for active probing |
 | Diagnose silent routing | `just env-check` / `routing` | env-check for env-var overrides; routing for request vs response model mismatch |
 | Cross-day degradation trend | `just trend` | Read local probe archive, aggregate by day |
+| Detect if the relay swaps/downgrades the model | `inspect --include ...,cache-replay,knowledge-cutoff,js-fingerprint` | 6-probe authenticity detection; P0/P1 on by default, P2 opt-in |
 | Watch cc-switch logs live | `just watch` | Poll every 3s, prints new entries, Ctrl+C to stop |
 | Multi-dimensional aggregation | `just analyze` | By day / model / provider×day matrix with sparklines |
 | Batch deep-dive after check | `deep-dive` | Read check JSON, inspect each; CI-pipeable |
@@ -451,6 +480,7 @@ python check_ccswitch_health.py inspect \
 | `--include LIST` | Checks to run (see table) | all on; `--compare` defaults to `text,streaming` |
 | `--probe-context 512k\|1m` | Context smoke tier | `512k` |
 | `--keep-suffix` | Keep `[1M]`-style suffixes in model ID | off |
+| `--js-samples N` | `js-fingerprint` sample count (default 50; ≥200 high confidence, <20 no verdict) | `50` |
 | `--ttft-timeout SEC` | Streaming first-token timeout | same as `--timeout` |
 | `--with-metadata` | Backward-compatible; metadata is already on and sends no extra request | off |
 | `--probe-delay SEC` | Delay between batch models | `3.0` |
@@ -471,6 +501,9 @@ python check_ccswitch_health.py inspect \
 | `thinking` | ✅ | Dual probe: disable + enable |
 | `tools` | ✅ | Minimal side-effect-free tool protocol probe |
 | `vision` | ❌ | Embedded 1×1 PNG; enable with `--include ...,vision` |
+| `cache-replay` | ❌ | temp=1 twin fire for cache replay/temp-clamp (2 extra requests) |
+| `knowledge-cutoff` | ❌ | before/after bank for model version/generation (6 extra requests) |
+| `js-fingerprint` | ❌ | Single-token random-number distribution fingerprint JSD (default `--js-samples` 50 extra requests) |
 
 **`--source` values**:
 
@@ -515,7 +548,11 @@ python check_ccswitch_health.py inspect \
 [6/7] Tool use
   Status: ✅ pass · support=native
 
-[7/7] Vision · skipped
+[7/7] Authenticity
+  verdict: clean
+  · Crosspack: no anomaly (no Anthropic-only fields in OpenAI response)
+  · Thinking signature: valid (genuine Claude server-side output)
+  · Usage consistency: completion_tokens matches answer length
 
 ------------------------------------------------------------
   Summary: healthy
@@ -541,6 +578,10 @@ python check_ccswitch_health.py inspect \
 | `vision.status` | `pass` / `fail` / `error` / `skipped` / `unsupported` |
 | `usage.present` / `input_tokens` / `output_tokens` | Whether real token counts were parsed |
 | `model_consistency.match` | `exact_match` / `alias_match` / `fuzzy_match` / `mismatch` / `unverifiable` |
+| `authenticity.verdict` | `clean` / `suspicious` / `inconclusive` (authenticity summary) |
+| `authenticity.crosspack` / `thinking_signature` / `usage_consistency` | P0/P1 probes on by default (zero/low new requests) |
+| `authenticity.cache_replay` / `knowledge_cutoff` / `js_fingerprint` | P2 probes, opt-in via `--include` |
+| `authenticity.evidence` | List of suspicious proofs (human-readable) |
 | `summary.verdict` | `healthy` / `available_but_wrong_answer` / `unavailable` / `skipped` |
 | `summary.recommended_actions` | Actionable suggestions based on results |
 
@@ -591,7 +632,7 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 | List models | Type → scope → catalog only / light probe / deep probe; probe modes then choose `listed/configured/both` source |
 | Deep diagnostics | Type → providers; multi-provider mode selects tiers and checks every provider×tier model, while one-provider mode offers one model, all models, or selected models and dimensions |
 | Runtime logs | Recent failures, all logs, statistics, silent routing, live watch, and analysis |
-| Advanced settings | JSON, token budget, thinking, UA, inspect context/vision, check stealth, plus quick-check type/scope; valid only for this launcher process and reset when the window closes |
+| Advanced settings | JSON, token budget, thinking, UA, inspect context/vision, authenticity probes (cache-replay/knowledge-cutoff/js-fingerprint), check stealth, plus quick-check type/scope; valid only for this launcher process and reset when the window closes |
 
 ### Interaction
 
@@ -635,6 +676,7 @@ Interactive terminals support arrow keys/mouse wheel to move, Enter to confirm, 
 - Models from `list-models` ≠ actually usable; they are only declared support lists
 - `inspect` never auto-runs cc-switch failover; it only emits **read-only diagnostics**
 - Anti-detection lowers but cannot eliminate the odds of being flagged: any "verify a correct answer" probe needs a checkable prompt, which is inherently a low-frequency, fixed-shape pattern in real traffic — a structural trade-off, not a bug
+- Authenticity detection is a **probabilistic signal**: 8-bit quantization / same-generation neighbor-tier downgrade is not detectable; GhostPrint-style attacks can theoretically fool the fingerprint; it does not promise "definitive proof of genuineness"
 
 ## Known scenarios and responses
 
@@ -656,14 +698,32 @@ Interactive terminals support arrow keys/mouse wheel to move, Enter to confirm, 
 # Run all tests (Python core + PS1 launcher)
 just test && just test-ps1
 
-# Python core only (247 unit + end-to-end mocks)
+# Python core only (unit + end-to-end mocks)
 just test
 
-# PS1 launcher end-to-end (33 cases; requires pwsh)
+# PS1 launcher end-to-end (requires pwsh)
 just test-ps1
+
+# Docs consistency guard (prevents README drift)
+just lint-docs
 ```
 
-Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **247 Python tests + 33 PS1 tests**.
+Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **612 Python tests + 47 PS1 tests**, distributed by file:
+
+| Test file | Purpose | Cases |
+|-----------|---------|-------|
+| `tests/test_ccpulse_full.py` | Unit + end-to-end (mock SSE / multi-protocol / multi-type) | 398 |
+| `tests/test_archive_trend.py` | Probe archive & trend aggregation | 54 |
+| `tests/test_authenticity.py` | P0 crosspack fields + thinking signature | 14 |
+| `tests/test_usage_consistency.py` | P1 usage consistency static check | 9 |
+| `tests/test_cache_replay.py` | P2-A cache replay / temp-clamp twin fire | 8 |
+| `tests/test_knowledge_cutoff.py` | P2-B knowledge cutoff before/after bank | 9 |
+| `tests/test_js_fingerprint.py` | P2-C single-token distribution fingerprint JSD | 10 |
+| `tests/test_p0_protocol_fix.py` | P0 protocol-inference fix regression | 2 |
+| `tests/test_env_check.py` | Env var override detection | 14 |
+| `tests/test_tui.py` | TUI arrow/mouse selector | 9 |
+| `tests/test_ps1_launcher.py` | PS1 launcher interaction flow | 47 |
+| `tests/test_docs_consistency.py` | Docs ↔ code consistency guard | — |
 
 ### `just` command cheat sheet
 
@@ -685,6 +745,7 @@ Confirmed against `justfile`; available once [just](https://just.systems/) is in
 | `just analyze` | `analyze --since 7d` | Full-dimension analysis |
 | `just test` | `python tests/test_ccpulse_full.py` | Python tests |
 | `just test-ps1` | `python tests/test_ps1_launcher.py` | PS1 launcher tests |
+| `just test-all` | runs all 7 test files | Full test suite |
 | `just lint-docs` | `python tests/test_docs_consistency.py` | Docs consistency guard |
 | `just format` / `just lint` | ruff format / ruff check | Dev formatting & lint |
 
@@ -706,18 +767,60 @@ Uses [ruff](https://github.com/astral-sh/ruff) for formatting and linting (dev-t
 
 ```
 CC-Pulse/
-├── check_ccswitch_health.py   # Main script: probes, catalogs, diagnostics, logs, trends, passive health
-├── run_health_check.ps1       # Windows interactive menu launcher
+├── check_ccswitch_health.py   # Main CLI: argparse command orchestration, provider parsing, reports, log analytics
+├── ccpulse_net.py             # Network layer: HTTP requests, SSE parsing, error classification, TLS, body sanitization
+├── ccpulse_probe.py           # Probe layer: probe_tier/probe_stream, protocol payloads, inspect 7 dims, authenticity 6 probes
+├── ccpulse_store.py           # Storage layer: read-only cc-switch SQLite access, provider/tier parsing, log queries
+├── ccpulse_archive.py         # Archive layer: local probe_history.jsonl read/write, rotation, trend aggregation
+├── ccpulse_env.py             # Env layer: env-var override detection (silent routing)
+├── ccpulse_output.py          # Output layer: ContextVar routing, terminal sanitization, ANSI styles
+├── ccpulse_tui.py             # TUI layer: cross-platform arrow/mouse multi-select
+├── run_health_check.ps1       # Windows desktop interactive menu launcher (PowerShell 7+)
 ├── justfile                   # Common tasks (check, format, lint, test)
 ├── requirements.txt           # Declares: stdlib only, no runtime deps
-├── tests/
-│   ├── test_ccpulse_full.py   # Unit + e2e (mock SSE / multi-protocol / multi-type)
-│   └── test_ps1_launcher.py   # PS1 launcher interaction flow
+├── tests/                     # See the test table above
+├── docs/
+│   ├── CODEMAPS/              # Repo architecture maps (architecture / backend / data / dependencies)
+│   ├── PRD-authenticity-p0.md ~ p2c.md   # Authenticity 6-probe PRD + TDD acceptance
+│   ├── product-research.md    # Internal competitive-research notes
+│   └── README.md              # docs/ index
 ├── CLAUDE.md                  # Project-level Claude Code instructions
 ├── LICENSE                    # MIT License
 ├── README.md                  # Chinese docs
 └── README.en.md               # English docs
 ```
+
+### Layered architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  CLI / PS1 launcher                                       │
+│  check_ccswitch_health.py (argparse) / run_health_check.ps1│
+└────────────┬─────────────────────────────────┬───────────┘
+             │ command dispatch                 │ interactive menu
+             ▼                                 ▼
+┌──────────────────────────┐   ┌───────────────────────────┐
+│ ccpulse_store (read-only SQLite)│   │ ccpulse_tui (selectors)    │
+│ provider / tier / log queries   │   │ ccpulse_output (routing)   │
+└─────────────┬────────────┘   └───────────────────────────┘
+              │ Provider + ModelTier
+              ▼
+┌──────────────────────────────────────────────────────────┐
+│  ccpulse_probe (probe layer)                              │
+│  probe_tier / probe_stream / inspect 7 dimensions        │
+│  authenticity: crosspack / thinking_signature / usage_c  │
+│           cache_replay / knowledge_cutoff / js_fingerprint│
+└────────────┬─────────────────────────────────┬───────────┘
+             │ HTTP                            │ archive
+             ▼                                 ▼
+┌──────────────────────────┐   ┌───────────────────────────┐
+│ ccpulse_net (network)    │   │ ccpulse_archive (trend)    │
+│ HTTP / SSE / error class │   │ probe_history.jsonl        │
+│ TLS / body sanitization  │   └───────────────────────────┘
+└──────────────────────────┘
+```
+
+Four clear layers: `store` parses config read-only → `probe` sends requests and diagnoses → `net` handles transport & sanitization → `archive` persists local trends. `check_ccswitch_health.py` is the single command-orchestration entry; layers are re-exported via `__getattr__` for importlib-based tests.
 
 ---
 
@@ -729,7 +832,48 @@ CC-Pulse/
 | [cc-test](https://github.com/zhoujun681/cc-test) | Rust CLI | Similar goal, but no multi-tier fallback or answer verification |
 | [cc-switcher](https://github.com/jimstratus/cc-switcher) | PowerShell | Switching-first, probing secondary |
 
-CC-Pulse's trade-off: **small and focused** — deep probing for cc-switch providers only (multi-tier fallback + answer verification + config-driven auth + 7-dimension single-model diagnostics). No provider management UI, no switching UI.
+CC-Pulse's trade-off: **small and focused** — deep probing for cc-switch providers only (multi-tier fallback + answer verification + config-driven auth + 7-dimension single-model diagnostics + authenticity detection). No provider management UI, no switching UI.
+
+---
+
+## Technical roadmap
+
+### Design iron rules (intentional, unbreakable)
+
+- **Zero runtime third-party deps**: pure Python standard library (`argparse`/`sqlite3`/`urllib`/`ssl`/`threading`/`concurrent.futures`/`contextvars`/`math`/`re`); no click/typer/rich/aiohttp
+- **API key never leaves the machine**: the key is used only in request headers, never written to logs/reports/archives; response bodies are sanitized via `_sanitize_raw_body` before reaching `raw_body`
+- **Read-only cc-switch SQLite**: opened with `file:...?mode=ro`, never modified; trend data goes to CC-Pulse's own `~/.cc-pulse/probe_history.jsonl`
+- **Never auto-switches providers**: emits read-only diagnostics and switch instructions only; never decides for the user
+- **No web UI / HTML report**: CLI + JSON/NDJSON is the only product form
+
+### Authenticity detection roadmap (P0 → P2-C all shipped)
+
+Sorted by cost-effectiveness — deterministic, key-stays-local, zero-dependency judgments first:
+
+| Stage | Probe | Judgment type | Request cost | Status |
+|-------|-------|---------------|--------------|--------|
+| **P0** | thinking signature | cryptographic (unforgeable) | 0 (reuses thinking response) | ✅ shipped |
+| **P0** | crosspack field detection | field-level JSON parsing | 0 (reuses text/streaming raw body) | ✅ shipped |
+| **P1** | usage consistency static check | billing self-consistency | 0 (reuses text_raw usage) | ✅ shipped |
+| **P2-A** | cache replay / temp-clamp twin fire | temp=1 byte-identical compare | 2 requests | ✅ shipped |
+| **P2-B** | knowledge cutoff before/after bank | factual-knowledge generation split | 6 requests | ✅ shipped |
+| **P2-C** | single-token distribution fingerprint JSD | distribution divergence (paper: *One Token Is Enough*) | 50 (tunable) | ✅ shipped |
+
+**Design trade-offs**:
+- **Self-contained judgments first**: P2-C uses a programmatically constructed `LLM_BIAS_REFERENCE` (preferred numbers ×3 / round numbers ×0.3, normalized) + uniform-distribution dual-hypothesis JSD — no per-vendor fingerprint library (avoids licensing & maintenance)
+- **Deterministic > probabilistic**: P0 thinking signature is cryptographic proof (relays cannot forge), so it ranks highest; P2 distribution fingerprint is a probabilistic signal, so it goes last
+- **Zero new requests first**: P0/P1 reuse existing response bodies at zero extra cost; P2 is where requests start burning
+- **Capability ceiling is explicit**: 8-bit quantization / same-generation neighbor tiers / GhostPrint attacks are acknowledged limits, stated in the report without exaggeration
+
+### Non-goals (YAGNI)
+
+- No logprobs-based methods (most relays don't expose logprobs)
+- No methods requiring a local real model (RUT/IRIS/perplexity need torch/GPU — violates zero-dep)
+- No "definitive proof of genuineness" — only probabilistic signals + evidence
+- No web/HTML report product
+- No provider management / switching / UI (that's cc-switch's domain)
+
+See [docs/PRD-authenticity-p0.md](docs/PRD-authenticity-p0.md) ~ [p2c.md](docs/PRD-authenticity-p2c.md) for details.
 
 ---
 
