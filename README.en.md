@@ -192,6 +192,25 @@ cd cc-pulse
 python check_ccswitch_health.py check --help
 ```
 
+### Preview
+
+<p align="center">
+  <img src="docs/screenshots/check.png" alt="check live progress" width="680"><br>
+  <sub><code>check --failover-only</code> · multi-tier fallback + answer verification; HTTP 200 but empty/wrong answer → unusable</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/inspect.png" alt="inspect 7 dims + authenticity" width="680"><br>
+  <sub><code>inspect --human</code> · 7-dimension diagnostics + 8th dimension "authenticity" (6 probes: thinking signature / crosspack fields / usage consistency / cache replay / knowledge cutoff / distribution fingerprint)</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/env-check.png" alt="env-check silent routing" width="680"><br>
+  <sub><code>env-check</code> · detect env vars overriding cc-switch's choice (silent-routing root cause); exit code 2 on conflict</sub>
+</p>
+
+> Screenshots generated with the project's built-in mock HTTP server — no real keys or providers; data is for illustration only.
+
 ### Get started in 3 seconds
 
 ```bash

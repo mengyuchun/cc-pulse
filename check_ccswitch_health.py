@@ -1434,6 +1434,47 @@ def format_inspect_human(r: dict) -> str:
     else:
         lines.append(f"[7/7] Vision · {vis.get('status', 'not_run')}")
 
+    # [8] 保真鉴别（authenticity）
+    auth = r.get("authenticity") or {}
+    if auth:
+        lines.append("")
+        lines.append("[8/8] 模型保真鉴别 (authenticity)")
+        av = auth.get("verdict")
+        icon = {"clean": "✅", "suspicious": "⚠", "inconclusive": "·"}.get(av, "·")
+        lines.append(f"  verdict：{icon} {av}")
+        # P0/P1 默认探针
+        cp = auth.get("crosspack") or {}
+        if cp.get("findings"):
+            for f in cp["findings"]:
+                lines.append(f"  · 换芯疑似：{f.get('field')} — {f.get('reason')}")
+        else:
+            lines.append(f"  · 换芯字段：{cp.get('note', '无异常')}")
+        ts = auth.get("thinking_signature") or {}
+        sig = ts.get("has_valid_signature")
+        sig_str = {True: "有效签名（确为真 Claude 服务端产出）",
+                   False: "thinking 块无签名，疑似伪造",
+                   None: "未触发 thinking 块"}.get(sig, "未知")
+        lines.append(f"  · thinking 签名：{sig_str}")
+        uc = auth.get("usage_consistency") or {}
+        if uc.get("findings"):
+            for f in uc["findings"]:
+                lines.append(f"  · 计费疑似：{f.get('check')} - {f.get('reason')}")
+        else:
+            lines.append(f"  · usage 自洽：{uc.get('note', '正常')}")
+        # P2 可选探针（仅当开启时显示）
+        cr = auth.get("cache_replay") or {}
+        if cr.get("note") and "未启用" not in cr.get("note", ""):
+            lines.append(f"  · 缓存回放：{cr.get('note')}")
+        kc = auth.get("knowledge_cutoff") or {}
+        if kc.get("note") and "未启用" not in kc.get("note", ""):
+            lines.append(f"  · 知识截止：{kc.get('note')}")
+        js = auth.get("js_fingerprint") or {}
+        if js.get("note") and "未启用" not in js.get("note", ""):
+            lines.append(f"  · 分布指纹：{js.get('note')}")
+        ev = auth.get("evidence") or []
+        if ev and av == "suspicious":
+            lines.append(f"  证据：{'；'.join(ev)}")
+
     lines.append("")
     lines.append("-" * 60)
     lines.append(f"  总结：{r['summary']['verdict']}")

@@ -193,6 +193,25 @@ cd cc-pulse
 python check_ccswitch_health.py check --help
 ```
 
+### 效果预览
+
+<p align="center">
+  <img src="docs/screenshots/check.png" alt="check 实时进度" width="680"><br>
+  <sub><code>check --failover-only</code> · 多档回退 + 校验真实回答，200 但空回答/答非所问标不可用</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/inspect.png" alt="inspect 7 维度 + 保真鉴别" width="680"><br>
+  <sub><code>inspect --human</code> · 7 维度诊断 + 第 8 维「保真鉴别」6 探针（thinking 签名 / 换芯字段 / usage 自洽 / 缓存回放 / 知识截止 / 分布指纹）</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/env-check.png" alt="env-check 静默路由检测" width="680"><br>
+  <sub><code>env-check</code> · 查环境变量是否覆盖了 cc-switch 选择（静默路由根因），有冲突退出码 2</sub>
+</p>
+
+> 截图用项目自带 mock HTTP server 生成，无真实 key/供应商，数据仅供演示。
+
 ### 三秒上手
 
 ```bash
