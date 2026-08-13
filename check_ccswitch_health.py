@@ -129,6 +129,7 @@ from ccpulse_probe import (  # noqa: F401
     _probe_tools,
     _probe_vision,
     _probe_cache_replay,
+    _probe_knowledge_cutoff,
     _resolve_protocol,
     _response_has_thinking_signal,
     _status_badge,
@@ -993,12 +994,20 @@ def run_inspect(args, providers, say) -> int:
             inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
             max_tokens=16, user_agent=_ua,
         )
+    # P2-B: 知识截止 before/after 题库（可选 --include knowledge-cutoff；6 次新请求）
+    knowledge_cutoff = {"suspicious": False, "note": "未启用（--include knowledge-cutoff 开启）"}
+    if "knowledge-cutoff" in include:
+        knowledge_cutoff = _probe_knowledge_cutoff(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            max_tokens=32, user_agent=_ua,
+        )
     auth_verdict, auth_evidence = _authenticity_verdict(
         {
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
+            "knowledge_cutoff": knowledge_cutoff,
         }
     )
     if auth_verdict == "suspicious":
@@ -1032,6 +1041,7 @@ def run_inspect(args, providers, say) -> int:
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
+            "knowledge_cutoff": knowledge_cutoff,
             "verdict": auth_verdict,
             "evidence": auth_evidence,
         },
@@ -2251,9 +2261,10 @@ def _build_parser():
         "--include",
         default=None,
         help="要执行的检查项，逗号分隔；支持：text,streaming,"
-        "model-consistency,protocol,error-classification,metadata,thinking,tools,vision,cache-replay。"
-        "默认全开（不含 vision/cache-replay）；--compare 默认仅 text,streaming。"
-        "cache-replay=temp=1 双发查缓存回放/钳温（2 次额外请求）",
+        "model-consistency,protocol,error-classification,metadata,thinking,tools,vision,cache-replay,knowledge-cutoff。"
+        "默认全开（不含 vision/cache-replay/knowledge-cutoff）；--compare 默认仅 text,streaming。"
+        "cache-replay=temp=1 双发查缓存回放/钳温（2 次额外请求）；"
+        "knowledge-cutoff=before/after 题库查模型版本/世代（6 次额外请求）",
     )
     p_inspect.add_argument(
         "--ttft-timeout",

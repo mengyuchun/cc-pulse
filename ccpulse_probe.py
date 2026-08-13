@@ -793,6 +793,93 @@ def _probe_cache_replay(
     }
 
 
+# ── P2-B 知识截止 before/after 题库 ──────────────────────────────────
+
+# 内置题库：era="before" 所有模型都该答对（2023 年前事实）；
+# era="after" 只有较新模型（截止 ≥2024-09）才该会。
+# 答案键内置代码不进 prompt，防 Agent 抄答案。
+KNOWLEDGE_CUTOFF_QUESTIONS = [
+    {"q": "2020 年奥运会在哪个城市举办？只答城市名。", "expected": "东京", "era": "before"},
+    {"q": "ChatGPT 首次公开发布是哪一年？只答年份。", "expected": "2022", "era": "before"},
+    {"q": "AlphaGo 击败李世石是哪一年？只答年份。", "expected": "2016", "era": "before"},
+    {"q": "Claude 3.5 Sonnet 公开发布于哪一年？只答年份。", "expected": "2024", "era": "after"},
+    {"q": "OpenAI 发布的 o1 模型是哪一年？只答年份。", "expected": "2024", "era": "after"},
+    {"q": "DeepSeek-V3 公开发布于哪一年？只答年份。", "expected": "2024", "era": "after"},
+]
+
+
+def _kc_check_answer(answer: str, expected: str) -> bool:
+    """宽松判分：答案含目标关键词即对（年份/城市名等）。"""
+    a = str(answer or "").strip()
+    e = str(expected or "").strip()
+    if not a or not e:
+        return False
+    return e.lower() in a.lower()
+
+
+def _probe_knowledge_cutoff(
+    p: Provider,
+    tier: ModelTier,
+    timeout: int,
+    skip_tls: bool,
+    *,
+    max_tokens: int,
+    user_agent: str | None,
+) -> dict:
+    """知识截止 before/after 题库探测：区分模型版本/世代。
+
+    before 题（2023 年前事实）所有模型该答对，答错 -> suspicious（异常）。
+    after 题（2024-2025 事件）只有较新模型该会，全错 -> note 标旧模型（不报 suspicious）。
+    每题 1 次请求，本地关键词判分。
+    """
+    details = []
+    before_ok = before_total = 0
+    after_ok = after_total = 0
+    for item in KNOWLEDGE_CUTOFF_QUESTIONS:
+        r = probe_tier(
+            p, tier, timeout, skip_tls, max_tokens=max_tokens,
+            disable_thinking=True, user_agent=user_agent,
+            question=item["q"],
+        )
+        if r.get("status") != 200:
+            details.append({"q": item["q"], "era": item["era"], "correct": None, "answer": r.get("answer", "")})
+            continue
+        ans = str(r.get("answer", "") or "")
+        ok = _kc_check_answer(ans, item["expected"])
+        details.append({"q": item["q"], "era": item["era"], "correct": ok, "answer": ans[:80]})
+        if item["era"] == "before":
+            before_total += 1
+            if ok:
+                before_ok += 1
+        else:
+            after_total += 1
+            if ok:
+                after_ok += 1
+
+    # before 错 = 异常（连老事实都不对）
+    suspicious = before_total > 0 and before_ok < before_total
+    if before_total == 0 and after_total == 0:
+        note = "探测失败无法判定"
+    elif suspicious:
+        note = f"before 题答错 {before_total - before_ok}/{before_total}，连老事实都不对，异常"
+    elif after_total > 0 and after_ok == after_total:
+        note = f"答对 {after_ok}/{after_total} 较新事件，疑似较新模型"
+    elif after_total > 0 and after_ok == 0:
+        note = f"较新事件全错（{after_ok}/{after_total}），疑似旧模型或降级"
+    else:
+        note = f"before {before_ok}/{before_total}，after {after_ok}/{after_total}"
+
+    return {
+        "suspicious": suspicious,
+        "before_correct": before_ok,
+        "before_total": before_total,
+        "after_correct": after_ok,
+        "after_total": after_total,
+        "note": note,
+        "details": details,
+    }
+
+
 def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     """汇总保真判据 → (verdict, evidence)。
 
@@ -803,9 +890,11 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     tsig = auth.get("thinking_signature") or {}
     usage_c = auth.get("usage_consistency") or {}
     cache_r = auth.get("cache_replay") or {}
+    kc = auth.get("knowledge_cutoff") or {}
     cp_susp = bool(crosspack.get("suspicious"))
     uc_susp = bool(usage_c.get("suspicious"))
     cr_susp = bool(cache_r.get("suspicious"))
+    kc_susp = bool(kc.get("suspicious"))
     has_sig = tsig.get("has_valid_signature")  # True/False/None
 
     evidence: list[str] = []
@@ -817,8 +906,10 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
         evidence.append(f"计费疑似：{f.get('check')} - {f.get('reason')}")
     if cr_susp:
         evidence.append(f"缓存/钳温疑似：{cache_r.get('note', '')}")
+    if kc_susp:
+        evidence.append(f"知识截止疑似：{kc.get('note', '')}")
 
-    if cp_susp or has_sig is False or uc_susp or cr_susp:
+    if cp_susp or has_sig is False or uc_susp or cr_susp or kc_susp:
         return "suspicious", evidence
     if has_sig is None and not crosspack:
         return "inconclusive", evidence
@@ -2633,12 +2724,20 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
             max_tokens=16, user_agent=_ua,
         )
+    # P2-B: 知识截止 before/after 题库（可选 --include knowledge-cutoff；6 次新请求）
+    knowledge_cutoff = {"suspicious": False, "note": "未启用（--include knowledge-cutoff 开启）"}
+    if "knowledge-cutoff" in include:
+        knowledge_cutoff = _probe_knowledge_cutoff(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            max_tokens=32, user_agent=_ua,
+        )
     auth_verdict, auth_evidence = _authenticity_verdict(
         {
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
+            "knowledge_cutoff": knowledge_cutoff,
         }
     )
     if auth_verdict == "suspicious":
@@ -2665,6 +2764,7 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
+            "knowledge_cutoff": knowledge_cutoff,
             "verdict": auth_verdict,
             "evidence": auth_evidence,
         },
