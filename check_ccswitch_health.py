@@ -128,6 +128,7 @@ from ccpulse_probe import (  # noqa: F401
     _probe_one_model,
     _probe_tools,
     _probe_vision,
+    _probe_cache_replay,
     _resolve_protocol,
     _response_has_thinking_signal,
     _status_badge,
@@ -985,11 +986,19 @@ def run_inspect(args, providers, say) -> int:
     _usage_raw = text_raw.get("usage") if text_raw else None
     _answer_raw = text_raw.get("answer", "") if text_raw else ""
     usage_consistency = _check_usage_consistency(_usage_raw, _answer_raw, inspect_p.app_type)
+    # P2-A: 缓存回放/钳温双发探测（可选 --include cache-replay；2 次新请求）
+    cache_replay = {"suspicious": False, "identical": None, "note": "未启用（--include cache-replay 开启）"}
+    if "cache-replay" in include:
+        cache_replay = _probe_cache_replay(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            max_tokens=16, user_agent=_ua,
+        )
     auth_verdict, auth_evidence = _authenticity_verdict(
         {
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
+            "cache_replay": cache_replay,
         }
     )
     if auth_verdict == "suspicious":
@@ -1022,6 +1031,7 @@ def run_inspect(args, providers, say) -> int:
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
+            "cache_replay": cache_replay,
             "verdict": auth_verdict,
             "evidence": auth_evidence,
         },
@@ -2241,8 +2251,9 @@ def _build_parser():
         "--include",
         default=None,
         help="要执行的检查项，逗号分隔；支持：text,streaming,"
-        "model-consistency,protocol,error-classification,metadata,thinking,tools。"
-        "默认全开（不含 vision）；--compare 默认仅 text,streaming",
+        "model-consistency,protocol,error-classification,metadata,thinking,tools,vision,cache-replay。"
+        "默认全开（不含 vision/cache-replay）；--compare 默认仅 text,streaming。"
+        "cache-replay=temp=1 双发查缓存回放/钳温（2 次额外请求）",
     )
     p_inspect.add_argument(
         "--ttft-timeout",

@@ -2087,6 +2087,12 @@ try:
         and "suspicious" in auth["usage_consistency"],
         f"usage_consistency={auth.get('usage_consistency')}",
     )
+    test(
+        "authenticity 含 cache_replay 子字段（P2，默认未启用）",
+        isinstance(auth.get("cache_replay"), dict)
+        and "suspicious" in auth["cache_replay"],
+        f"cache_replay={auth.get('cache_replay')}",
+    )
 finally:
     srv.shutdown()
 

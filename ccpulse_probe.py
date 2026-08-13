@@ -347,6 +347,7 @@ def _build_proto_payload(
     max_tokens: int,
     stream: bool,
     suppress: bool,
+    temperature: float | None = None,
 ) -> dict:
     """按协议类型构造 payload dict（不含 headers/body/encode）。"""
     if proto == Protocol.ANTHROPIC_MESSAGES:
@@ -359,6 +360,8 @@ def _build_proto_payload(
             payload["stream"] = True
         if suppress:
             payload["thinking"] = {"type": "disabled"}
+        if temperature is not None:
+            payload["temperature"] = temperature
         return payload
 
     if proto == Protocol.OPENAI_CHAT_COMPLETIONS:
@@ -371,6 +374,8 @@ def _build_proto_payload(
             payload["stream"] = True
         if suppress:
             payload["reasoning_effort"] = "none"
+        if temperature is not None:
+            payload["temperature"] = temperature
         return payload
 
     if proto == Protocol.OPENAI_RESPONSES:
@@ -383,6 +388,7 @@ def _build_proto_payload(
             payload["stream"] = True
         if suppress:
             payload["reasoning"] = {"effort": "minimal"}
+        # Responses 协议不支持 temperature，跳过
         return payload
 
     # Protocol.UNKNOWN → 最小 Anthropic 兼容
@@ -395,6 +401,8 @@ def _build_proto_payload(
         payload["stream"] = True
     if suppress:
         payload["thinking"] = {"type": "disabled"}
+    if temperature is not None:
+        payload["temperature"] = temperature
     return payload
 
 
@@ -407,6 +415,7 @@ def build_probe_request(
     user_agent: str | None = None,
     question: str = PROBE_QUESTION,
     stainless_version: str | None = None,
+    temperature: float | None = None,
 ) -> tuple:
     """构造 (url, method, headers, body)，发真实问题，路径不去重。
 
@@ -415,6 +424,7 @@ def build_probe_request(
     见 _is_thinking_prone_model）发思考抑制字段，避免其耗光 max_tokens 而无
     最终答案；普通 claude 模型不发该字段，更贴近真实 claude-cli，减少指纹。
     question 为实际探测问题（来自问题池随机抽取）；max_tokens 允许调高预算。
+    temperature 非 None 时按协议加 temperature 字段（缓存回放探测用）；None 不发。
     """
     # UA 优先级：CLI --user-agent > 供应商 meta.customUserAgent > 本机 claude-cli 版本
     user_agent = user_agent or p.custom_user_agent
@@ -432,6 +442,7 @@ def build_probe_request(
         max_tokens=max_tokens,
         stream=stream,
         suppress=suppress,
+        temperature=temperature,
     )
     body = json.dumps(payload).encode()
 
@@ -736,6 +747,52 @@ def _check_usage_consistency(usage: dict, answer: str, app_type: str) -> dict:
     return {"suspicious": bool(findings), "findings": findings}
 
 
+def _probe_cache_replay(
+    p: Provider,
+    tier: ModelTier,
+    timeout: int,
+    skip_tls: bool,
+    *,
+    max_tokens: int,
+    user_agent: str | None,
+) -> dict:
+    """缓存回放/钳温双发探测：temp=1 发两次同一 prompt，逐字相同 -> 疑似缓存或钳温。
+
+    正常 temp=1 下同一 prompt 两次请求应有随机性差异；逐字完全相同是强可疑信号。
+    用固定 question（不随机），max_tokens 限低（16）省 token。
+    返回 {suspicious, identical, note, first_answer, second_answer}。
+    """
+    fixed_q = PROBE_PROMPTS[0]["q"] if PROBE_PROMPTS else "1+4="
+    r1 = probe_tier(
+        p, tier, timeout, skip_tls, max_tokens=max_tokens,
+        disable_thinking=True, user_agent=user_agent,
+        temperature=1.0, question=fixed_q,
+    )
+    r2 = probe_tier(
+        p, tier, timeout, skip_tls, max_tokens=max_tokens,
+        disable_thinking=True, user_agent=user_agent,
+        temperature=1.0, question=fixed_q,
+    )
+    a1 = str(r1.get("answer", "") or "")
+    a2 = str(r2.get("answer", "") or "")
+    if r1.get("status") != 200 or r2.get("status") != 200:
+        return {
+            "suspicious": False,
+            "identical": None,
+            "note": f"探测失败无法判定（status={r1.get('status')}/{r2.get('status')}）",
+            "first_answer": a1,
+            "second_answer": a2,
+        }
+    identical = a1 == a2 and a1 != ""
+    return {
+        "suspicious": identical,
+        "identical": identical,
+        "note": "temp=1 双发逐字相同，疑似缓存回放或强制钳温" if identical else "双发答案不同，无缓存回放迹象",
+        "first_answer": a1,
+        "second_answer": a2,
+    }
+
+
 def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     """汇总保真判据 → (verdict, evidence)。
 
@@ -745,8 +802,10 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     crosspack = auth.get("crosspack") or {}
     tsig = auth.get("thinking_signature") or {}
     usage_c = auth.get("usage_consistency") or {}
+    cache_r = auth.get("cache_replay") or {}
     cp_susp = bool(crosspack.get("suspicious"))
     uc_susp = bool(usage_c.get("suspicious"))
+    cr_susp = bool(cache_r.get("suspicious"))
     has_sig = tsig.get("has_valid_signature")  # True/False/None
 
     evidence: list[str] = []
@@ -756,8 +815,10 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
         evidence.append("thinking 块无签名，疑似非真 Claude 服务端产出或第三方模型伪装")
     for f in usage_c.get("findings", []) or []:
         evidence.append(f"计费疑似：{f.get('check')} - {f.get('reason')}")
+    if cr_susp:
+        evidence.append(f"缓存/钳温疑似：{cache_r.get('note', '')}")
 
-    if cp_susp or has_sig is False or uc_susp:
+    if cp_susp or has_sig is False or uc_susp or cr_susp:
         return "suspicious", evidence
     if has_sig is None and not crosspack:
         return "inconclusive", evidence
@@ -1228,14 +1289,21 @@ def probe_tier(
     stainless_version: str | None = None,
     stealth: bool = False,
     max_retries: int = 0,
+    temperature: float | None = None,
+    question: str | None = None,
 ) -> dict:
     """探测单个档位，返回结果字典（含 usage / raw_body 供 inspect 复用）。
 
     问题从 PROBE_PROMPTS 随机抽取（避免固定 prompt 被识别），按配对答案宽松校验。
     stealth=True 时请求前随机延迟 STEALTH_JITTER_MIN~MAX 秒，弱化脚本式流量尖峰。
+    temperature 非 None 时透传给 build_probe_request（缓存回放探测用）。
+    question 非 None 时覆盖随机抽取（双发探测需固定同一问题）。
     """
-    prompt = random.choice(PROBE_PROMPTS)
-    question, expected = prompt["q"], prompt["a"]
+    if question is None:
+        prompt = random.choice(PROBE_PROMPTS)
+        question, expected = prompt["q"], prompt["a"]
+    else:
+        expected = ""
     url, method, headers, body = build_probe_request(
         p,
         tier,
@@ -1244,6 +1312,7 @@ def probe_tier(
         user_agent=user_agent,
         question=question,
         stainless_version=stainless_version,
+        temperature=temperature,
     )
     empty_usage = extract_usage("")
     if not url:
@@ -2557,11 +2626,19 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
     _usage = (text_raw or {}).get("usage") if text_raw else None
     _answer = (text_raw or {}).get("answer", "") if text_raw else ""
     usage_consistency = _check_usage_consistency(_usage, _answer, inspect_p.app_type)
+    # P2-A: 缓存回放/钳温双发探测（可选 --include cache-replay；2 次新请求）
+    cache_replay = {"suspicious": False, "identical": None, "note": "未启用（--include cache-replay 开启）"}
+    if "cache-replay" in include:
+        cache_replay = _probe_cache_replay(
+            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
+            max_tokens=16, user_agent=_ua,
+        )
     auth_verdict, auth_evidence = _authenticity_verdict(
         {
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
+            "cache_replay": cache_replay,
         }
     )
     if auth_verdict == "suspicious":
@@ -2587,6 +2664,7 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
+            "cache_replay": cache_replay,
             "verdict": auth_verdict,
             "evidence": auth_evidence,
         },
