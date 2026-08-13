@@ -206,18 +206,19 @@ test("输出含 '高级设置'", "高级设置" in combined)
 test("显示当前设置", "JSON 输出" in combined and "probe-max-tokens" in combined)
 test("显示上下文档位", "上下文档位" in combined or "512k" in combined)
 test("显示 vision 设置", "vision" in combined.lower())
+test("显示保真探针入口", "保真·" in combined)
 
 
 print("\n[PS1] 高级设置端到端：开启 JSON 后快速体检输出 JSON")
-# [4]高级设置 -> 1(JSON项) -> y 开 -> 10/返主菜单 -> [1]体检 -> [1]快速 -> 不深挖(4) -> [5]退出
+# [4]高级设置 -> 1(JSON项) -> y 开 -> 13/返主菜单 -> [1]体检 -> [1]快速 -> 不深挖(5) -> [5]退出
 stdin_text = (
     "4\n"  # 主菜单: 高级设置
     "1\n"  # 选第 1 项: JSON
     "y\n"  # JSON: 开
-    "10\n"  # 返回主菜单（末项）
+    "13\n"  # 返回主菜单（末项）
     "1\n"  # 主菜单: 体检
     "1\n"  # 子菜单: 快速
-    "4\n"  # 深挖选择：不深挖
+    "5\n"  # 深挖选择：不深挖（末项）
     "5\n"  # 退出
 )
 rc, out, err = run_pwsh(stdin_text, timeout=120)
@@ -228,7 +229,7 @@ test("stdout 含 JSON 报告", '"schema_version"' in combined or '"providers"' i
 
 
 print("\n[PS1] 高级设置：上下文档位 1m + vision 后 inspect 带参")
-# [4]高级设置 -> 5(上下文档位,选1m) -> 6(vision) y -> 10 返主菜单
+# [4]高级设置 -> 5(上下文档位,选1m) -> 6(vision) y -> 13 返主菜单
 #        -> [1]体检 -> [2]inspect: type默认 -> provider序号1 -> 模式默认 -> model序号1 -> 返回 -> [5]退出
 stdin_text = (
     "4\n"  # 主菜单: 高级设置
@@ -236,7 +237,7 @@ stdin_text = (
     "2\n"  # 上下文档位选择: 2 = 1m
     "6\n"  # 第 6 项: vision
     "y\n"  # vision: 开
-    "10\n"  # 返回主菜单（末项）
+    "13\n"  # 返回主菜单（末项）
     "2\n"  # 主菜单: 深度诊断
     "2\n"  # 子菜单: inspect
     "\n"  # type 默认 claude
@@ -257,6 +258,41 @@ test(
 test(
     "inspect 命令含 vision include",
     "vision" in combined.lower(),
+    f"tail={combined[-500:]}",
+)
+
+
+print("\n[PS1] 高级设置：开启保真探针后 inspect 带参")
+# [4]高级设置 -> 8(知识截止) y -> 9(分布指纹) 5 -> 13 返主菜单
+#        -> [2]inspect: type默认 -> provider序号1 -> 模式默认 -> model序号1 -> 返回 -> [5]退出
+# js-samples 用小值 5（测试只验命令行带参，不真跑 200 次）
+stdin_text = (
+    "4\n"  # 主菜单: 高级设置
+    "8\n"  # 第 8 项: 保真·知识截止
+    "y\n"  # 知识截止: 开
+    "9\n"  # 第 9 项: 保真·分布指纹
+    "5\n"  # 分布指纹: 开 + 采样 5（测试用小值）
+    "13\n"  # 返回主菜单（末项）
+    "2\n"  # 主菜单: 深度诊断
+    "2\n"  # 子菜单: inspect
+    "\n"  # type 默认 claude
+    "1\n"  # provider: 序号 1 (Mock-Provider)
+    "\n"  # 检测模式: 默认 1 (单一模型)
+    "1\n"  # model: 序号 1 (claude-haiku-4-5)
+    "\n"  # 返回主菜单
+    "5\n"
+)
+rc, out, err = run_pwsh(stdin_text, timeout=180)
+combined = out + err
+test("保真探针 inspect exit 0/1/2", rc in (0, 1, 2), f"rc={rc} tail={combined[-500:]}")
+test(
+    "inspect 命令含 knowledge-cutoff include",
+    "knowledge-cutoff" in combined,
+    f"tail={combined[-500:]}",
+)
+test(
+    "inspect 命令含 js-fingerprint + --js-samples",
+    "js-fingerprint" in combined and "--js-samples" in combined,
     f"tail={combined[-500:]}",
 )
 

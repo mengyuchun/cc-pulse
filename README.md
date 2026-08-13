@@ -10,7 +10,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-655%20pass-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-659%20pass-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -647,7 +647,7 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 | 拉模型列表 | 类型 → 范围 → 仅列表 / 轻量探测 / 深度探测；探测时再选 `listed/configured/both` 来源 |
 | 深度诊断 | 类型 → 供应商；多供应商时选档位并逐个检测供应商×档位模型，单供应商可选单模型、全部模型或自选模型和维度 |
 | 运行日志 | 最近失败、最近全部、统计、静默路由、实时监控、分析报表 |
-| 高级设置 | JSON、token 预算、thinking、UA、inspect 上下文/vision、check stealth，以及快速体检类型/范围；仅当前启动器进程有效，关闭窗口后重置 |
+| 高级设置 | JSON、token 预算、thinking、UA、inspect 上下文/vision、保真探针（缓存回放/知识截止/分布指纹）、check stealth，以及快速体检类型/范围；仅当前启动器进程有效，关闭窗口后重置 |
 
 ### 交互方式
 
@@ -763,7 +763,7 @@ just test-ps1
 just lint-docs
 ```
 
-测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **612 个 Python 测试 + 43 个 PS1 测试**，按文件分布：
+测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **612 个 Python 测试 + 47 个 PS1 测试**，按文件分布：
 
 | 测试文件 | 用途 | 用例数 |
 |---------|------|--------|
@@ -777,7 +777,7 @@ just lint-docs
 | `tests/test_p0_protocol_fix.py` | P0 协议推断修复回归 | 2 |
 | `tests/test_env_check.py` | 环境变量覆盖检测 | 14 |
 | `tests/test_tui.py` | TUI 箭头/鼠标选择器 | 9 |
-| `tests/test_ps1_launcher.py` | PS1 启动器交互流程 | 43 |
+| `tests/test_ps1_launcher.py` | PS1 启动器交互流程 | 47 |
 | `tests/test_docs_consistency.py` | 文档与代码一致性守卫 | — |
 
 ### `just` 常用命令速查
@@ -800,6 +800,7 @@ just lint-docs
 | `just analyze` | `analyze --since 7d` | 全维度分析 |
 | `just test` | `python tests/test_ccpulse_full.py` | Python 测试 |
 | `just test-ps1` | `python tests/test_ps1_launcher.py` | PS1 启动器测试 |
+| `just test-all` | 7 个测试文件全跑 | 全套测试 |
 | `just lint-docs` | `python tests/test_docs_consistency.py` | 文档一致性守卫 |
 | `just format` / `just lint` | ruff format / ruff check | 开发期格式化与 lint |
 

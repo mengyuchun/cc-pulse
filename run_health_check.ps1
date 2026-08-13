@@ -259,6 +259,13 @@ $script:AdvVision = $false        # inspect 是否附带 vision
 $script:AdvStealth = $false       # check 隐身模式：降并发 + 请求间随机延迟
 $script:AdvType = "claude"        # check 默认供应商类型：claude/codex/openclaw/all
 $script:AdvScope = "failover"     # check 默认范围：failover(队列+当前) / all(全部)
+# inspect 保真鉴别 P2 探针（默认关，烧请求时显式开）
+$script:AdvAuthCacheReplay = $false      # --include cache-replay（2 次额外请求）
+$script:AdvAuthKnowledgeCutoff = $false  # --include knowledge-cutoff（6 次额外请求）
+$script:AdvAuthJsFingerprint = $false    # --include js-fingerprint（默认 50 次额外请求）
+$script:AdvJsSamples = ""                 # --js-samples N（留空=50）
+$script:AdvType = "claude"        # check 默认供应商类型：claude/codex/openclaw/all
+$script:AdvScope = "failover"     # check 默认范围：failover(队列+当前) / all(全部)
 
 function Show-Banner {
     param([string]$Title = "CC-Pulse · cc-switch 供应商健康检测与单模型深度诊断")
@@ -323,6 +330,25 @@ function Apply-AdvancedArgs {
             } else {
                 $CmdArgs.Add("--include")
                 $CmdArgs.Add("text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools,vision")
+            }
+        }
+        # 保真鉴别 P2 探针：追加到已有 --include（默认全关，烧请求时显式开）
+        $authExtras = @()
+        if ($script:AdvAuthCacheReplay) { $authExtras += "cache-replay" }
+        if ($script:AdvAuthKnowledgeCutoff) { $authExtras += "knowledge-cutoff" }
+        if ($script:AdvAuthJsFingerprint) { $authExtras += "js-fingerprint" }
+        if ($authExtras.Count -gt 0) {
+            $incIdx = $CmdArgs.IndexOf("--include")
+            $extra = $authExtras -join ","
+            if ($incIdx -ge 0 -and $incIdx + 1 -lt $CmdArgs.Count) {
+                $base = [string]$CmdArgs[$incIdx + 1]
+                $CmdArgs[$incIdx + 1] = $base.TrimEnd(',') + "," + $extra
+            } else {
+                $CmdArgs.Add("--include")
+                $CmdArgs.Add("text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools," + $extra)
+            }
+            if ($script:AdvAuthJsFingerprint -and -not [string]::IsNullOrWhiteSpace($script:AdvJsSamples)) {
+                $CmdArgs.Add("--js-samples"); $CmdArgs.Add($script:AdvJsSamples)
             }
         }
     }
@@ -1185,14 +1211,17 @@ function Menu-AdvancedSettings {
             "user-agent        [全部子命令]   $(if ($script:AdvUserAgent) {$script:AdvUserAgent} else {'本机版本（默认）'})"
             "上下文档位        [inspect]      $($script:AdvProbeContext)（无声明时冒烟）"
             "vision 探测       [inspect]      $(if ($script:AdvVision) {'开'} else {'关（默认）'})"
+            "保真·缓存回放     [inspect]      $(if ($script:AdvAuthCacheReplay) {'开'} else {'关（默认）'})"
+            "保真·知识截止     [inspect]      $(if ($script:AdvAuthKnowledgeCutoff) {'开'} else {'关（默认）'})"
+            "保真·分布指纹     [inspect]      $(if ($script:AdvAuthJsFingerprint) {"$($script:AdvJsSamples)次"} else {'关（默认）'})"
             "stealth 隐身      [check]        $(if ($script:AdvStealth) {'开'} else {'关（默认）'})"
             "快速体检类型      [快速体检]     $($script:AdvType)"
             "快速体检范围      [快速体检]     $(if ($script:AdvScope -eq 'all') {'全部'} else {'队列+当前（默认）'})"
             "返回主菜单"
         )
         Write-Host "当前设置（箭头选择修改，ESC 或选末项返回主菜单）:" -ForegroundColor Yellow
-        $pick = Select-MenuItem -Options $opts -Title "高级设置" -Prompt "输入 1-10"
-        if ($pick -lt 0 -or $pick -eq 9) { return }
+        $pick = Select-MenuItem -Options $opts -Title "高级设置" -Prompt "输入 1-13"
+        if ($pick -lt 0 -or $pick -eq 12) { return }
         switch ($pick) {
             0 {
                 $j = Read-HostSafe "JSON 输出？(y/N)"
@@ -1219,14 +1248,32 @@ function Menu-AdvancedSettings {
                 if (-not [string]::IsNullOrWhiteSpace($vi)) { $script:AdvVision = ($vi -eq "y" -or $vi -eq "Y") }
             }
             6 {
+                $cr = Read-HostSafe "inspect 开启保真·缓存回放探针？(y/N)"
+                if (-not [string]::IsNullOrWhiteSpace($cr)) { $script:AdvAuthCacheReplay = ($cr -eq "y" -or $cr -eq "Y") }
+            }
+            7 {
+                $kc = Read-HostSafe "inspect 开启保真·知识截止探针？(y/N)"
+                if (-not [string]::IsNullOrWhiteSpace($kc)) { $script:AdvAuthKnowledgeCutoff = ($kc -eq "y" -or $kc -eq "Y") }
+            }
+            8 {
+                $js = Read-HostSafe "inspect 开启保真·分布指纹探针？(y/N，可填采样次数)"
+                $jsTrim = "$js".Trim()
+                if ([string]::IsNullOrWhiteSpace($jsTrim)) { $script:AdvAuthJsFingerprint = $false; $script:AdvJsSamples = "" }
+                elseif ($jsTrim -eq "y" -or $jsTrim -eq "Y") { $script:AdvAuthJsFingerprint = $true; $script:AdvJsSamples = "" }
+                else {
+                    $script:AdvAuthJsFingerprint = $true
+                    $script:AdvJsSamples = $jsTrim
+                }
+            }
+            9 {
                 $st = Read-HostSafe "check 开启 stealth 隐身？(y/N)"
                 if (-not [string]::IsNullOrWhiteSpace($st)) { $script:AdvStealth = ($st -eq "y" -or $st -eq "Y") }
             }
-            7 {
+            10 {
                 $tyIdx = Select-MenuItem -Options @("claude(默认)", "codex", "openclaw", "all") -Title "快速体检类型"
                 if ($tyIdx -ge 0) { $script:AdvType = switch ($tyIdx) { 1 { "codex" } 2 { "openclaw" } 3 { "all" } default { "claude" } } }
             }
-            8 {
+            11 {
                 $scIdx = Select-MenuItem -Options @("队列+当前(默认,快)", "全部(完整)") -Title "快速体检范围"
                 if ($scIdx -ge 0) { $script:AdvScope = if ($scIdx -eq 1) { "all" } else { "failover" } }
             }
