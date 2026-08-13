@@ -10,7 +10,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-280%20pass-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-655%20pass-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -143,6 +143,34 @@ cc-switch 的基础检测若只覆盖连通性维度，可能只看到前半段�
 | **tools** | 最小无副作用 tool，判定 native/text_only/rejected |
 | **vision** | 内嵌 1×1 PNG，验证是否接受 image（默认关） |
 | **model-consistency** | 请求模型 vs 响应 model 字段，抓静默路由异常 |
+| **authenticity** | 模型保真鉴别（见下节，默认探 P0/P1，P2 探针可选开启） |
+
+### 4. 模型保真鉴别 `authenticity` —— 中转站有没有偷偷换芯/降智
+
+中转站最大暗坑：标榜 Claude Sonnet 4.5，后端却换芯到 GPT / 旧版 / 量化模型 / 甚至脚本兜底。`inspect` 报告的 `authenticity` 字段用 6 个探针做概率性鉴别——**结论是疑似信号，非确定性判定**（GhostPrint 类攻击理论上可骗过）。
+
+| 探针 | 默认 | 原理 | 信号 |
+|------|------|------|------|
+| **换芯字段** `crosspack` | ✅ 开 | 原生 OpenAI 回包只有 prompt/completion/total 三键；冒出 `cache_creation_input_tokens`/`usage_source: anthropic` 等不该出现的字段 → 中转把 OpenAI 请求偷转 Claude 后端再包回。零新请求，复用 text/streaming raw body | 可疑字段 → suspicious |
+| **thinking 签名** `thinking_signature` | ✅ 开 | Claude 扩展思考块的 `signature` 是 Anthropic 服务端密钥签名，客户端只能验证不能生成。中转无法伪造，只能原样透传真 Claude 产出。复用 thinking enable 响应，零新请求 | 有 thinking 块但无签名 → suspicious |
+| **usage 自洽** `usage_consistency` | ✅ 开 | 极短回复（只回 OK）却报高 completion_tokens → 扣费不可解释。复用 text_raw 的 usage，零新请求 | 计费不自洽 → suspicious |
+| **缓存回放/钳温** `cache_replay` | ❌ `--include cache-replay` | temp=1 发两次同一 prompt，逐字完全相同 → 疑似缓存回放或强制钳温（真模型 temp=1 应有随机差异）。2 次新请求 | 双发逐字相同 → suspicious |
+| **知识截止** `knowledge_cutoff` | ❌ `--include knowledge-cutoff` | before 题（2023 年前事实）所有模型都该答对，答错 → 异常；after 题（2024-2025 事件）只有较新模型该会。区分模型版本/世代。6 次新请求 | before 错 → suspicious；after 全错 → note 旧模型 |
+| **分布指纹** `js_fingerprint` | ❌ `--include js-fingerprint` | 问 N 次"给个 1-100 随机数"，真 LLM 永远不均匀（有偏置），脚本 `random.randint` 才近似均匀。JSD 判定更接近均匀 than LLM 偏置参考 → 疑似非 LLM 后端。默认 50 次（`--js-samples N`），<20 不判定 | 分布近均匀 → suspicious |
+
+```bash
+# 默认：crosspack + thinking_signature + usage_consistency（零/低新请求，常开）
+python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-sonnet-4-6" --human
+
+# 全量保真鉴别（额外烧 ~58 次请求，高置信）
+python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-sonnet-4-6" \
+    --include text,streaming,metadata,thinking,tools,cache-replay,knowledge-cutoff,js-fingerprint \
+    --js-samples 200 --human
+```
+
+报告 `authenticity.verdict` ∈ `clean` / `suspicious` / `inconclusive`，`evidence` 列出每条可疑证据。详见 [docs/PRD-authenticity-p0.md](docs/PRD-authenticity-p0.md) ~ `p2c.md`。
+
+**能力边界**（写进报告，不夸大）：高档大模型 8-bit 量化 / 同世代邻档降智（haiku vs sonnet）少量黑盒请求测不出；GhostPrint 攻击（arXiv:2606.16100）理论上可微调弱模型骗过指纹；temperature=0 只能单向证伪不能反证保真。
 
 ---
 
@@ -212,6 +240,7 @@ python check_ccswitch_health.py inspect \
 | 看 cc-switch 被动健康状态 | `health` | 只读 `provider_health`，不发 HTTP；不替代主动探测 |
 | 排查静默路由 | `just env-check` / `routing` | env-check 查环境变量覆盖，routing 看请求 vs 响应模型不一致排行 |
 | 看跨天是否有降级趋势 | `just trend` | 读本地探测归档，按天聚合成功率 / 延迟 / 错误分类 |
+| 看中转站有没有偷偷换芯/降智 | `inspect --include ...,cache-replay,knowledge-cutoff,js-fingerprint` | 6 探针保真鉴别，默认开 P0/P1，P2 烧请求时显式开 |
 | 实时盯着 cc-switch 日志 | `just watch` | 每 3 秒轮询，有新日志就打印，Ctrl+C 结束 |
 | 多维交叉聚合分析 | `just analyze` | 按天 / 模型 / 供应商×日期矩阵，自带 sparkline |
 | check 后批量深挖失败/可用供应商 | `deep-dive` | 读 check JSON 逐个 inspect，CI 可串联 |
@@ -466,6 +495,7 @@ python check_ccswitch_health.py inspect \
 | `--include LIST` | 检查项（见下表） | 默认全开；`--compare` 默认 `text,streaming` |
 | `--probe-context 512k\|1m` | 上下文冒烟档位 | `512k` |
 | `--keep-suffix` | 保留模型 ID 的 `[1M]` 后缀 | 关 |
+| `--js-samples N` | `js-fingerprint` 采样次数（默认 50；建议 ≥200 高置信，<20 不判定） | `50` |
 | `--ttft-timeout SEC` | 流式首 token 超时 | 用 `--timeout` |
 | `--with-metadata` | 兼容旧命令；metadata 默认已开启，不会额外发请求 | 关 |
 | `--probe-delay SEC` | 批量模型间延迟 | `3.0` |
@@ -486,6 +516,9 @@ python check_ccswitch_health.py inspect \
 | `thinking` | ✅ | disable + enable 双发对比 |
 | `tools` | ✅ | 最小无副作用 tool 协议探测 |
 | `vision` | ❌ | 内嵌 1×1 PNG，`--include ...,vision` 才开 |
+| `cache-replay` | ❌ | temp=1 双发查缓存回放/钳温（2 次额外请求） |
+| `knowledge-cutoff` | ❌ | before/after 题库查模型版本/世代（6 次额外请求） |
+| `js-fingerprint` | ❌ | 单 token 随机数分布指纹 JSD（默认 `--js-samples` 50 次额外请求） |
 
 **`--source` 三种来源**：
 
@@ -530,7 +563,11 @@ python check_ccswitch_health.py inspect \
 [6/7] Tool use
   状态：✅ pass · support=native
 
-[7/7] Vision · skipped
+[7/7] 保真鉴别（authenticity）
+  verdict：clean
+  · 换芯字段：无异常（OpenAI 响应未出现 Anthropic 专属字段）
+  · thinking 签名：有效签名（确为真 Claude 服务端产出）
+  · usage 自洽：completion_tokens 与回答长度匹配
 
 ------------------------------------------------------------
   总结：healthy
@@ -556,6 +593,10 @@ python check_ccswitch_health.py inspect \
 | `vision.status` | `pass` / `fail` / `error` / `skipped` / `unsupported` |
 | `usage.present` / `input_tokens` / `output_tokens` | 是否解析到真实 token 计数 |
 | `model_consistency.match` | `exact_match` / `alias_match` / `fuzzy_match` / `mismatch` / `unverifiable` |
+| `authenticity.verdict` | `clean` / `suspicious` / `inconclusive`（保真鉴别汇总） |
+| `authenticity.crosspack` / `thinking_signature` / `usage_consistency` | 默认开启的 P0/P1 探针（零/低新请求） |
+| `authenticity.cache_replay` / `knowledge_cutoff` / `js_fingerprint` | P2 探针，`--include` 显式开启 |
+| `authenticity.evidence` | 可疑证据列表（人类可读） |
 | `summary.verdict` | `healthy` / `available_but_wrong_answer` / `unavailable` / `skipped` |
 | `summary.recommended_actions` | 基于结果的可执行建议列表 |
 
@@ -651,6 +692,46 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 - `inspect` 不会自动执行 cc-switch 故障转移，只输出**只读诊断**
 - thinking 模型即便默认 `max_tokens=1024`，仍可能耗光预算无最终答案——脚本已对 deepseek/glm 等 thinking-prone 模型自动发思考抑制字段；仍误判时可开 `--probe-enable-thinking`
 - 弱化测活指纹只能**降低**被识别概率，不能消除：验证「能否正确回答」本质上需要答案可判定的 prompt，这类流量在真实用户中占比低、模式相对固定
+- 保真鉴别是**概率信号**：8-bit 量化 / 同世代邻档降智测不出；GhostPrint 攻击理论上可骗过指纹审计；不承诺"确定性判定真伪"
+
+## 技术路线
+
+### 设计铁律（刻意为之，不可破）
+
+- **零运行时第三方依赖**：纯 Python 标准库（`argparse`/`sqlite3`/`urllib`/`ssl`/`threading`/`concurrent.futures`/`contextvars`/`math`/`re`），不引 click/typer/rich/aiohttp
+- **key 不出本机**：API key 仅用于请求头，绝不写日志/报告/归档；响应体经 `_sanitize_raw_body` 脱敏后才进 `raw_body`
+- **只读 cc-switch SQLite**：以 `file:...?mode=ro` 打开，绝不改库；趋势数据写 CC-Pulse 自己的 `~/.cc-pulse/probe_history.jsonl`
+- **不自动切换供应商**：只输出只读诊断与切换指令，不替用户做决策
+- **不做 Web 端 / HTML 报告**：CLI + JSON/NDJSON 是唯一产品形态
+
+### 保真鉴别技术路线（P0 → P2-C 已全部上线）
+
+按"性价比"排序，先做不破零依赖、key 不出机、确定性强的判据：
+
+| 阶段 | 探针 | 判据类型 | 请求成本 | 状态 |
+|------|------|---------|---------|------|
+| **P0** | thinking 签名验签 | 密码学级（不可伪造） | 0（复用 thinking 响应） | ✅ `50a6e21` |
+| **P0** | 换芯字段检测 | 字段级 JSON 解析 | 0（复用 text/streaming raw body） | ✅ `50a6e21` |
+| **P1** | usage 自洽静态校验 | 计费一致性 | 0（复用 text_raw usage） | ✅ `7c802c1` |
+| **P2-A** | 缓存回放/钳温双发 | temp=1 双发逐字比对 | 2 次 | ✅ `1bc1e6a` |
+| **P2-B** | 知识截止 before/after 题库 | 事实知识分代 | 6 次 | ✅ `ada4e60` |
+| **P2-C** | 单 token 随机数分布指纹 JSD | 分布散度（论文 One Token Is Enough） | 50 次（可调） | ✅ `cf09d8a` |
+
+**设计取舍**：
+- **自包含判据优先**：P2-C 用程序化构造的 `LLM_BIAS_REFERENCE`（偏好数 ×3 / 整数 ×0.3 归一化）+ 均匀分布双假设 JSD，不内置各家专属指纹库——规避版权与维护成本
+- **确定性 > 概率性**：P0 thinking 签名是密码学级铁证（中转无法伪造），优先级最高；P2 分布指纹是概率信号，放最后
+- **零新请求优先**：P0/P1 全部复用已有响应体，零额外成本；P2 才开始烧请求
+- **能力边界明确**：8-bit 量化 / 同世代邻档 / GhostPrint 攻击是公认天花板，写进报告不夸大
+
+### 不做清单（YAGNI）
+
+- 不做需要 logprobs 的方法（多数中转站不给 logprobs）
+- 不做需要本地真模型的方法（RUT/IRIS/perplexity 需 torch/GPU，违背零依赖）
+- 不做"确定性判定真伪"——只输出概率信号 + 证据
+- 不做 Web/HTML 报告产品
+- 不做供应商管理 / 切换 / 界面（cc-switch 的领域）
+
+详见 [docs/PRD-authenticity-p0.md](docs/PRD-authenticity-p0.md) ~ [p2c.md](docs/PRD-authenticity-p2c.md)，调研结论见内部竞品调研笔记。
 
 ## 已知场景与应对
 
@@ -672,14 +753,32 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 # 运行全部测试（Python 主逻辑 + PS1 启动器）
 just test && just test-ps1
 
-# 仅 Python 主逻辑（192 个单元 + 端到端 mock）
+# 仅 Python 主逻辑（单元 + 端到端 mock）
 just test
 
-# PS1 启动器端到端（33 个，需要 pwsh）
+# PS1 启动器端到端（需要 pwsh）
 just test-ps1
+
+# 文档一致性守卫（防 README 漂移）
+just lint-docs
 ```
 
-测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **247 个 Python 测试 + 33 个 PS1 测试**。
+测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **612 个 Python 测试 + 43 个 PS1 测试**，按文件分布：
+
+| 测试文件 | 用途 | 用例数 |
+|---------|------|--------|
+| `tests/test_ccpulse_full.py` | 单元 + 端到端（Mock SSE / 多协议 / 多类型） | 398 |
+| `tests/test_archive_trend.py` | 探测归档与趋势聚合 | 54 |
+| `tests/test_authenticity.py` | P0 换芯字段 + thinking 签名验签 | 14 |
+| `tests/test_usage_consistency.py` | P1 usage 自洽静态校验 | 9 |
+| `tests/test_cache_replay.py` | P2-A 缓存回放/钳温双发 | 8 |
+| `tests/test_knowledge_cutoff.py` | P2-B 知识截止 before/after 题库 | 9 |
+| `tests/test_js_fingerprint.py` | P2-C 单 token 随机数分布指纹 JSD | 10 |
+| `tests/test_p0_protocol_fix.py` | P0 协议推断修复回归 | 2 |
+| `tests/test_env_check.py` | 环境变量覆盖检测 | 14 |
+| `tests/test_tui.py` | TUI 箭头/鼠标选择器 | 9 |
+| `tests/test_ps1_launcher.py` | PS1 启动器交互流程 | 43 |
+| `tests/test_docs_consistency.py` | 文档与代码一致性守卫 | — |
 
 ### `just` 常用命令速查
 
@@ -722,18 +821,60 @@ just lint
 
 ```
 CC-Pulse/
-├── check_ccswitch_health.py   # 主脚本：健康探测、模型目录、诊断、日志、趋势与被动健康度命令
-├── run_health_check.ps1       # Windows 桌面交互菜单启动器
+├── check_ccswitch_health.py   # 主 CLI：argparse 命令编排、供应商解析、报告与日志分析
+├── ccpulse_net.py             # 网络层：HTTP 请求、SSE 解析、错误分类、TLS 处理、响应体脱敏
+├── ccpulse_probe.py           # 探测层：probe_tier/probe_stream、协议构造、inspect 7 维度、保真鉴别 6 探针
+├── ccpulse_store.py           # 存储层：只读 cc-switch SQLite 访问、provider/tier 解析、日志查询
+├── ccpulse_archive.py         # 归档层：本地 probe_history.jsonl 读写、轮转、趋势聚合
+├── ccpulse_env.py             # 环境层：环境变量覆盖检测（静默路由排查）
+├── ccpulse_output.py          # 输出层：ContextVar 路由、终端脱敏、ANSI 样式
+├── ccpulse_tui.py             # TUI 层：跨平台箭头/鼠标多选选择器
+├── run_health_check.ps1       # Windows 桌面交互菜单启动器（PowerShell 7+）
 ├── justfile                    # 常用任务（检查、格式化、lint、测试）
 ├── requirements.txt           # 声明：纯标准库，无运行时依赖
-├── tests/
-│   ├── test_ccpulse_full.py   # 单元 + 端到端（Mock SSE / 多协议 / 多类型）
-│   └── test_ps1_launcher.py   # PS1 启动器交互流程
+├── tests/                      # 见上方测试表
+├── docs/
+│   ├── CODEMAPS/              # 仓库架构地图（architecture / backend / data / dependencies）
+│   ├── PRD-authenticity-p0.md ~ p2c.md   # 保真鉴别 6 探针的 PRD + TDD 验收
+│   ├── product-research.md    # 内部竞品调研笔记
+│   └── README.md              # docs/ 索引
 ├── CLAUDE.md                   # 项目级 Claude Code 指令
 ├── LICENSE                     # MIT License
 ├── README.md                   # 中文文档
 └── README.en.md                # English docs
 ```
+
+### 分层架构
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  CLI / PS1 启动器                                          │
+│  check_ccswitch_health.py (argparse) / run_health_check.ps1│
+└────────────┬────────────────────────────────────┬────────┘
+             │ 命令分发                             │ 交互菜单
+             ▼                                     ▼
+┌──────────────────────────┐   ┌───────────────────────────┐
+│ ccpulse_store (只读 SQLite)│   │ ccpulse_tui (选择器)        │
+│ provider / tier / 日志查询 │   │ ccpulse_output (输出路由)    │
+└─────────────┬────────────┘   └───────────────────────────┘
+              │ Provider + ModelTier
+              ▼
+┌──────────────────────────────────────────────────────────┐
+│  ccpulse_probe (探测层)                                    │
+│  probe_tier / probe_stream / inspect 7 维度              │
+│  保真鉴别: crosspack / thinking_signature / usage_c      │
+│           cache_replay / knowledge_cutoff / js_fingerprint│
+└────────────┬─────────────────────────────────┬───────────┘
+             │ HTTP                            │ 归档
+             ▼                                 ▼
+┌──────────────────────────┐   ┌───────────────────────────┐
+│ ccpulse_net (网络层)      │   │ ccpulse_archive (趋势归档)  │
+│ HTTP / SSE / 错误分类     │   │ probe_history.jsonl         │
+│ TLS / 响应体脱敏          │   └───────────────────────────┘
+└──────────────────────────┘
+```
+
+四层职责清晰：`store` 只读解析配置 → `probe` 发请求做诊断 → `net` 处理传输与脱敏 → `archive` 落本地趋势。`check_ccswitch_health.py` 是唯一的命令编排入口，各层通过 `__getattr__` re-export 暴露给 importlib 测试。
 
 ---
 
