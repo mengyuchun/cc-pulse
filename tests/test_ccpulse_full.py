@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import ClassVar
@@ -259,6 +260,41 @@ test(
 test(
     "parse_include 显式覆盖",
     mod._parse_include("text,tools", mod._COMPARE_DEFAULT_INCLUDE) == {"text", "tools"},
+)
+_auth_args = types.SimpleNamespace(include=None, auth_full=True)
+test(
+    "auth-full 在默认维度上追加三个保真探针",
+    mod._resolve_inspect_include(_auth_args, mod._INSPECT_DEFAULT_INCLUDE)
+    >= {"cache-replay", "knowledge-cutoff", "js-fingerprint", "text"},
+)
+_auth_custom_args = types.SimpleNamespace(include="text,tools", auth_full=True)
+test(
+    "auth-full 保留显式 include",
+    mod._resolve_inspect_include(_auth_custom_args, mod._INSPECT_DEFAULT_INCLUDE)
+    == {"text", "tools", "cache-replay", "knowledge-cutoff", "js-fingerprint"},
+)
+_parser, *_ = mod._build_parser()
+_auth_cli_args = _parser.parse_args(
+    ["inspect", "--provider", "P", "--model", "M", "--auth-full"]
+)
+test("inspect 接受 --auth-full", _auth_cli_args.auth_full is True)
+
+_human_without_auth = mod.format_inspect_human(
+    {
+        "provider": "P",
+        "model": "M",
+        "model_source": "manual",
+        "protocol": {"detected": "anthropic", "confidence": "likely"},
+        "summary": {"verdict": "healthy", "recommended_actions": []},
+    }
+)
+test(
+    "human 始终显示模型保真鉴别",
+    "[8/8] 模型保真鉴别" in _human_without_auth,
+)
+test(
+    "human 未跑完整探针时提示 auth-full",
+    "--auth-full" in _human_without_auth,
 )
 
 

@@ -655,6 +655,14 @@ def _parse_include(raw: str | None, default: str) -> set[str]:
     return out or {x.strip() for x in default.split(",") if x.strip()}
 
 
+def _resolve_inspect_include(args, default: str) -> set[str]:
+    """解析 inspect 维度；--auth-full 追加完整保真探针。"""
+    include = _parse_include(getattr(args, "include", None), default)
+    if getattr(args, "auth_full", False):
+        include |= {"cache-replay", "knowledge-cutoff", "js-fingerprint"}
+    return include
+
+
 def _parse_compare_targets(spec: str) -> list[tuple[str, str]]:
     """解析 --compare 规格字符串 → [(provider, model), ...]。
 
@@ -698,7 +706,7 @@ def _run_inspect_compare(args, providers, say) -> int:
         return 2
 
     # 对比默认 text+streaming；只有用户显式 --include 才扩维度
-    include = _parse_include(getattr(args, "include", None), _COMPARE_DEFAULT_INCLUDE)
+    include = _resolve_inspect_include(args, _COMPARE_DEFAULT_INCLUDE)
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
     _ua = getattr(args, "user_agent", None)
@@ -861,7 +869,7 @@ def run_inspect(args, providers, say) -> int:
 
     inspect_p = rebuild_provider_for_inspect(p, model_id)
     protocol = detect_protocol(p)
-    include = _parse_include(getattr(args, "include", None), _INSPECT_DEFAULT_INCLUDE)
+    include = _resolve_inspect_include(args, _INSPECT_DEFAULT_INCLUDE)
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
     _ua = getattr(args, "user_agent", None) or p.custom_user_agent
@@ -1171,7 +1179,7 @@ def _run_inspect_all(args, providers, say) -> int:
         f"模型间延迟 {delay}s · 429 重试 {max_retries} 次 · 输出={'human' if human else 'json'}\n"
     )
 
-    include = _parse_include(getattr(args, "include", None), _INSPECT_DEFAULT_INCLUDE)
+    include = _resolve_inspect_include(args, _INSPECT_DEFAULT_INCLUDE)
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
     _ua = getattr(args, "user_agent", None)
@@ -1436,44 +1444,42 @@ def format_inspect_human(r: dict) -> str:
 
     # [8] 保真鉴别（authenticity）
     auth = r.get("authenticity") or {}
-    if auth:
-        lines.append("")
-        lines.append("[8/8] 模型保真鉴别 (authenticity)")
-        av = auth.get("verdict")
-        icon = {"clean": "✅", "suspicious": "⚠", "inconclusive": "·"}.get(av, "·")
-        lines.append(f"  verdict：{icon} {av}")
-        # P0/P1 默认探针
-        cp = auth.get("crosspack") or {}
-        if cp.get("findings"):
-            for f in cp["findings"]:
-                lines.append(f"  · 换芯疑似：{f.get('field')} — {f.get('reason')}")
-        else:
-            lines.append(f"  · 换芯字段：{cp.get('note', '无异常')}")
-        ts = auth.get("thinking_signature") or {}
-        sig = ts.get("has_valid_signature")
-        sig_str = {True: "有效签名（确为真 Claude 服务端产出）",
-                   False: "thinking 块无签名，疑似伪造",
-                   None: "未触发 thinking 块"}.get(sig, "未知")
-        lines.append(f"  · thinking 签名：{sig_str}")
-        uc = auth.get("usage_consistency") or {}
-        if uc.get("findings"):
-            for f in uc["findings"]:
-                lines.append(f"  · 计费疑似：{f.get('check')} - {f.get('reason')}")
-        else:
-            lines.append(f"  · usage 自洽：{uc.get('note', '正常')}")
-        # P2 可选探针（仅当开启时显示）
-        cr = auth.get("cache_replay") or {}
-        if cr.get("note") and "未启用" not in cr.get("note", ""):
-            lines.append(f"  · 缓存回放：{cr.get('note')}")
-        kc = auth.get("knowledge_cutoff") or {}
-        if kc.get("note") and "未启用" not in kc.get("note", ""):
-            lines.append(f"  · 知识截止：{kc.get('note')}")
-        js = auth.get("js_fingerprint") or {}
-        if js.get("note") and "未启用" not in js.get("note", ""):
-            lines.append(f"  · 分布指纹：{js.get('note')}")
-        ev = auth.get("evidence") or []
-        if ev and av == "suspicious":
-            lines.append(f"  证据：{'；'.join(ev)}")
+    lines.append("")
+    lines.append("[8/8] 模型保真鉴别 (authenticity)")
+    av = auth.get("verdict", "inconclusive")
+    icon = {"clean": "✅", "suspicious": "⚠", "inconclusive": "·"}.get(av, "·")
+    lines.append(f"  verdict：{icon} {av}")
+    # P0/P1 默认探针
+    cp = auth.get("crosspack") or {}
+    if cp.get("findings"):
+        for f in cp["findings"]:
+            lines.append(f"  · 换芯疑似：{f.get('field')} — {f.get('reason')}")
+    else:
+        lines.append(f"  · 换芯字段：{cp.get('note', '未取得数据')}")
+    ts = auth.get("thinking_signature") or {}
+    sig = ts.get("has_valid_signature")
+    sig_str = {True: "有效签名（确为真 Claude 服务端产出）",
+               False: "thinking 块无签名，疑似伪造",
+               None: "未触发 thinking 块"}.get(sig, "未知")
+    lines.append(f"  · thinking 签名：{sig_str}")
+    uc = auth.get("usage_consistency") or {}
+    if uc.get("findings"):
+        for f in uc["findings"]:
+            lines.append(f"  · 计费疑似：{f.get('check')} - {f.get('reason')}")
+    else:
+        lines.append(f"  · usage 自洽：{uc.get('note', '未取得数据')}")
+    # P2 可选探针
+    cr = auth.get("cache_replay") or {}
+    kc = auth.get("knowledge_cutoff") or {}
+    js = auth.get("js_fingerprint") or {}
+    for label, probe in (("缓存回放", cr), ("知识截止", kc), ("分布指纹", js)):
+        if probe.get("note") and "未启用" not in probe.get("note", ""):
+            lines.append(f"  · {label}：{probe.get('note')}")
+    if any("未启用" in (probe.get("note") or "") or not probe for probe in (cr, kc, js)):
+        lines.append("  提示：使用 --auth-full 开启缓存回放、知识截止和分布指纹深度鉴别")
+    ev = auth.get("evidence") or []
+    if ev and av == "suspicious":
+        lines.append(f"  证据：{'；'.join(ev)}")
 
     lines.append("")
     lines.append("-" * 60)
@@ -2318,6 +2324,11 @@ def _build_parser():
         "cache-replay=temp=1 双发查缓存回放/钳温（2 次额外请求）；"
         "knowledge-cutoff=before/after 题库查模型版本/世代（6 次额外请求）；"
         "js-fingerprint=单 token 随机数分布指纹 JSD（默认 --js-samples 50 次额外请求）",
+    )
+    p_inspect.add_argument(
+        "--auth-full",
+        action="store_true",
+        help="追加完整保真探针：缓存回放、知识截止、分布指纹；不覆盖 --include",
     )
     p_inspect.add_argument(
         "--js-samples",

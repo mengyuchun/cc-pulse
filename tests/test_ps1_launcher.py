@@ -197,6 +197,25 @@ test(
 )
 
 
+print("\n[PS1] 一键深度保真 - 深度诊断子菜单选项 3")
+# 主菜单 2(深度诊断) -> 子菜单 3(一键深度保真) -> 复用 inspect 交互 -> 返回 -> 5退出
+stdin_text = (
+    "2\n"
+    "3\n"
+    "\n"  # type 默认 claude
+    "1\n"  # provider: Mock-Provider
+    "\n"  # 模式默认单一模型
+    "1\n"  # model
+    "\n"  # 返回主菜单
+    "5\n"
+)
+rc, out, err = run_pwsh(stdin_text, timeout=180)
+combined = out + err
+test("一键深度保真 exit 0/1/2", rc in (0, 1, 2), f"rc={rc} tail={combined[-500:]}")
+test("显示一键深度保真入口", "深度保真鉴别" in combined)
+test("一键深度保真命令含 --auth-full", "--auth-full" in combined)
+
+
 print("\n[PS1] 高级设置 - 选项 4")
 # 新编号菜单：进入后直接 q 返回主菜单 -> 5 退出
 rc, out, err = run_pwsh("4\nq\n5\n", timeout=60)

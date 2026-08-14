@@ -260,6 +260,7 @@ $script:AdvStealth = $false       # check 隐身模式：降并发 + 请求间�
 $script:AdvType = "claude"        # check 默认供应商类型：claude/codex/openclaw/all
 $script:AdvScope = "failover"     # check 默认范围：failover(队列+当前) / all(全部)
 # inspect 保真鉴别 P2 探针（默认关，烧请求时显式开）
+$script:AdvAuthFull = $false             # 一键入口临时启用 --auth-full
 $script:AdvAuthCacheReplay = $false      # --include cache-replay（2 次额外请求）
 $script:AdvAuthKnowledgeCutoff = $false  # --include knowledge-cutoff（6 次额外请求）
 $script:AdvAuthJsFingerprint = $false    # --include js-fingerprint（默认 50 次额外请求）
@@ -316,6 +317,7 @@ function Apply-AdvancedArgs {
     }
     # inspect 专属：上下文档位 + 可选 vision
     if ($SubCommand -eq "inspect") {
+        if ($script:AdvAuthFull) { $CmdArgs.Add("--auth-full") }
         if (-not [string]::IsNullOrWhiteSpace($script:AdvProbeContext)) {
             $CmdArgs.Add("--probe-context"); $CmdArgs.Add($script:AdvProbeContext)
         }
@@ -1127,12 +1129,20 @@ function Menu-Inspect {
 # ── 深度诊断入口（合并拉模型/inspect） ───────────────────────────────────
 function Menu-DeepDiag {
     $mode = Select-MenuItem -Options @(
-        "拉模型列表  GET /v1/models 目录"
-        "深度诊断    inspect 单一/多/对比 (provider, model)"
+        "拉模型列表    GET /v1/models 目录"
+        "深度诊断      inspect 单一/多/对比 (provider, model)"
+        "深度保真鉴别  inspect --auth-full 一键全开"
     ) -Title "深度诊断"
     if ($mode -lt 0) { return 1 }
     if ($mode -eq 0) { return Menu-ListModels }
-    return Menu-Inspect
+    if ($mode -eq 1) { return Menu-Inspect }
+    $oldAuthFull = $script:AdvAuthFull
+    try {
+        $script:AdvAuthFull = $true
+        return Menu-Inspect
+    } finally {
+        $script:AdvAuthFull = $oldAuthFull
+    }
 }
 
 # ── [5] 运行日志（只读 cc-switch 历史） ──────────────────────────
