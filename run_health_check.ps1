@@ -519,12 +519,25 @@ function Invoke-DeepDive {
         return
     }
 
-    # 3. 组合任务：选中供应商 × 选中模型
+    # 3. 组合任务：每家供应商只测它自己探测过的、且被用户选中的模型
+    #    （非笛卡尔积；避免测供应商压根没配的模型 → 无谓 403）
+    $selSet = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($m in @($selModels)) { $null = $selSet.Add($m) }
     $tasks = [System.Collections.Generic.List[object]]::new()
     foreach ($p in $Providers) {
-        foreach ($m in @($selModels)) {
-            $tasks.Add([pscustomobject]@{ provider = $p.name; type = $p.type; model = $m })
+        $provModels = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($a in @($p.attempts)) {
+            if ($a.model) { $null = $provModels.Add($a.model) }
         }
+        foreach ($m in $provModels) {
+            if ($selSet.Contains($m)) {
+                $tasks.Add([pscustomobject]@{ provider = $p.name; type = $p.type; model = $m })
+            }
+        }
+    }
+    if ($tasks.Count -eq 0) {
+        Write-Host "  选中供应商均无选中模型，跳过。" -ForegroundColor Yellow
+        return
     }
     Write-Host "将检测 $($tasks.Count) 个 (供应商, 模型) 组合:" -ForegroundColor Green
     foreach ($t in $tasks) { Write-Host "  · $($t.provider) -> $($t.model)" -ForegroundColor White }
