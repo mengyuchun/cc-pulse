@@ -3088,6 +3088,14 @@ test(
     mod.classify_log_error(400, "maximum prompt length") == "protocol_incompatible",
 )
 test("orphan name", mod.resolve_provider_name("abcd-uuid", {}) == "deleted:abcd-uui")
+test(
+    "classify 罕见 status 不崩（无 _category_from_status）",
+    mod.classify_log_error(301, "redirect") == "protocol_incompatible",
+)
+test(
+    "classify 200 无 msg → none",
+    mod.classify_log_error(200, "") == "none",
+)
 
 
 print("\n[Unit] history/stats/routing on temp sqlite with proxy_request_logs")

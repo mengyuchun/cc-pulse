@@ -311,9 +311,8 @@ def classify_log_error(status_code: int | None, error_message: str | None) -> st
     if st >= 500:
         return ErrorCategory.SERVER.value
     if st and st != 200:
-        cat = _category_from_status(st)
-        if cat is not None:
-            return cat.value
+        # 兜底：1xx/3xx 等罕见 status → protocol_incompatible（语义最接近的现有类别）
+        return ErrorCategory.PROTOCOL_INCOMPATIBLE.value
     if msg.strip():
         return ErrorCategory.UNKNOWN.value
     return ErrorCategory.NONE.value
