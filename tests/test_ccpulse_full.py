@@ -1642,6 +1642,45 @@ finally:
     srv.shutdown()
 
 
+print("\n[Unit] extract_answer 按协议分支（app_type=claude + protocol=openai_chat）")
+# 修复前 extract_answer 按 app_type='claude' 走 content[] 解析，OpenAI chat
+# 响应体被丢成空串 → text 探测恒 fail。该类供应商（cc-switch meta.apiFormat
+# = openai_chat 的 L 站）是 37837e5 修不了的探测盲区。
+_chat_prov = mod.Provider(
+    name="ChatProv",
+    app_type="claude",  # cc-switch app_type 仍标 claude
+    base_url="http://x",
+    api_key="k",
+    auth_mode="bearer",
+    tiers=[],
+    protocol=mod.Protocol.OPENAI_CHAT_COMPLETIONS,  # 协议权威
+    protocol_source="api_format",
+)
+_chat_body = json.dumps(
+    {"choices": [{"message": {"content": "5"}}]}
+)
+test(
+    "extract_answer openai_chat body → 提取 '5'（不论 app_type）",
+    mod.extract_answer(_chat_prov, _chat_body) == "5",
+    f"got={mod.extract_answer(_chat_prov, _chat_body)!r}",
+)
+_anthropic_prov = mod.Provider(
+    name="AntProv",
+    app_type="claude",
+    base_url="http://x",
+    api_key="k",
+    auth_mode="bearer",
+    tiers=[],
+    protocol=mod.Protocol.ANTHROPIC_MESSAGES,
+)
+_ant_body = json.dumps({"content": [{"type": "text", "text": "5"}]})
+test(
+    "extract_answer anthropic_messages body → 提取 '5'",
+    mod.extract_answer(_anthropic_prov, _ant_body) == "5",
+    f"got={mod.extract_answer(_anthropic_prov, _ant_body)!r}",
+)
+
+
 print("\n[End-to-end] SSE 用 \\r\\r 分隔符（_take_event HIGH 修复验证）")
 
 
@@ -3670,6 +3709,61 @@ try:
     )
 finally:
     shutil.rmtree(_tmp2, ignore_errors=True)
+
+
+# 测试 1d：openclaw/codex 的 parse_provider 也设 protocol
+# 修复前：parse_provider 仅在 claude 分支设 protocol=...，openclaw/codex
+# 分支用默认值 UNKNOWN → extract_answer 等下游分支走错协议路径
+_tmp_oc = tempfile.mkdtemp(prefix="ccpulse_proto_oc_")
+_db_oc = os.path.join(_tmp_oc, "test.db")
+try:
+    _conn_oc = sqlite3.connect(_db_oc)
+    _conn_oc.execute(
+        """CREATE TABLE providers (
+            name TEXT, app_type TEXT, settings_config TEXT,
+            is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER
+        )"""
+    )
+    _conn_oc.execute(
+        "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "OC",
+            "openclaw",
+            json.dumps(
+                {"apiKey": "k", "baseUrl": "https://oc.test", "models": [{"id": "g"}]}
+            ),
+            1, 1, 0,
+        ),
+    )
+    _conn_oc.execute(
+        "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "CX",
+            "codex",
+            json.dumps(
+                {
+                    "auth": {"OPENAI_API_KEY": "k"},
+                    "config": 'base_url = "https://cx.test"',
+                }
+            ),
+            1, 1, 0,
+        ),
+    )
+    _conn_oc.commit(); _conn_oc.close()
+    _provs_oc = mod.load_providers(_db_oc, "openclaw")
+    _provs_cx = mod.load_providers(_db_oc, "codex")
+    test(
+        "openclaw parse_provider -> protocol OPENAI_CHAT_COMPLETIONS",
+        _provs_oc[0].protocol == mod.Protocol.OPENAI_CHAT_COMPLETIONS,
+        f"proto={_provs_oc[0].protocol}",
+    )
+    test(
+        "codex parse_provider -> protocol OPENAI_RESPONSES",
+        _provs_cx[0].protocol == mod.Protocol.OPENAI_RESPONSES,
+        f"proto={_provs_cx[0].protocol}",
+    )
+finally:
+    shutil.rmtree(_tmp_oc, ignore_errors=True)
 
 # 测试 1c：meta JSON 解析失败
 _tmp3 = tempfile.mkdtemp(prefix="ccpulse_meta_test3_")

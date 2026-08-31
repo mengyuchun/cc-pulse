@@ -201,6 +201,8 @@ def parse_provider(
                     [ModelTier("default", model, model)],
                     is_current,
                     in_failover,
+                    protocol=Protocol.OPENAI_RESPONSES,
+                    protocol_source="app_type",
                     custom_user_agent=custom_user_agent,
                     notes=notes,
                 )
@@ -214,6 +216,14 @@ def parse_provider(
             if isinstance(m, dict) and m.get("id")
         ]
         if token and base and tiers:
+            # 协议推断：base_url 显式后缀 > app_type 默认
+            base_stripped = base.rstrip("/")
+            if "/chat/completions" in base_stripped:
+                proto = Protocol.OPENAI_CHAT_COMPLETIONS
+                p_source = "url_suffix"
+            else:
+                proto = Protocol.OPENAI_CHAT_COMPLETIONS
+                p_source = "app_type"
             out.append(
                 Provider(
                     name,
@@ -224,6 +234,8 @@ def parse_provider(
                     tiers,
                     is_current,
                     in_failover,
+                    protocol=proto,
+                    protocol_source=p_source,
                     custom_user_agent=custom_user_agent,
                     notes=notes,
                 )

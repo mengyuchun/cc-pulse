@@ -467,16 +467,16 @@ def build_probe_request(
 def extract_answer(p: Provider, resp_body: str) -> str:
     """从响应里提取模型的实际回答文本。
 
-    OpenRouter（claude + is_openrouter）请求走 OpenAI chat/completions，
-    响应是 choices[].message.content，不能按 Anthropic content[] 解析。
+    按权威协议分支（而非 app_type）：claude+apiFormat=openai_chat 这类
+    供应商请求发对了但响应按 Anthropic content[] 解析会丢成空串。
     """
     try:
         j = json.loads(resp_body)
     except (json.JSONDecodeError, TypeError):
         return ""
 
-    # OpenAI chat/completions 格式：openrouter / openclaw / 部分 codex 兼容层
-    if p.is_openrouter or p.app_type in ("openclaw",):
+    # OpenAI chat/completions / OpenAI Responses：统一按 choices[].message.content
+    if p.protocol in (Protocol.OPENAI_CHAT_COMPLETIONS, Protocol.OPENAI_RESPONSES):
         for ch in j.get("choices", []):
             if not isinstance(ch, dict):
                 continue
@@ -486,32 +486,25 @@ def extract_answer(p: Provider, resp_body: str) -> str:
             # 少数兼容层把 content 放在 choice 顶层
             if ch.get("content"):
                 return str(ch["content"]).strip()
+            # Responses 协议可能在 output_text/output
+            ot = j.get("output_text")
+            if isinstance(ot, str) and ot:
+                return ot.strip()
         return ""
 
-    if p.app_type == "claude":
-        # Anthropic: {"content": [{"type":"text","text":"5"}]}
-        parts = []
-        for blk in j.get("content", []):
-            if isinstance(blk, dict) and blk.get("text"):
-                parts.append(blk["text"])
-        return "".join(parts).strip()
-
-    if p.app_type == "codex":
-        # chat/completions 兼容
-        for ch in j.get("choices", []):
-            if not isinstance(ch, dict):
-                continue
-            msg = ch.get("message") or {}
-            if isinstance(msg, dict) and msg.get("content"):
-                return str(msg["content"]).strip()
-        # Responses API: {"output":[{"content":[{"text":"5"}]}]}
-        for o in j.get("output", []):
-            if not isinstance(o, dict):
-                continue
-            for c in o.get("content", []):
-                if isinstance(c, dict) and c.get("text"):
-                    return c["text"].strip()
-    return ""
+    # Anthropic messages: {"content": [{"type":"text","text":"5"}]}
+    parts = []
+    for blk in j.get("content", []):
+        if isinstance(blk, dict) and blk.get("text"):
+            parts.append(blk["text"])
+    # Responses API: {"output":[{"content":[{"text":"5"}]}]}
+    for o in j.get("output", []):
+        if not isinstance(o, dict):
+            continue
+        for c in o.get("content", []):
+            if isinstance(c, dict) and c.get("text"):
+                return c["text"].strip()
+    return "".join(parts).strip()
 
 
 def extract_usage(resp_body: str) -> dict:
