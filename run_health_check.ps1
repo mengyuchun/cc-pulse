@@ -5,6 +5,12 @@
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# 两侧编码统一为 UTF-8：避免用户机器 PYTHONUTF8=1 时 Python 管道 UTF-8
+# 输出被 pwsh 用控制台代码页解码为乱码（中文供应商名 mojibake → 深挖匹配
+# 静默落空 → "库里有供应商却查不到" 假阴性）
+$env:PYTHONUTF8 = "1"
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
+
 # Read-Host 容错：stdin 关闭（管道/自动化）时 Read-Host 抛终止错误，这里吞掉返回 ""。
 # 主菜单已用 [Console]::In.ReadLine() 区分 EOF；子菜单的兜底暂停用它避免崩。
 function Read-HostSafe {
@@ -172,7 +178,9 @@ function Select-FromList {
         Write-Host "  [$($i + 1)] $($Options[$i])"
     }
     Write-Host "  [a] $AllLabel" -ForegroundColor Cyan
-    $sel = Read-Host "输入序号（逗号分隔，如 1,3）或 a 全选（$($(if ($DefaultAll) { '空回车=全选' } else { '默认 1' }))）"
+    $sel = $null
+    try { $sel = Read-Host "输入序号（逗号分隔，如 1,3）或 a 全选（$($(if ($DefaultAll) { '空回车=全选' } else { '默认 1' }))）" }
+    catch { return @() }  # stdin EOF → 空选择，等价于取消
     if ([string]::IsNullOrWhiteSpace($sel)) {
         return @(if ($DefaultAll) { $Options } else { @($Options[0]) })
     }
@@ -213,7 +221,9 @@ function Select-MenuItem {
     for ($i = 0; $i -lt $Options.Count; $i++) {
         Write-Host "  [$($i + 1)] $($Options[$i])"
     }
-    $sel = Read-Host "$Prompt（$DefaultSuffix）"
+    $sel = $null
+    try { $sel = Read-Host "$Prompt（$DefaultSuffix）" }
+    catch { return -1 }  # stdin EOF → 等价于 ESC
     $script:LastInput = $sel
     if ([string]::IsNullOrWhiteSpace($sel)) { return 0 }
     if ($sel -match '^\d+$' -and [int]$sel -ge 1 -and [int]$sel -le $Options.Count) {
@@ -265,8 +275,6 @@ $script:AdvAuthCacheReplay = $false      # --include cache-replay（2 次额外�
 $script:AdvAuthKnowledgeCutoff = $false  # --include knowledge-cutoff（6 次额外请求）
 $script:AdvAuthJsFingerprint = $false    # --include js-fingerprint（默认 50 次额外请求）
 $script:AdvJsSamples = ""                 # --js-samples N（留空=50）
-$script:AdvType = "claude"        # check 默认供应商类型：claude/codex/openclaw/all
-$script:AdvScope = "failover"     # check 默认范围：failover(队列+当前) / all(全部)
 
 function Show-Banner {
     param([string]$Title = "CC-Pulse · cc-switch 供应商健康检测与单模型深度诊断")
@@ -418,6 +426,10 @@ function Invoke-CcpulseJson {
     $proc.StartInfo.RedirectStandardOutput = $true
     $proc.StartInfo.RedirectStandardError = $true
     $proc.StartInfo.CreateNoWindow = $true
+    # 编码与 [Console]::OutputEncoding 一致（头部已设 UTF-8）—— 否则默认
+    # OEM 代码页解码 UTF-8 字节流，中文供应商名变 mojibake
+    $proc.StartInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $proc.StartInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     $null = $proc.Start()
     # stdout 只有 JSON（体量小），异步读到底；stderr 是人类进度，逐行实时转发
     $outTask = $proc.StandardOutput.ReadToEndAsync()
@@ -814,7 +826,7 @@ function Menu-Inspect {
     }
     $type = Get-AppType
     Write-Host ""
-
+    $parsed = $null  # 防跨递归重入读到上一轮的旧 JSON（PS 变量逐层上溯）
     Write-Host "[1/2] 选择供应商" -ForegroundColor Yellow
     Write-Host "正在拉取供应商列表…" -ForegroundColor DarkGray
     $names = @()

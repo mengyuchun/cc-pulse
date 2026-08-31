@@ -1758,12 +1758,13 @@ def run_watch(args, say) -> int:
         args.db, limit=1, fails_only=False, provider_substr=prov
     )
     last_ts = bootstrap[0]["created_at"] if bootstrap else int(time.time())
-    seen_ids: set[str] = set()
+    # dict 保留插入顺序，截断时按真实时序而非哈希顺序（set 截断会丢新条目）
+    seen_ids: dict[str, None] = {}
     if bootstrap:
         rid = str(bootstrap[0].get("request_id") or "")
         cts = bootstrap[0].get("created_at") or 0
         if rid:
-            seen_ids.add(f"{rid}|{cts}")
+            seen_ids[f"{rid}|{cts}"] = None
     say(
         f"watch: 每 {interval}s 轮询 proxy_request_logs"
         f"{'（仅失败）' if fails_only else ''}"
@@ -1785,7 +1786,7 @@ def run_watch(args, say) -> int:
             for r in new_rows:
                 rid = str(r.get("request_id") or "")
                 cts = r.get("created_at") or 0
-                seen_ids.add(f"{rid}|{cts}")
+                seen_ids[f"{rid}|{cts}"] = None
                 st = r.get("status_code")
                 ok = st == 200 and not r.get("error_message")
                 badge = _status_badge(ok, st, r.get("error_category"))
@@ -1809,9 +1810,9 @@ def run_watch(args, say) -> int:
                     _say_colored(f"  {_c('[' + cat + ']', 'red')} {msg}")
                 if r.get("created_at") and r["created_at"] > last_ts:
                     last_ts = r["created_at"]
-            # 防止 seen 无限涨
+            # 防止 seen 无限涨：用 dict 保插入顺序，截断最近 2000 条
             if len(seen_ids) > 5000:
-                seen_ids = set(list(seen_ids)[-2000:])
+                seen_ids = dict(list(seen_ids.items())[-2000:])
             time.sleep(interval)
     except KeyboardInterrupt:
         say("\nwatch 已停止")
@@ -2672,6 +2673,26 @@ def run_deep_dive(args, say) -> int:
             "1",
             "--human",
         ]
+        # 透传探测环境变量，让 deep-dive 与 check 用同一指纹（不然自签名站 check
+        # 过 deep-dive 必挂；UA 严格校验站深挖结论会与体检矛盾）
+        if getattr(args, "user_agent", None):
+            cmd += ["--user-agent", args.user_agent]
+        if getattr(args, "skip_tls_verify", False):
+            cmd += ["--skip-tls-verify"]
+        if getattr(args, "retry", 0):
+            cmd += ["--retry", str(args.retry)]
+        if getattr(args, "probe_max_tokens", None):
+            cmd += ["--probe-max-tokens", str(args.probe_max_tokens)]
+        if getattr(args, "probe_enable_thinking", False):
+            cmd += ["--probe-enable-thinking"]
+        if getattr(args, "stainless_version", None):
+            cmd += ["--stainless-version", args.stainless_version]
+        # 透传 --include / --auth-full：check 默认会带 include，深挖应一致；
+        # --auth-full 让 inspect 加 cache-replay/knowledge-cutoff/js-fingerprint
+        if getattr(args, "include", None):
+            cmd += ["--include", args.include]
+        if getattr(args, "auth_full", False):
+            cmd += ["--auth-full"]
         rc = subprocess.call(cmd)
         if rc != 0 and overall == 0:
             overall = 1
