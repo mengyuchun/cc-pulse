@@ -1550,10 +1550,15 @@ try:
         archive=None,
     )
     rc_dd2 = mod.run_deep_dive(args_ns2, mod.say)
-    test("deep-dive --models m-a = 2任务", len(_dd_calls) == 2, f"calls={len(_dd_calls)}")
+    # 交集语义：--models m-a 时只有 FailProv 配过 m-a；OkProv 只有 m-c，不硬测
     test(
-        "deep-dive m-a 两供应商",
-        {c[c.index("--provider") + 1] for c in _dd_calls} == {"FailProv", "OkProv"},
+        "deep-dive --models m-a 交集 = 1 任务（OkProv 未配 m-a 不硬测）",
+        len(_dd_calls) == 1,
+        f"calls={len(_dd_calls)}",
+    )
+    test(
+        "deep-dive --models m-a 只含 FailProv",
+        {c[c.index("--provider") + 1] for c in _dd_calls} == {"FailProv"},
     )
     # --json dry-run
     args_ns3 = _ns(
@@ -4255,9 +4260,40 @@ test(
 rc2, out2, _ = run_cli(["deep-dive", "--from", _dd_file, "--target", "both", "--json"])
 _rep2 = json.loads(out2) if out2 else {}
 test(
-    "deep-dive --target both = 2家×2模型=4组合",
-    len(_rep2.get("tasks", [])) == 4,
+    "deep-dive --target both = 交集组合（每家只测自己 attempts 的模型）",
+    len(_rep2.get("tasks", [])) == 2,
     f"n={len(_rep2.get('tasks', []))}",
+)
+
+# 交集语义：37837e5 已修 PS1，deep-dive CLI 须一致——每家供应商只测
+# 自己 attempts 里出现过的、且被 --models（或全集）选中的模型。
+_dd_x = {
+    "schema_version": 2,
+    "providers": [
+        {
+            "name": "P1",
+            "type": "claude",
+            "overall_ok": False,
+            "attempts": [{"model": "m-a"}, {"model": "m-b"}],
+        },
+        {
+            "name": "P2",
+            "type": "claude",
+            "overall_ok": False,
+            "attempts": [{"model": "m-a"}],
+        },
+    ],
+}
+_dd_x_file = os.path.join(tempfile.mkdtemp(prefix="ccpulse_dd_"), "dd_x.json")
+with open(_dd_x_file, "w", encoding="utf-8") as _f:
+    json.dump(_dd_x, _f)
+rcx, outx, _ = run_cli(["deep-dive", "--from", _dd_x_file, "--target", "fail", "--json"])
+_repx = json.loads(outx) if outx else {}
+_xpairs = {(t["provider"], t["model"]) for t in _repx.get("tasks", [])}
+test(
+    "deep-dive 交集：P1 两模型 + P2 一模型 = 3 组合（非笛卡尔积 6）",
+    len(_xpairs) == 3 and ("P2", "m-b") not in _xpairs,
+    f"tasks={sorted(_xpairs)}",
 )
 
 rc3, out3, _ = run_cli(
@@ -4265,8 +4301,8 @@ rc3, out3, _ = run_cli(
 )
 _rep3 = json.loads(out3) if out3 else {}
 test(
-    "deep-dive --models 过滤只含 m-fail",
-    len(_rep3.get("tasks", [])) == 2
+    "deep-dive --models 过滤：只含配过 m-fail 的 FailProv（交集）",
+    len(_rep3.get("tasks", [])) == 1
     and all(t["model"] == "m-fail" for t in _rep3.get("tasks", [])),
     f"tasks={_rep3.get('tasks')}",
 )

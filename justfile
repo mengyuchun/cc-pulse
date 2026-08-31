@@ -80,7 +80,7 @@ test:
 test-ps1:
     {{PYTHON}} tests/test_ps1_launcher.py
 
-# 全部测试
+# 全部测试（12 个文件：主套件 + 保真探针专项 + PS1 + 环境检测 + 归档 + TUI + 文档守卫）
 test-all:
     {{PYTHON}} tests/test_ccpulse_full.py
     {{PYTHON}} tests/test_p0_protocol_fix.py
@@ -89,6 +89,11 @@ test-all:
     {{PYTHON}} tests/test_archive_trend.py
     {{PYTHON}} tests/test_tui.py
     {{PYTHON}} tests/test_docs_consistency.py
+    {{PYTHON}} tests/test_authenticity.py
+    {{PYTHON}} tests/test_usage_consistency.py
+    {{PYTHON}} tests/test_cache_replay.py
+    {{PYTHON}} tests/test_knowledge_cutoff.py
+    {{PYTHON}} tests/test_js_fingerprint.py
 
 # 探测历史趋势（归档跨次聚合）
 trend:

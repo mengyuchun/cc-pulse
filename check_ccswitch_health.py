@@ -354,7 +354,7 @@ def _archive_check_results(args, providers, results) -> None:
                 "model": (attempt or {}).get("model", "?") or "?",
                 "status": "ok" if ok else "fail",
                 "latency": (attempt or {}).get("elapsed"),
-                "ttft": (attempt or {}).get("ttft_seconds"),
+                # ttft 字段有意省略：check 路径不跑流式探测，添 null 字段误导
                 "error_category": (attempt or {}).get("error_category"),
             }
             append_record(path, record)
@@ -1104,8 +1104,8 @@ def run_inspect(args, providers, say) -> int:
         ttft = None
         if streaming_result and streaming_result.get("ttft_seconds") is not None:
             ttft = streaming_result["ttft_seconds"]
-        if text_result and text_result.get("elapsed") is not None:
-            lat = text_result.get("elapsed")
+        if text_result and text_result.get("elapsed_seconds") is not None:
+            lat = text_result.get("elapsed_seconds")
         append_record(
             archive_path(getattr(args, "archive", None)),
             {
@@ -2377,7 +2377,7 @@ def _build_parser():
         "--quiet",
         action="store_true",
         help="静默模式：只输出 NDJSON（每模型一行 JSON 到 stdout），关闭所有进度提示；"
-        "与 --human 互斥。退出码：0 全成功 / 3 部分失败 / 4 全部失败",
+        "与 --human 互斥。退出码：0 全成功 / 1 部分失败 / 3 全部失败",
     )
     p_inspect.add_argument(
         "--probe-delay",
@@ -2601,8 +2601,18 @@ def run_deep_dive(args, say) -> int:
         say("无候选模型")
         return 0
 
-    # 任务列表：供应商 × 模型
-    tasks = [(p["name"], p.get("type", "claude"), m) for p in targets for m in models]
+    # 任务列表：每家供应商只测它自己 attempts 里出现过的、且被选中的模型
+    # （交集，非笛卡尔积——与 PS1 Invoke-DeepDive 37837e5 一致，避免测没配的模型白吃 403）
+    sel_set = {m.strip() for m in args.models.split(",") if m.strip()} if args.models else None
+    tasks = []
+    for p in targets:
+        prov_models = {a.get("model") for a in (p.get("attempts") or []) if a.get("model")}
+        for m in prov_models:
+            if sel_set is None or m in sel_set:
+                tasks.append((p["name"], p.get("type", "claude"), m))
+    if not tasks:
+        say("选中供应商均无选中模型")
+        return 0
 
     # 容量保护
     if len(tasks) > 20 and not args.yes:

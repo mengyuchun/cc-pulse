@@ -10,6 +10,7 @@ import math
 import random
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -2402,7 +2403,9 @@ def _probe_one_model(p, model_id, args, deep):
         return out
 
     out["streaming"] = probe_stream(
-        ip, tier, to, tls, max_tokens=mt, disable_thinking=dt, user_agent=ua
+        ip, tier, to, tls,
+        ttft_timeout=getattr(args, "ttft_timeout", None),
+        max_tokens=mt, disable_thinking=dt, user_agent=ua,
     )
     out["metadata"] = probe_model_metadata(
         ip, re.sub(r"\[.*?\]$", "", model_id), to, tls, user_agent=ua
@@ -2410,6 +2413,9 @@ def _probe_one_model(p, model_id, args, deep):
     out["thinking"] = _inspect_thinking(
         ip, tier, text_raw, to, tls, max_tokens=mt, user_agent=ua
     )
+    # thinking 块附带的 _enabled_raw_body（最长 8000 字符）不进 schema，剥掉
+    if isinstance(out["thinking"], dict):
+        out["thinking"].pop("_enabled_raw_body", None)
     out["tools"] = _probe_tools(
         ip, re.sub(r"\[.*?\]$", "", model_id), to, tls, user_agent=ua
     )
