@@ -342,7 +342,6 @@ def _build_proto_url(p: Provider, proto: Protocol) -> str:
 def _build_proto_payload(
     proto: Protocol,
     model_id: str,
-    raw_model: str,
     question: str,
     *,
     max_tokens: int,
@@ -366,8 +365,11 @@ def _build_proto_payload(
         return payload
 
     if proto == Protocol.OPENAI_CHAT_COMPLETIONS:
+        # model 用干净名：[1M] 是 Claude Code 本地能力标记，cc-switch 转发层
+        # （forwarder.rs strip_one_m_suffix_for_upstream）会剥离后才发给上游；
+        # 探测流量保持一致，否则 new-api 系渠道表匹配不上 → 503 假阴性
         payload = {
-            "model": raw_model or model_id,
+            "model": model_id,
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": question}],
         }
@@ -438,7 +440,6 @@ def build_probe_request(
     payload = _build_proto_payload(
         proto,
         tier.model,
-        tier.raw_model,
         question,
         max_tokens=max_tokens,
         stream=stream,

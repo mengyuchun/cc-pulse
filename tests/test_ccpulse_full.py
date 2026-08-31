@@ -339,6 +339,27 @@ url2, _, _, body2 = mod.build_probe_request(p2, p2.tiers[0], stream=True)
 test("Chat Completions 路径", url2 == "https://example.com/chat/completions")
 test("Chat Completions body.stream=True", json.loads(body2).get("stream") is True)
 
+# [1M] 后缀剥离：cc-switch 转发层会把 [1M] 能力标记从 model 字段剥离
+# （forwarder.rs strip_one_m_suffix_for_upstream），上游收到的永远是干净名。
+# CC-Pulse 探测流量须与真实流量一致，否则命中不了渠道（503 假阴性）。
+p2m = mod.Provider(
+    name="X",
+    app_type="openclaw",
+    base_url="https://example.com",
+    api_key="sk",
+    auth_mode="bearer",
+    tiers=[mod.ModelTier("default", "MiniMax-M3", "MiniMax-M3[1M]")],
+    is_current=False,
+    in_failover=False,
+    is_openrouter=False,
+)
+_, _, _, body2m = mod.build_probe_request(p2m, p2m.tiers[0])
+test(
+    "OpenAI Chat 协议剥 [1M] 后缀（与 cc-switch 转发一致）",
+    json.loads(body2m).get("model") == "MiniMax-M3",
+    f"body={body2m}",
+)
+
 # codex
 p3 = mod.Provider(
     name="X",
