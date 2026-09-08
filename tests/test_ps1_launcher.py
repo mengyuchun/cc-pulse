@@ -380,6 +380,53 @@ combined = out + err
 test("日志命令空库不崩溃", rc in (0, 1, 2), f"rc={rc} output={combined[-300:]}")
 
 
+print("\n[PS1] 深挖交集：每家只测自己 attempts 里的模型")
+# P1 配 haiku+sonnet，P2 只配 haiku；全选供应商和模型后应为 3 组合，
+# 不能退回供应商 × 全局模型的 4 组合。
+intersection_db = os.path.join(tmp, "intersection.db")
+conn = sqlite3.connect(intersection_db)
+cur = conn.cursor()
+cur.execute("""CREATE TABLE providers (
+    name TEXT, app_type TEXT, settings_config TEXT,
+    is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER
+)""")
+def _insert_ps1_provider(name, haiku, sonnet=None):
+    env = {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:9/v1",
+        "ANTHROPIC_AUTH_TOKEN": "sk-fake",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku,
+    }
+    if sonnet:
+        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet
+    cur.execute(
+        "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)",
+        (name, "claude", json.dumps({"env": env}), 0, 1, 0),
+    )
+_insert_ps1_provider("P1", "claude-haiku-4-5", "claude-sonnet-4-5")
+_insert_ps1_provider("P2", "claude-haiku-4-5")
+conn.commit()
+conn.close()
+original_db = db_path
+try:
+    db_path = intersection_db
+    rc, out, err = run_pwsh("1\n1\n1\na\na\n5\n", timeout=180)
+finally:
+    db_path = original_db
+combined = out + err
+test("深挖交集 exit 0/1", rc in (0, 1), f"rc={rc} tail={combined[-500:]}")
+test(
+    "交集组合数为 3（非笛卡尔积 4）",
+    "将检测 3 个" in combined,
+    f"tail={combined[-800:]}",
+)
+test(
+    "未配置模型不被硬测",
+    "P2 -> claude-sonnet-4-5" not in combined
+    and "P2  -> claude-sonnet-4-5" not in combined,
+    f"tail={combined[-800:]}",
+)
+
+
 # 汇总
 print("\n" + "=" * 60)
 print(f"  PS1 PASS: {len(PASSED)}")

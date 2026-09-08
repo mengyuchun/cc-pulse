@@ -296,6 +296,29 @@ test(
     "human 未跑完整探针时提示 auth-full",
     "--auth-full" in _human_without_auth,
 )
+_h_auth_on = mod.format_inspect_human(
+    {
+        "provider": "P",
+        "model": "M",
+        "model_source": "manual",
+        "protocol": {"detected": "anthropic", "confidence": "confirmed"},
+        "summary": {"verdict": "healthy", "recommended_actions": []},
+        "authenticity": {
+            "verdict": "clean",
+            "cache_replay": {"note": "双发答案不同，无回放"},
+            "knowledge_cutoff": {"note": "before 全对 / after 全对"},
+            "js_fingerprint": {"note": "JSD=0.12，符合 LLM 偏置特征"},
+        },
+    }
+)
+test(
+    "human 已启用的 P2 探针结果显示 note 且无提示行",
+    "缓存回放：双发答案不同" in _h_auth_on
+    and "知识截止：before 全对" in _h_auth_on
+    and "分布指纹：JSD" in _h_auth_on
+    and "提示：使用 --auth-full" not in _h_auth_on,
+    f"out={_h_auth_on[-400:]}",
+)
 
 
 print("\n[Unit] build_probe_request 含 stream=True")
@@ -2193,6 +2216,45 @@ try:
         isinstance(auth.get("cache_replay"), dict)
         and "suspicious" in auth["cache_replay"],
         f"cache_replay={auth.get('cache_replay')}",
+    )
+finally:
+    srv.shutdown()
+
+
+print("\n[End-to-end] inspect --auth-full 三探针真实执行")
+# b49b83c 的接线此前只有单元层 include 集合断言；这里验证
+# include 集合 → 三处 if "xxx" in include → _probe_* 真调用 全链路。
+# --js-samples 1 让 JSD 样本不足（<20 不判定）但 note 不含「未启用」，
+# 恰好证明探针跑了且不拖时间。
+srv, port = start_server(MockAnthropicHandler)
+try:
+    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
+    rc, out, err = run_cli(
+        [
+            "inspect",
+            "--provider",
+            "Mock-Provider",
+            "--model",
+            "claude-sonnet-4-5",
+            "--auth-full",
+            "--js-samples",
+            "1",
+        ],
+        timeout=60,
+    )
+    j = json.loads(out) if out else {}
+    auth = j.get("authenticity") or {}
+    for _k in ("cache_replay", "knowledge_cutoff", "js_fingerprint"):
+        _note = (auth.get(_k) or {}).get("note") or ""
+        test(
+            f"auth-full {_k} 探针已执行（note 不含未启用）",
+            _note != "" and "未启用" not in _note,
+            f"note={_note!r} rc={rc} err={err[:150]}",
+        )
+    test(
+        "auth-full js_fingerprint 样本不足被标注",
+        "不足" in (auth.get("js_fingerprint") or {}).get("note", ""),
+        f"js={auth.get('js_fingerprint')}",
     )
 finally:
     srv.shutdown()
