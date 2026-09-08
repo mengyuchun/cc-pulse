@@ -1749,10 +1749,59 @@ def _filter_new_watch_rows(rows, last_ts, seen_ids) -> list[dict]:
 
 
 def run_watch(args, say) -> int:
-    """轮询 proxy_request_logs，有新行就打印（Ctrl+C 退出）。"""
+    """轮询 proxy_request_logs，有新行就打印（Ctrl+C 退出）。
+
+    --json：stdout 输出 NDJSON（每行一个 {"event": "row", ...} 事件），
+    人类进度走 stderr，供 jq / CI / 联动脚本消费。
+    """
     interval = max(1, int(getattr(args, "interval", 3) or 3))
     fails_only = getattr(args, "fails", False)
     prov = getattr(args, "provider", None) or None
+    json_mode = getattr(args, "json", False)
+
+    def _emit(line: str) -> None:
+        if not json_mode:
+            _say_colored(line)
+
+    def _emit_row(r: dict) -> None:
+        if json_mode:
+            print(
+                json.dumps(
+                    {"event": "row", **r}, ensure_ascii=False, default=str
+                ),
+                flush=True,
+            )
+            return
+        st = r.get("status_code")
+        ok = st == 200 and not r.get("error_message")
+        badge = _status_badge(ok, st, r.get("error_category"))
+        pname = _sanitize_for_terminal(str(r.get("provider_name") or "?"))
+        ts = r.get("created_at_fmt") or "?"
+        _say_colored(f"{badge} {_c(ts, 'dim')}  {pname}")
+        req_m = _sanitize_for_terminal(str(r.get("request_model") or "?"))
+        act_m = _sanitize_for_terminal(str(r.get("model") or "?"))
+        model_line = f"  {req_m} -> {act_m}"
+        if r.get("routing_mismatch"):
+            model_line += _c("  ⚡路由", "yellow")
+        _say_colored(
+            f"{model_line}  "
+            f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms"
+        )
+        # tokens：in/out + 缓存命中（cc-switch 记账，缺列时 0）
+        it, ot = r.get("input_tokens") or 0, r.get("output_tokens") or 0
+        crt = r.get("cache_read_tokens") or 0
+        cct = r.get("cache_creation_tokens") or 0
+        tok = f"  in={it} out={ot}"
+        if crt or cct:
+            tok += f" cache_r={crt} cache_w={cct}"
+        _say_colored(tok)
+        if r.get("error_message"):
+            cat = _sanitize_for_terminal(str(r.get("error_category") or ""))
+            msg = _sanitize_for_terminal(str(r.get("error_message") or ""))[
+                :160
+            ]
+            _say_colored(f"  {_c('[' + cat + ']', 'red')} {msg}")
+
     # 起点：当前最新 created_at（避免启动时刷屏历史）
     bootstrap = query_proxy_logs(
         args.db, limit=1, fails_only=False, provider_substr=prov
@@ -1765,49 +1814,34 @@ def run_watch(args, say) -> int:
         cts = bootstrap[0].get("created_at") or 0
         if rid:
             seen_ids[f"{rid}|{cts}"] = None
-    say(
+    _emit(
         f"watch: 每 {interval}s 轮询 proxy_request_logs"
         f"{'（仅失败）' if fails_only else ''}"
         f"{' provider~' + prov if prov else ''}"
     )
-    say(f"从 created_at>{last_ts} 开始；Ctrl+C 结束\n")
+    _emit(f"从 created_at>{last_ts} 开始；Ctrl+C 结束\n")
     try:
         while True:
-            # 多取一些，按 id 去重
-            rows = query_proxy_logs(
-                args.db,
-                since_ts=int(last_ts) if last_ts else None,
-                limit=50,
-                fails_only=fails_only,
-                provider_substr=prov,
-            )
+            try:
+                # 突发补拉：拉 200 条兜住重度 agent 会话一秒内 >50 行的尖峰
+                rows = query_proxy_logs(
+                    args.db,
+                    since_ts=int(last_ts) if last_ts else None,
+                    limit=200,
+                    fails_only=fails_only,
+                    provider_substr=prov,
+                )
+            except sqlite3.Error as e:  # SQLITE_BUSY / 文件短暂锁 → 下一轮重试
+                say(f"（读取日志失败，{interval}s 后重试: {e}）")
+                time.sleep(interval)
+                continue
             # query 是 DESC；反转让旧的先打
             new_rows = _filter_new_watch_rows(list(reversed(rows)), last_ts, seen_ids)
             for r in new_rows:
                 rid = str(r.get("request_id") or "")
                 cts = r.get("created_at") or 0
                 seen_ids[f"{rid}|{cts}"] = None
-                st = r.get("status_code")
-                ok = st == 200 and not r.get("error_message")
-                badge = _status_badge(ok, st, r.get("error_category"))
-                pname = _sanitize_for_terminal(str(r.get("provider_name") or "?"))
-                ts = r.get("created_at_fmt") or "?"
-                _say_colored(f"{badge} {_c(ts, 'dim')}  {pname}")
-                req_m = _sanitize_for_terminal(str(r.get("request_model") or "?"))
-                act_m = _sanitize_for_terminal(str(r.get("model") or "?"))
-                model_line = f"  {req_m} -> {act_m}"
-                if r.get("routing_mismatch"):
-                    model_line += _c("  ⚡路由", "yellow")
-                _say_colored(
-                    f"{model_line}  "
-                    f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms"
-                )
-                if r.get("error_message"):
-                    cat = _sanitize_for_terminal(str(r.get("error_category") or ""))
-                    msg = _sanitize_for_terminal(str(r.get("error_message") or ""))[
-                        :160
-                    ]
-                    _say_colored(f"  {_c('[' + cat + ']', 'red')} {msg}")
+                _emit_row(r)
                 if r.get("created_at") and r["created_at"] > last_ts:
                     last_ts = r["created_at"]
             # 防止 seen 无限涨：用 dict 保插入顺序，截断最近 2000 条
@@ -2466,6 +2500,11 @@ def _build_parser():
     p_watch.add_argument("--interval", type=int, default=3, help="轮询间隔秒（默认 3）")
     p_watch.add_argument("--fails", action="store_true", help="只显示失败")
     p_watch.add_argument("--provider", default=None, help="按供应商名子串过滤")
+    p_watch.add_argument(
+        "--json",
+        action="store_true",
+        help="NDJSON 流输出（每行一个 {\"event\":\"row\",...} 到 stdout，人类进度走 stderr）",
+    )
 
     p_analyze = sub.add_parser(
         "analyze", parents=[common], help="多维度聚合分析（按天/模型/供应商交叉）"

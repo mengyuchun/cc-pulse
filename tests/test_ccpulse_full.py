@@ -3563,29 +3563,104 @@ test(
     f"report={analyze_report}",
 )
 
-watch_proc = subprocess.Popen(
-    [PY, "-u", SCRIPT, "watch", "--interval", "1", "--db", log_db],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True,
+# watch e2e：启动后插入新行 → 下一轮轮询应打印（含 tokens + NDJSON 模式）
+# 修复前 watch 只验证启动横幅，从不验证「新行到达真的打印」
+_w_db = os.path.join(tmp, "watch.db")
+_w_conn = sqlite3.connect(_w_db)
+_w_conn.execute("""CREATE TABLE providers (
+    id TEXT, name TEXT, app_type TEXT, settings_config TEXT,
+    is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER
+)""")
+_w_conn.execute(
+    "INSERT INTO providers VALUES (?,?,?,?,?,?,?)",
+    ("pid-w", "Prov-W", "claude", "{}", 1, 1, 0),
 )
-try:
-    deadline = time.monotonic() + 2
-    watch_out = ""
-    watch_err = ""
-    while time.monotonic() < deadline:
-        if watch_proc.poll() is not None:
-            break
-        time.sleep(0.1)
-    watch_proc.terminate()
-    watch_out, watch_err = watch_proc.communicate(timeout=3)
-except subprocess.TimeoutExpired:
-    watch_proc.kill()
-    watch_out, watch_err = watch_proc.communicate(timeout=3)
+_w_conn.execute("""CREATE TABLE proxy_request_logs (
+    request_id TEXT, provider_id TEXT, app_type TEXT, model TEXT,
+    request_model TEXT, input_tokens INTEGER, output_tokens INTEGER,
+    cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
+    input_cost_usd TEXT, output_cost_usd TEXT, cache_read_cost_usd TEXT,
+    cache_creation_cost_usd TEXT, total_cost_usd TEXT,
+    latency_ms INTEGER, first_token_ms INTEGER, duration_ms INTEGER,
+    status_code INTEGER, error_message TEXT, session_id TEXT,
+    provider_type TEXT, is_streaming INTEGER, cost_multiplier TEXT,
+    created_at INTEGER, data_source TEXT, pricing_model TEXT,
+    input_token_semantics INTEGER
+)""")
+_w_now = int(time.time())
+_w_conn.execute(
+    "INSERT INTO proxy_request_logs VALUES (" + ",".join(["?"] * 27) + ")",
+    _log_row("w-boot", "pid-w", "m", 1, 1, 10, 2, 200, None, _w_now),
+)
+_w_conn.commit()
+_w_conn.close()
+
+
+def _watch_run(extra_args, insert_row):
+    """起 watch 进程 → 插入新行 → 等一轮轮询 → terminate 收输出。"""
+    proc = subprocess.Popen(
+        [PY, "-u", SCRIPT, "watch", "--interval", "1", "--db", _w_db] + extra_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(1.2)  # 等第一轮轮询完成（bootstrap 起点 = w-boot）
+        if insert_row:
+            _c = sqlite3.connect(_w_db)
+            _c.execute(
+                "INSERT INTO proxy_request_logs VALUES ("
+                + ",".join(["?"] * 27)
+                + ")",
+                _log_row(
+                    "w-new", "pid-w", "model-w", 1234, 567, 800, 120, 200, None,
+                    int(time.time()),
+                ),
+            )
+            _c.commit()
+            _c.close()
+        time.sleep(1.6)  # 等下一轮轮询捕获新行
+        proc.terminate()
+        out, err = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate(timeout=5)
+    return out, err
+
+
+_w_out, _w_err = _watch_run([], insert_row=True)
 test(
-    "watch CLI 进入轮询",
-    "watch: 每 1s 轮询" in watch_out,
-    f"rc={watch_proc.returncode} out={watch_out[:200]} err={watch_err[:200]}",
+    "watch 打印新行（供应商名）",
+    "Prov-W" in _w_out,
+    f"out={_w_out[:400]!r}",
+)
+test(
+    "watch 新行带 in/out tokens（#1 输入输出显示）",
+    "in=1234" in _w_out and "out=567" in _w_out,
+    f"out={_w_out[:400]!r}",
+)
+
+_w_jout, _w_jerr = _watch_run(["--json"], insert_row=True)
+_w_lines = [ln for ln in _w_jout.splitlines() if ln.strip().startswith("{")]
+_w_new_json = {}
+for _ln in _w_lines:
+    try:
+        _j = json.loads(_ln)
+        if _j.get("event") == "row" and _j.get("request_id") == "w-new":
+            _w_new_json = _j
+            break
+    except (json.JSONDecodeError, TypeError):
+        pass
+test(
+    "watch --json NDJSON 输出新行事件（#6 机器可读）",
+    bool(_w_new_json),
+    f"lines={_w_lines[:3]} out={_w_jout[:400]!r}",
+)
+test(
+    "watch --json 行含 tokens 字段",
+    _w_new_json.get("input_tokens") == 1234
+    and _w_new_json.get("output_tokens") == 567,
+    f"j={_w_new_json}",
 )
 
 shutil.rmtree(tmp, ignore_errors=True)
