@@ -10,7 +10,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-659%20pass-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-593%20pass-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -164,8 +164,10 @@ python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-son
 
 # 全量保真鉴别（额外烧 ~58 次请求，高置信）
 python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-sonnet-4-6" \
-    --include text,streaming,metadata,thinking,tools,cache-replay,knowledge-cutoff,js-fingerprint \
-    --js-samples 200 --human
+    --auth-full --js-samples 200 --human
+# --auth-full 等价追加 cache-replay/knowledge-cutoff/js-fingerprint 三个 P2 探针，
+# 不覆盖 --include；也可用长参数手选维度：
+#   --include text,streaming,metadata,thinking,tools,cache-replay,knowledge-cutoff,js-fingerprint
 ```
 
 报告 `authenticity.verdict` ∈ `clean` / `suspicious` / `inconclusive`，`evidence` 列出每条可疑证据。详见 [docs/PRD-authenticity-p0.md](docs/PRD-authenticity-p0.md) ~ `p2c.md`。
@@ -259,7 +261,7 @@ python check_ccswitch_health.py inspect \
 | 看 cc-switch 被动健康状态 | `health` | 只读 `provider_health`，不发 HTTP；不替代主动探测 |
 | 排查静默路由 | `just env-check` / `routing` | env-check 查环境变量覆盖，routing 看请求 vs 响应模型不一致排行 |
 | 看跨天是否有降级趋势 | `just trend` | 读本地探测归档，按天聚合成功率 / 延迟 / 错误分类 |
-| 看中转站有没有偷偷换芯/降智 | `inspect --include ...,cache-replay,knowledge-cutoff,js-fingerprint` | 6 探针保真鉴别，默认开 P0/P1，P2 烧请求时显式开 |
+| 看中转站有没有偷偷换芯/降智 | `inspect --auth-full` | 6 探针保真鉴别，默认开 P0/P1，`--auth-full` 一键追加 P2 三探针（不覆盖 `--include`） |
 | 实时盯着 cc-switch 日志 | `just watch` | 每 3 秒轮询，有新日志就打印，Ctrl+C 结束 |
 | 多维交叉聚合分析 | `just analyze` | 按天 / 模型 / 供应商×日期矩阵，自带 sparkline |
 | check 后批量深挖失败/可用供应商 | `deep-dive` | 读 check JSON 逐个 inspect，CI 可串联 |
@@ -382,8 +384,13 @@ python check_ccswitch_health.py stats --since 7d
 python check_ccswitch_health.py routing --since 24h --limit 20
 
 # 实时监控（每 3 秒轮询，有新日志就打印，Ctrl+C 结束）
+# 每行带 status/latency/ttft + in/out tokens（缓存读写非零时一并显示）
 python check_ccswitch_health.py watch
 python check_ccswitch_health.py watch --fails --provider Fengwind --interval 5
+
+# NDJSON 流（每行一个 {"event":"row",...} 到 stdout，人类进度走 stderr），
+# 供 jq / 联动脚本消费：
+python check_ccswitch_health.py watch --json | jq 'select(.error_category=="authentication")'
 
 # 可选：附加磁盘日志尾部（大文件只读末尾约 512KB）
 python check_ccswitch_health.py history --fails \
@@ -426,6 +433,7 @@ python check_ccswitch_health.py analyze --since 7d --json
 | `--with-history` | check/inspect 后附 24h 摘要 | check / inspect |
 | `--history-since` | `--with-history` 的时间窗口 | check / inspect |
 | `--interval N` | 轮询间隔秒（默认 3） | watch |
+| `--json` | NDJSON 流输出（stdout 每行一个 row 事件） | watch |
 
 失败原因会映射到与探测相同的 `error_category`（如 `authentication` / `rate_limit` / `network` / `model_not_found`）。
 
@@ -512,6 +520,7 @@ python check_ccswitch_health.py inspect \
 | `--source configured\|listed\|manual` | 模型来源 | `configured` |
 | `--type claude\|codex\|openclaw\|all` | 限定供应商类型 | `claude` |
 | `--include LIST` | 检查项（见下表） | 默认全开；`--compare` 默认 `text,streaming` |
+| `--auth-full` | 一键追加 P2 保真探针（cache-replay/knowledge-cutoff/js-fingerprint），不覆盖 `--include` | 关 |
 | `--probe-context 512k\|1m` | 上下文冒烟档位 | `512k` |
 | `--keep-suffix` | 保留模型 ID 的 `[1M]` 后缀 | 关 |
 | `--js-samples N` | `js-fingerprint` 采样次数（默认 50；建议 ≥200 高置信，<20 不判定） | `50` |
@@ -582,11 +591,14 @@ python check_ccswitch_health.py inspect \
 [6/7] Tool use
   状态：✅ pass · support=native
 
-[7/7] 保真鉴别（authenticity）
-  verdict：clean
+[7/7] Vision · not_run
+
+[8/8] 模型保真鉴别 (authenticity)
+  verdict：✅ clean
   · 换芯字段：无异常（OpenAI 响应未出现 Anthropic 专属字段）
   · thinking 签名：有效签名（确为真 Claude 服务端产出）
   · usage 自洽：completion_tokens 与回答长度匹配
+  提示：使用 --auth-full 开启缓存回放、知识截止和分布指纹深度鉴别
 
 ------------------------------------------------------------
   总结：healthy
@@ -651,8 +663,8 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 
 ```
 [1] 体检              快速/自定义，检测完可深挖
-[2] 深度诊断          拉模型列表/inspect
-[3] 运行日志          失败/统计/路由/实时监控
+[2] 深度诊断          拉模型列表/inspect/深度保真鉴别
+[3] 运行日志          失败/统计/路由/实时监控/env-check/trend/health
 [4] 高级设置          JSON/stealth/thinking/UA
 [5] 退出
 ```
@@ -664,9 +676,9 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 | 快速体检 | 直接读取高级设置的类型和范围；默认 `claude` + 故障转移队列/当前激活 |
 | 自定义健康检测 | 类型 → 队列+当前 / 全部 / 仅当前 / 自选供应商（可多选） |
 | 拉模型列表 | 类型 → 范围 → 仅列表 / 轻量探测 / 深度探测；探测时再选 `listed/configured/both` 来源 |
-| 深度诊断 | 类型 → 供应商；多供应商时选档位并逐个检测供应商×档位模型，单供应商可选单模型、全部模型或自选模型和维度 |
-| 运行日志 | 最近失败、最近全部、统计、静默路由、实时监控、分析报表 |
-| 高级设置 | JSON、token 预算、thinking、UA、inspect 上下文/vision、保真探针（缓存回放/知识截止/分布指纹）、check stealth，以及快速体检类型/范围；仅当前启动器进程有效，关闭窗口后重置 |
+| 深度诊断 | 二级菜单三选一：拉模型列表 / 深度诊断（类型 → 供应商；多供应商时选档位并逐个检测供应商×档位模型，单供应商可选单模型、全部模型或自选模型和维度）/ **深度保真鉴别**（inspect --auth-full 一键全开，复用深度诊断交互） |
+| 运行日志 | 最近失败、最近全部、统计、静默路由、实时监控、分析报表、**排查静默路由（env-check）**、**探测历史趋势（trend）**、被动健康度（health） |
+| 高级设置 | JSON、token 预算、thinking、UA、inspect 上下文/vision、保真探针（缓存回放/知识截止/分布指纹）、check stealth，以及快速体检类型/范围；共 12 项可改 + 返回；仅当前启动器进程有效，关闭窗口后重置 |
 
 ### 交互方式
 
@@ -782,11 +794,11 @@ just test-ps1
 just lint-docs
 ```
 
-测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **612 个 Python 测试 + 47 个 PS1 测试**，按文件分布：
+测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **543 个 Python 测试 + 50 个 PS1 测试**，按文件分布：
 
 | 测试文件 | 用途 | 用例数 |
 |---------|------|--------|
-| `tests/test_ccpulse_full.py` | 单元 + 端到端（Mock SSE / 多协议 / 多类型） | 398 |
+| `tests/test_ccpulse_full.py` | 单元 + 端到端（Mock SSE / 多协议 / 多类型） | 414 |
 | `tests/test_archive_trend.py` | 探测归档与趋势聚合 | 54 |
 | `tests/test_authenticity.py` | P0 换芯字段 + thinking 签名验签 | 14 |
 | `tests/test_usage_consistency.py` | P1 usage 自洽静态校验 | 9 |
@@ -796,7 +808,7 @@ just lint-docs
 | `tests/test_p0_protocol_fix.py` | P0 协议推断修复回归 | 2 |
 | `tests/test_env_check.py` | 环境变量覆盖检测 | 14 |
 | `tests/test_tui.py` | TUI 箭头/鼠标选择器 | 9 |
-| `tests/test_ps1_launcher.py` | PS1 启动器交互流程 | 47 |
+| `tests/test_ps1_launcher.py` | PS1 启动器交互流程 | 50 |
 | `tests/test_docs_consistency.py` | 文档与代码一致性守卫 | — |
 
 ### `just` 常用命令速查
@@ -819,7 +831,7 @@ just lint-docs
 | `just analyze` | `analyze --since 7d` | 全维度分析 |
 | `just test` | `python tests/test_ccpulse_full.py` | Python 测试 |
 | `just test-ps1` | `python tests/test_ps1_launcher.py` | PS1 启动器测试 |
-| `just test-all` | 7 个测试文件全跑 | 全套测试 |
+| `just test-all` | 12 个测试文件全跑 | 全套测试 |
 | `just lint-docs` | `python tests/test_docs_consistency.py` | 文档一致性守卫 |
 | `just format` / `just lint` | ruff format / ruff check | 开发期格式化与 lint |
 

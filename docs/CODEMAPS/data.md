@@ -1,4 +1,4 @@
-<!-- Generated: 2026-07-31 | Files scanned: 10 | Token estimate: ~330 -->
+<!-- Generated: 2026-09-08 | Token estimate: ~330 -->
 # Data Map
 
 ## Sources

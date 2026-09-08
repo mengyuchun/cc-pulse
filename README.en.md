@@ -10,7 +10,7 @@ Don't trust "it connected". Trust "it works". With so many providers, see at a g
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-659%20pass-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/tests-593%20pass-brightgreen.svg)](#tests)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -163,8 +163,10 @@ python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-son
 
 # Full authenticity detection (burns ~58 extra requests, high confidence)
 python check_ccswitch_health.py inspect --provider "Relay-A" --model "claude-sonnet-4-6" \
-    --include text,streaming,metadata,thinking,tools,cache-replay,knowledge-cutoff,js-fingerprint \
-    --js-samples 200 --human
+    --auth-full --js-samples 200 --human
+# --auth-full appends the three P2 probes (cache-replay/knowledge-cutoff/
+# js-fingerprint) without overriding --include; the long form still works:
+#   --include text,streaming,metadata,thinking,tools,cache-replay,knowledge-cutoff,js-fingerprint
 ```
 
 The report's `authenticity.verdict` ∈ `clean` / `suspicious` / `inconclusive`, with `evidence` listing each suspicious proof. See [docs/PRD-authenticity-p0.md](docs/PRD-authenticity-p0.md) ~ `p2c.md`.
@@ -258,7 +260,7 @@ python check_ccswitch_health.py inspect \
 | Passive cc-switch health | `health` | Read `provider_health` only; no HTTP, not a replacement for active probing |
 | Diagnose silent routing | `just env-check` / `routing` | env-check for env-var overrides; routing for request vs response model mismatch |
 | Cross-day degradation trend | `just trend` | Read local probe archive, aggregate by day |
-| Detect if the relay swaps/downgrades the model | `inspect --include ...,cache-replay,knowledge-cutoff,js-fingerprint` | 6-probe authenticity detection; P0/P1 on by default, P2 opt-in |
+| Detect if the relay swaps/downgrades the model | `inspect --auth-full` | 6-probe authenticity detection; P0/P1 on by default, `--auth-full` appends all P2 probes (doesn't override `--include`) |
 | Watch cc-switch logs live | `just watch` | Poll every 3s, prints new entries, Ctrl+C to stop |
 | Multi-dimensional aggregation | `just analyze` | By day / model / provider×day matrix with sparklines |
 | Batch deep-dive after check | `deep-dive` | Read check JSON, inspect each; CI-pipeable |
@@ -365,6 +367,10 @@ python check_ccswitch_health.py stats --since 7d
 python check_ccswitch_health.py routing --since 24h --limit 20
 python check_ccswitch_health.py watch
 python check_ccswitch_health.py watch --fails --provider Fengwind --interval 5
+
+# NDJSON stream (one {"event":"row",...} per line on stdout, human progress on
+# stderr) for jq / automation:
+python check_ccswitch_health.py watch --json | jq 'select(.error_category=="authentication")'
 python check_ccswitch_health.py history --fails \
   --log-file ~/.cc-switch/logs/cc-switch.log --log-lines 80
 ```
@@ -380,6 +386,7 @@ python check_ccswitch_health.py history --fails \
 | `--with-history` | Attach 24h summary after check/inspect | check / inspect |
 | `--history-since` | Time window used by `--with-history` | check / inspect |
 | `--interval N` | Poll interval seconds (default 3) | watch |
+| `--json` | NDJSON stream output (one row event per stdout line) | watch |
 
 Failures map into the same `error_category` enum used by live probes.
 
@@ -497,6 +504,7 @@ python check_ccswitch_health.py inspect \
 | `--source configured\|listed\|manual` | Model source | `configured` |
 | `--type claude\|codex\|openclaw\|all` | Limit provider type | `claude` |
 | `--include LIST` | Checks to run (see table) | all on; `--compare` defaults to `text,streaming` |
+| `--auth-full` | Append all P2 authenticity probes (cache-replay/knowledge-cutoff/js-fingerprint); does not override `--include` | off |
 | `--probe-context 512k\|1m` | Context smoke tier | `512k` |
 | `--keep-suffix` | Keep `[1M]`-style suffixes in model ID | off |
 | `--js-samples N` | `js-fingerprint` sample count (default 50; ≥200 high confidence, <20 no verdict) | `50` |
@@ -567,11 +575,15 @@ python check_ccswitch_health.py inspect \
 [6/7] Tool use
   Status: ✅ pass · support=native
 
-[7/7] Authenticity
-  verdict: clean
+[7/7] Vision · not_run
+
+[8/8] Model authenticity (authenticity)
+  verdict: ✅ clean
   · Crosspack: no anomaly (no Anthropic-only fields in OpenAI response)
   · Thinking signature: valid (genuine Claude server-side output)
   · Usage consistency: completion_tokens matches answer length
+  Tip: use --auth-full to enable cache-replay, knowledge-cutoff and
+  distribution-fingerprint deep detection
 
 ------------------------------------------------------------
   Summary: healthy
@@ -636,8 +648,8 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 
 ```
 [1] Health check          quick / custom, deep-dive after check
-[2] Deep diagnostics      list models / inspect
-[3] Runtime logs          fails / stats / routing / watch
+[2] Deep diagnostics      list models / inspect / full authenticity
+[3] Runtime logs          fails / stats / routing / watch / env-check / trend / health
 [4] Advanced settings     JSON / stealth / thinking / UA
 [5] Exit
 ```
@@ -649,9 +661,9 @@ stream_protocol | ttft_timeout | stream_incomplete | unknown
 | Quick health check | Directly uses type and scope from Advanced settings; defaults to `claude` + failover queue/current provider |
 | Custom health check | Type → queue+current / all / current only / selected providers (multi-select) |
 | List models | Type → scope → catalog only / light probe / deep probe; probe modes then choose `listed/configured/both` source |
-| Deep diagnostics | Type → providers; multi-provider mode selects tiers and checks every provider×tier model, while one-provider mode offers one model, all models, or selected models and dimensions |
-| Runtime logs | Recent failures, all logs, statistics, silent routing, live watch, and analysis |
-| Advanced settings | JSON, token budget, thinking, UA, inspect context/vision, authenticity probes (cache-replay/knowledge-cutoff/js-fingerprint), check stealth, plus quick-check type/scope; valid only for this launcher process and reset when the window closes |
+| Deep diagnostics | Second-level menu with three entries: list models / deep diagnostics (type → providers; multi-provider mode selects tiers and checks every provider×tier model, while one-provider mode offers one model, all models, or selected models and dimensions) / **full authenticity** (inspect --auth-full one-shot, reuses the deep-diagnostics flow) |
+| Runtime logs | Recent failures, all logs, statistics, silent routing, live watch, analysis, **silent-routing triage (env-check)**, **probe trend (trend)**, passive health (health) |
+| Advanced settings | JSON, token budget, thinking, UA, inspect context/vision, authenticity probes (cache-replay/knowledge-cutoff/js-fingerprint), check stealth, plus quick-check type/scope; 12 editable items + back; valid only for this launcher process and reset when the window closes |
 
 ### Interaction
 
@@ -727,11 +739,11 @@ just test-ps1
 just lint-docs
 ```
 
-Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **612 Python tests + 47 PS1 tests**, distributed by file:
+Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **543 Python tests + 50 PS1 tests**, distributed by file:
 
 | Test file | Purpose | Cases |
 |-----------|---------|-------|
-| `tests/test_ccpulse_full.py` | Unit + end-to-end (mock SSE / multi-protocol / multi-type) | 398 |
+| `tests/test_ccpulse_full.py` | Unit + end-to-end (mock SSE / multi-protocol / multi-type) | 414 |
 | `tests/test_archive_trend.py` | Probe archive & trend aggregation | 54 |
 | `tests/test_authenticity.py` | P0 crosspack fields + thinking signature | 14 |
 | `tests/test_usage_consistency.py` | P1 usage consistency static check | 9 |
@@ -741,7 +753,7 @@ Tests use the standard library only, with an embedded mock HTTP server, and neve
 | `tests/test_p0_protocol_fix.py` | P0 protocol-inference fix regression | 2 |
 | `tests/test_env_check.py` | Env var override detection | 14 |
 | `tests/test_tui.py` | TUI arrow/mouse selector | 9 |
-| `tests/test_ps1_launcher.py` | PS1 launcher interaction flow | 47 |
+| `tests/test_ps1_launcher.py` | PS1 launcher interaction flow | 50 |
 | `tests/test_docs_consistency.py` | Docs ↔ code consistency guard | — |
 
 ### `just` command cheat sheet
@@ -764,7 +776,7 @@ Confirmed against `justfile`; available once [just](https://just.systems/) is in
 | `just analyze` | `analyze --since 7d` | Full-dimension analysis |
 | `just test` | `python tests/test_ccpulse_full.py` | Python tests |
 | `just test-ps1` | `python tests/test_ps1_launcher.py` | PS1 launcher tests |
-| `just test-all` | runs all 7 test files | Full test suite |
+| `just test-all` | runs all 12 test files | Full test suite |
 | `just lint-docs` | `python tests/test_docs_consistency.py` | Docs consistency guard |
 | `just format` / `just lint` | ruff format / ruff check | Dev formatting & lint |
 

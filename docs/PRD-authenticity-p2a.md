@@ -1,6 +1,6 @@
 # PRD：模型保真鉴别 P2-A - 缓存回放/钳温双发探测
 
-> 状态：实现中 · 2026-08-13 · P0/P1 已上线 · 调研见 memory `authenticity-probe-research`
+> 状态：已上线（`1bc1e6a`）· 2026-09-08 验收全过 · P0/P1 先行 · 调研见 memory `authenticity-probe-research`
 
 ## 1. 目标
 

@@ -1,4 +1,4 @@
-<!-- Generated: 2026-07-31 | Files scanned: 10 | Token estimate: ~400 -->
+<!-- Generated: 2026-09-08 | Token estimate: ~400 -->
 # Backend / CLI Map
 
 ## Command Paths
@@ -19,7 +19,7 @@ main
 ## Probe Pipeline
 ```
 run_health_check -> ThreadPoolExecutor -> probe -> probe_tier -> _http_request
-run_inspect -> text / streaming / protocol / metadata / context / thinking / tools / vision
+run_inspect -> text / streaming / protocol / metadata / context / thinking / tools / vision / authenticity
 probe_stream -> _drain_sse_stream -> parse_sse_lines
 ```
 

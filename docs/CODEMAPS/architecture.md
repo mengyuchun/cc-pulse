@@ -1,4 +1,4 @@
-<!-- Generated: 2026-08-13 | Files scanned: 8 | Token estimate: ~380 -->
+<!-- Generated: 2026-09-08 | Token estimate: ~380 -->
 # Architecture
 
 ## Shape

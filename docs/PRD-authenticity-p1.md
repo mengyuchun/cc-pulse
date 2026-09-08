@@ -1,6 +1,6 @@
 # PRD：模型保真鉴别 P1 - usage 自洽静态校验
 
-> 状态：实现中 · 2026-08-13 · P0 已上线（`50a6e21`）· 调研见 memory `authenticity-probe-research`
+> 状态：已上线（`7c802c1`）· 2026-09-08 验收全过 · P0 先行（`50a6e21`）· 调研见 memory `authenticity-probe-research`
 
 ## 1. 目标
 

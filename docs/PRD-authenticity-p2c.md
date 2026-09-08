@@ -1,6 +1,6 @@
 # PRD：模型保真鉴别 P2-C - 单 token 随机数分布指纹（JSD）
 
-> 状态：实现中 · 2026-08-13 · P0/P1/P2-A/P2-B 已上线 · 调研见 memory `authenticity-probe-research`
+> 状态：已上线（`cf09d8a`）· 2026-09-08 验收全过 · P0~P2-B 先行 · 调研见 memory `authenticity-probe-research`
 
 ## 1. 目标
 

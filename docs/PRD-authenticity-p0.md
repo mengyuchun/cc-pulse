@@ -1,6 +1,6 @@
 # PRD：模型保真鉴别 P0（thinking 签名验签 + 换芯字段检测）
 
-> 状态：实现中 · 2026-08-13 · 零依赖铁律不变 · 调研见 memory `authenticity-probe-research`
+> 状态：已上线（`50a6e21`）· 2026-09-08 验收全过 · 零依赖铁律不变 · 调研见 memory `authenticity-probe-research`
 
 ## 1. 背景与目标
 

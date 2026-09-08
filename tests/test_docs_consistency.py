@@ -34,6 +34,8 @@ REQUIRED_MARKERS = {
     "--alert-threshold": "cron",
     "trim_archive": "5MB",
     "trend_direction": "↑",
+    # b49b83c：--auth-full 快捷开关必须在中英文 README 留档
+    "--auth-full": "cache-replay",
 }
 
 MENU_MARKERS = {
