@@ -1170,9 +1170,9 @@ function Menu-DeepDiag {
     }
 }
 
-# ── [5] 运行日志（只读 cc-switch 历史） ──────────────────────────
+# ── [5] 运行日志（只读 cc-switch 历史 + cc-pulse 自家归档） ──────
 function Menu-Logs {
-    if (-not (Show-Banner "运行日志 · 只读 cc-switch proxy 日志")) {
+    if (-not (Show-Banner "运行日志 · 只读 cc-switch 历史 + cc-pulse 归档")) {
         Read-HostSafe "按回车返回主菜单" | Out-Null; return 1
     }
     $logOptions = @(
@@ -1182,6 +1182,9 @@ function Menu-Logs {
         "静默路由排行        routing --since 7d"
         "实时监控（轮询）    watch · 有新日志就打印"
         "分析报表            analyze · 按天/模型/供应商交叉"
+        "排查静默路由        env-check · 环境变量是否覆盖 cc-switch"
+        "探测历史趋势        trend --since 7d · cc-pulse 自家归档"
+        "被动健康度          health · cc-switch 真实流量汇总"
         "返回主菜单"
     )
     $idx = Select-MenuItem -Options $logOptions -Title "请选择"
@@ -1220,7 +1223,27 @@ function Menu-Logs {
             $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
             $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
-        6 { return 0 }
+        6 {
+            # 排查静默路由：env-check 不发 HTTP，秒级返回。
+            # README「突然不能用」首推动作——但之前 PS1 没有入口，用户被引导去深挖白烧请求。
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("env-check"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        }
+        7 {
+            # 探测历史趋势：CC-Pulse 自家 ~/.cc-pulse/probe_history.jsonl，
+            # 此前 PS1 用户看不到自己生产的数据
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("trend"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        }
+        8 {
+            $cmdArgs = [System.Collections.Generic.List[string]]::new()
+            $cmdArgs.Add("health"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
+            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+        }
+        9 { return 0 }
         default {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)

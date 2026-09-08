@@ -317,8 +317,9 @@ test(
 
 
 print("\n[PS1] 运行日志入口 - 选项 3")
-# 主菜单 3(运行日志) -> 日志菜单选 7(返回主菜单) -> 主菜单 5 退出
-rc, out, err = run_pwsh("3\n7\n5\n", timeout=60)
+# 主菜单 3(运行日志) -> 日志菜单选 10(返回主菜单) -> 主菜单 5 退出
+# 新增 env-check/trend/health 三个入口后返回项从 7 变 10
+rc, out, err = run_pwsh("3\n10\n5\n", timeout=60)
 combined = out + err
 test(
     "运行日志菜单可见",
