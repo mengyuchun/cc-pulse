@@ -436,8 +436,44 @@ _other_oc_p = mod.Provider(
 )
 _, _, _oc_headers3, _ = mod.build_probe_request(_other_oc_p, _other_oc_p.tiers[0])
 test(
-    "不同 OpenCode Go Provider 不共享 session",
+    "OpenCode Go 不同 Provider 不共享 session",
     _oc_headers1.get("x-opencode-session") != _oc_headers3.get("x-opencode-session"),
+)
+_opencode_v1_p = mod.Provider(
+    name="OpenCode-Go-v1",
+    app_type="openclaw",
+    base_url="https://opencode.ai/zen/go/v1",
+    api_key="k",
+    auth_mode="bearer",
+    tiers=[mod.ModelTier("default", "glm-5.2", "glm-5.2")],
+    protocol=mod.Protocol.OPENAI_CHAT_COMPLETIONS,
+)
+test(
+    "OpenCode Go /zen/go/v1 也识别会话端点",
+    mod._is_opencode_go(_opencode_v1_p),
+)
+_oc_http_calls = []
+_oc_old_http = mod.ccpulse_probe._http_request
+
+def _oc_capture_http(url, method, headers, body, *args):
+    _oc_http_calls.append((url, headers))
+    return type("R", (), {"status": 200, "body": '{"data": []}', "error_category": None, "error_msg": ""})()
+
+mod.ccpulse_probe._http_request = _oc_capture_http
+try:
+    mod.fetch_models(_opencode_v1_p, 3, False)
+finally:
+    mod.ccpulse_probe._http_request = _oc_old_http
+test(
+    "OpenCode Go /v1 models URL 不重复拼接",
+    _oc_http_calls and _oc_http_calls[-1][0] == "https://opencode.ai/zen/go/v1/models"
+    and _oc_http_calls[-1][0].count("/v1") == 1,
+    f"calls={_oc_http_calls}",
+)
+test(
+    "OpenCode Go /v1 models GET 也带 session",
+    _oc_http_calls and bool(_oc_http_calls[-1][1].get("x-opencode-session")),
+    f"calls={_oc_http_calls}",
 )
 
 # codex

@@ -262,9 +262,18 @@ class HistoryResult(TypedDict, total=False):
 
 
 def _is_opencode_go(p: Provider) -> bool:
-    """仅识别 OpenCode Go 官方端点，避免污染其他 OpenAI 兼容站。"""
+    """仅识别 OpenCode Go 官方端点，避免污染其他 OpenAI 兼容站。
+
+    cc-switch 中 OpenCode Go 配置常见 base_url：
+    - https://opencode.ai/zen/go
+    - https://opencode.ai/zen/go/v1
+    接受两者（末尾可选 /v1）；其他 host/path 一律不识别。
+    """
     parsed = urllib.parse.urlsplit(p.base_url)
-    return (parsed.hostname or "").lower() == "opencode.ai" and parsed.path.rstrip("/") == "/zen/go"
+    path = (parsed.path or "").rstrip("/")
+    if (parsed.hostname or "").lower() != "opencode.ai":
+        return False
+    return path in ("/zen/go", "/zen/go/v1")
 
 
 def _opencode_session(p: Provider) -> str:
@@ -278,6 +287,14 @@ def _opencode_session(p: Provider) -> str:
 
 def _opencode_session_headers(p: Provider) -> dict:
     return {"x-opencode-session": _opencode_session(p)} if _is_opencode_go(p) else {}
+
+
+def _strip_v1(suffix: str, base_url: str) -> str:
+    """若 base_url 已含 /v1 结尾则直接拼接；否则补 /v1。"""
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        return base + suffix
+    return base + "/v1" + suffix
 
 
 @dataclass(frozen=True)
@@ -1680,7 +1697,7 @@ def fetch_models(
         # OpenRouter：base 是 .../chat/completions，模型端点是同级 /models
         url = p.base_url.rsplit("/chat/completions", 1)[0].rstrip("/") + "/models"
     else:
-        url = p.base_url.rstrip("/") + "/v1/models"
+        url = _strip_v1("/models", p.base_url)
 
     auth_h = build_auth_headers(p)
     headers = {**auth_h, "Content-Type": "application/json", **_opencode_session_headers(p)}
@@ -1752,7 +1769,7 @@ def probe_model_metadata(
             + f"/models/{quoted_id}"
         )
     else:
-        url = p.base_url.rstrip("/") + f"/v1/models/{quoted_id}"
+        url = _strip_v1(f"/models/{quoted_id}", p.base_url)
 
     auth_h = build_auth_headers(p)
     headers = {**auth_h, "Accept": "application/json", **_opencode_session_headers(p)}
