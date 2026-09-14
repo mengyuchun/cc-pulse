@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypedDict
@@ -260,6 +261,25 @@ class HistoryResult(TypedDict, total=False):
     mismatch_rate: float
 
 
+def _is_opencode_go(p: Provider) -> bool:
+    """仅识别 OpenCode Go 官方端点，避免污染其他 OpenAI 兼容站。"""
+    parsed = urllib.parse.urlsplit(p.base_url)
+    return (parsed.hostname or "").lower() == "opencode.ai" and parsed.path.rstrip("/") == "/zen/go"
+
+
+def _opencode_session(p: Provider) -> str:
+    """为当前探测 Provider 懒生成并复用一个 OpenCode Go 会话 ID。"""
+    session = getattr(p, "_opencode_session_id", None)
+    if session is None:
+        session = str(uuid.uuid4())
+        object.__setattr__(p, "_opencode_session_id", session)
+    return session
+
+
+def _opencode_session_headers(p: Provider) -> dict:
+    return {"x-opencode-session": _opencode_session(p)} if _is_opencode_go(p) else {}
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
@@ -280,7 +300,8 @@ class Provider:
     custom_user_agent: str | None = None
     # notes: cc-switch providers.notes（用户自记的限流/宕机等运营笔记）
     notes: str = ""
-
+    # OpenCode Go 运行期会话；不参与 repr/比较，不进入数据库或报告
+    _opencode_session_id: str | None = field(default=None, repr=False, compare=False)
 
 # --- from check_ccswitch_health.py:526-2196 ---
 def build_auth_headers(p: Provider) -> dict:
@@ -461,6 +482,8 @@ def build_probe_request(
             **auth_h,
             "Content-Type": "application/json",
         }
+    if _is_opencode_go(p):
+        headers["x-opencode-session"] = _opencode_session(p)
     return url, "POST", headers, body
 
 
@@ -1660,7 +1683,7 @@ def fetch_models(
         url = p.base_url.rstrip("/") + "/v1/models"
 
     auth_h = build_auth_headers(p)
-    headers = {**auth_h, "Content-Type": "application/json"}
+    headers = {**auth_h, "Content-Type": "application/json", **_opencode_session_headers(p)}
     if p.app_type == "claude":
         headers.update(_claude_code_headers(user_agent))
 
@@ -1732,7 +1755,7 @@ def probe_model_metadata(
         url = p.base_url.rstrip("/") + f"/v1/models/{quoted_id}"
 
     auth_h = build_auth_headers(p)
-    headers = {**auth_h, "Accept": "application/json"}
+    headers = {**auth_h, "Accept": "application/json", **_opencode_session_headers(p)}
     if p.app_type == "claude":
         headers.update(_claude_code_headers(user_agent))
 
@@ -2433,6 +2456,7 @@ def rebuild_provider_for_inspect(p: Provider, model_id: str) -> Provider:
         protocol_source=p.protocol_source,
         custom_user_agent=p.custom_user_agent,
         notes=p.notes,
+        _opencode_session_id=getattr(p, "_opencode_session_id", None),
     )
 
 

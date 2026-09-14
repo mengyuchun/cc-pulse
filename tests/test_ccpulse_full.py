@@ -383,6 +383,63 @@ test(
     f"body={body2m}",
 )
 
+# OpenCode Go 要求每个会话稳定的 x-opencode-session；非 Go 端点不应污染请求头。
+_opencode_p = mod.Provider(
+    name="OpenCode-Go",
+    app_type="openclaw",
+    base_url="https://opencode.ai/zen/go",
+    api_key="k",
+    auth_mode="bearer",
+    tiers=[mod.ModelTier("default", "glm-5.2", "glm-5.2")],
+    protocol=mod.Protocol.OPENAI_CHAT_COMPLETIONS,
+)
+_, _, _oc_headers1, _ = mod.build_probe_request(_opencode_p, _opencode_p.tiers[0])
+_, _, _oc_headers2, _ = mod.build_probe_request(_opencode_p, _opencode_p.tiers[0], stream=True)
+test(
+    "OpenCode Go 注入 x-opencode-session",
+    bool(_oc_headers1.get("x-opencode-session")),
+    f"headers={_oc_headers1}",
+)
+test(
+    "OpenCode Go 同一 Provider 的请求复用 session",
+    _oc_headers1.get("x-opencode-session") == _oc_headers2.get("x-opencode-session"),
+    f"h1={_oc_headers1} h2={_oc_headers2}",
+)
+test(
+    "OpenCode Go session 是 UUID",
+    len(_oc_headers1.get("x-opencode-session", "").split("-")) == 5,
+    f"session={_oc_headers1.get('x-opencode-session')!r}",
+)
+_non_oc_p = mod.Provider(
+    name="Other-Chat",
+    app_type="openclaw",
+    base_url="https://example.com",
+    api_key="k",
+    auth_mode="bearer",
+    tiers=[mod.ModelTier("default", "gpt-5", "gpt-5")],
+    protocol=mod.Protocol.OPENAI_CHAT_COMPLETIONS,
+)
+_, _, _other_headers, _ = mod.build_probe_request(_non_oc_p, _non_oc_p.tiers[0])
+test(
+    "非 OpenCode Go 不注入 x-opencode-session",
+    "x-opencode-session" not in _other_headers,
+    f"headers={_other_headers}",
+)
+_other_oc_p = mod.Provider(
+    name="OpenCode-Go-2",
+    app_type="openclaw",
+    base_url="https://opencode.ai/zen/go",
+    api_key="k",
+    auth_mode="bearer",
+    tiers=[mod.ModelTier("default", "glm-5.2", "glm-5.2")],
+    protocol=mod.Protocol.OPENAI_CHAT_COMPLETIONS,
+)
+_, _, _oc_headers3, _ = mod.build_probe_request(_other_oc_p, _other_oc_p.tiers[0])
+test(
+    "不同 OpenCode Go Provider 不共享 session",
+    _oc_headers1.get("x-opencode-session") != _oc_headers3.get("x-opencode-session"),
+)
+
 # codex
 p3 = mod.Provider(
     name="X",
@@ -4090,6 +4147,13 @@ test(
     "rebuild protocol 保留",
     _p_rebuilt.protocol == mod.Protocol.OPENAI_CHAT_COMPLETIONS,
     f"proto={_p_rebuilt.protocol}",
+)
+# 为 OpenCode Go 先懒生成 session，再重建模型；同一次 inspect 必须复用
+_, _, _session_headers, _ = mod.build_probe_request(_opencode_p, _opencode_p.tiers[0])
+_p_rebuilt_session = mod.rebuild_provider_for_inspect(_opencode_p, "glm-5.3")
+test(
+    "rebuild OpenCode session 保留",
+    _p_rebuilt_session._opencode_session_id == _opencode_p._opencode_session_id,
 )
 
 
