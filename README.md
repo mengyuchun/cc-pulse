@@ -10,7 +10,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-593%20pass-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-610%20pass-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -794,11 +794,11 @@ just test-ps1
 just lint-docs
 ```
 
-测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **543 个 Python 测试 + 50 个 PS1 测试**，按文件分布：
+测试纯标准库、自带 mock HTTP server，不触达任何真实供应商。当前 **557 个 Python 测试 + 53 个 PS1 测试**，按文件分布：
 
 | 测试文件 | 用途 | 用例数 |
 |---------|------|--------|
-| `tests/test_ccpulse_full.py` | 单元 + 端到端（Mock SSE / 多协议 / 多类型） | 414 |
+| `tests/test_ccpulse_full.py` | 单元 + 端到端（Mock SSE / 多协议 / 多类型） | 428 |
 | `tests/test_archive_trend.py` | 探测归档与趋势聚合 | 54 |
 | `tests/test_authenticity.py` | P0 换芯字段 + thinking 签名验签 | 14 |
 | `tests/test_usage_consistency.py` | P1 usage 自洽静态校验 | 9 |
@@ -808,7 +808,7 @@ just lint-docs
 | `tests/test_p0_protocol_fix.py` | P0 协议推断修复回归 | 2 |
 | `tests/test_env_check.py` | 环境变量覆盖检测 | 14 |
 | `tests/test_tui.py` | TUI 箭头/鼠标选择器 | 9 |
-| `tests/test_ps1_launcher.py` | PS1 启动器交互流程 | 50 |
+| `tests/test_ps1_launcher.py` | PS1 启动器交互流程 | 53 |
 | `tests/test_docs_consistency.py` | 文档与代码一致性守卫 | — |
 
 ### `just` 常用命令速查
@@ -833,6 +833,7 @@ just lint-docs
 | `just test-ps1` | `python tests/test_ps1_launcher.py` | PS1 启动器测试 |
 | `just test-all` | 12 个测试文件全跑 | 全套测试 |
 | `just lint-docs` | `python tests/test_docs_consistency.py` | 文档一致性守卫 |
+| `just lint-docs-counts` | `... --counts` | 全量版：实跑测试并比对 README 数字（改测试后跑） |
 | `just format` / `just lint` | ruff format / ruff check | 开发期格式化与 lint |
 
 > 没装 just 也无妨，所有命令的 `python check_ccswitch_health.py ...` 原形在上方子命令详解里。

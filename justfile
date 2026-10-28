@@ -108,9 +108,13 @@ lint:
     ruff check .
     ruff format --check .
 
-# 文档与代码一致性守卫：禁止 README 中出现 4 维 / 6 维等过时说法
+# 文档与代码一致性守卫：禁止 README 中出现 4 维 / 6 维等过时说法，并校验测试数字自洽
 lint-docs:
     {{PYTHON}} tests/test_docs_consistency.py
+
+# 文档守卫全量模式：额外实跑全部测试文件，比对 README 明细数字（慢，改测试后跑）
+lint-docs-counts:
+    {{PYTHON}} tests/test_docs_consistency.py --counts
 
 # Format with ruff
 format:

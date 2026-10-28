@@ -10,7 +10,7 @@ Don't trust "it connected". Trust "it works". With so many providers, see at a g
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-593%20pass-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/tests-610%20pass-brightgreen.svg)](#tests)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -739,11 +739,11 @@ just test-ps1
 just lint-docs
 ```
 
-Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **543 Python tests + 50 PS1 tests**, distributed by file:
+Tests use the standard library only, with an embedded mock HTTP server, and never hit real providers. Currently **557 Python tests + 53 PS1 tests**, distributed by file:
 
 | Test file | Purpose | Cases |
 |-----------|---------|-------|
-| `tests/test_ccpulse_full.py` | Unit + end-to-end (mock SSE / multi-protocol / multi-type) | 414 |
+| `tests/test_ccpulse_full.py` | Unit + end-to-end (mock SSE / multi-protocol / multi-type) | 428 |
 | `tests/test_archive_trend.py` | Probe archive & trend aggregation | 54 |
 | `tests/test_authenticity.py` | P0 crosspack fields + thinking signature | 14 |
 | `tests/test_usage_consistency.py` | P1 usage consistency static check | 9 |
@@ -753,7 +753,7 @@ Tests use the standard library only, with an embedded mock HTTP server, and neve
 | `tests/test_p0_protocol_fix.py` | P0 protocol-inference fix regression | 2 |
 | `tests/test_env_check.py` | Env var override detection | 14 |
 | `tests/test_tui.py` | TUI arrow/mouse selector | 9 |
-| `tests/test_ps1_launcher.py` | PS1 launcher interaction flow | 50 |
+| `tests/test_ps1_launcher.py` | PS1 launcher interaction flow | 53 |
 | `tests/test_docs_consistency.py` | Docs ↔ code consistency guard | — |
 
 ### `just` command cheat sheet
@@ -778,6 +778,7 @@ Confirmed against `justfile`; available once [just](https://just.systems/) is in
 | `just test-ps1` | `python tests/test_ps1_launcher.py` | PS1 launcher tests |
 | `just test-all` | runs all 12 test files | Full test suite |
 | `just lint-docs` | `python tests/test_docs_consistency.py` | Docs consistency guard |
+| `just lint-docs-counts` | `... --counts` | Full mode: runs tests and verifies README counts (after test changes) |
 | `just format` / `just lint` | ruff format / ruff check | Dev formatting & lint |
 
 > No just? The raw `python check_ccswitch_health.py ...` forms are all shown in the subcommand sections above.
