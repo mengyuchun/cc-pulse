@@ -12,13 +12,13 @@ import time
 from pathlib import Path
 
 from ccpulse_net import ErrorCategory
-from ccpulse_output import _sanitize_for_terminal, say
+from ccpulse_output import say
 from ccpulse_probe import (
+    TIER_ENV_KEYS,
+    TIER_ORDER,
     ModelTier,
     Protocol,
     Provider,
-    TIER_ENV_KEYS,
-    TIER_ORDER,
 )
 
 

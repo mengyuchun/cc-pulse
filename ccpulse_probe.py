@@ -22,9 +22,8 @@ from enum import Enum
 from typing import TypedDict
 
 from ccpulse_net import (
-    ErrorCategory,
-    HttpResponse,
     STREAM_DONE_MARKERS,
+    ErrorCategory,
     StreamEvent,
     _error_category_for_urlerror,
     _http_request,
@@ -33,12 +32,13 @@ from ccpulse_net import (
     _read_httperror_body,
     _sanitize_display,
     _sanitize_raw_body,
-    _sse_event_to_dict,
     classify_error,
     create_ssl_context,
-    parse_sse_lines,
 )
-from ccpulse_output import _c, _output_stream, _pad, _sanitize_for_terminal, _say_colored, say
+from ccpulse_output import (
+    _c,
+    _sanitize_for_terminal,
+)
 
 # 默认兜底的 claude-cli 版本（读取本机版本失败时用）
 _DEFAULT_CLAUDE_CLI_VERSION = "2.1.44"
@@ -1413,7 +1413,7 @@ def probe_stream(
                 if "ttft" in str(e)
                 else ErrorCategory.NETWORK.value
             )
-    except Exception as e:  # noqa: BLE001 - 向 CLI 报告未预期的网络层异常
+    except Exception as e:
         error_category = (
             _error_category_for_urlerror(e)
             if _is_tls_error(e)
@@ -1666,7 +1666,7 @@ def probe(
         if on_attempt is not None:
             try:
                 on_attempt(p, r)
-            except Exception as e:  # noqa: BLE001 - 回调失败不影响探测结果
+            except Exception as e:
                 sys.stderr.write(f"警告: on_attempt 回调失败: {e}\n")
         if r["status"] == 200 and r.get("correct"):
             best_tier = r

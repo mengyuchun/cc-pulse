@@ -21,39 +21,27 @@ CC-Pulse — cc-switch 供应商健康检测脚本（独立运行，不改 cc-sw
 """
 
 import argparse
-import http.client
 import json
-import random
 import re
 import sqlite3
-import ssl
 import subprocess
 import sys
-import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
-from typing import TypedDict
 
+import ccpulse_net as _ccpulse_net
+import ccpulse_probe
+
+# 拆分后子模块的私有名经 module __getattr__ 透传，保证 importlib.util
+# 加载本文件时外部仍可按原名访问 net/probe 层符号。
+import ccpulse_store
 from ccpulse_archive import parse_since, run_trend
 from ccpulse_env import run_env_check
-from ccpulse_output import (
-    _c,
-    _output_stream,
-    _pad,
-    _sanitize_for_terminal,
-    _say_colored,
-    say,
-)
 from ccpulse_net import (  # noqa: F401
+    STREAM_DONE_MARKERS,
     ErrorCategory,
     HttpResponse,
-    STREAM_DONE_MARKERS,
     StreamEvent,
     _category_from_status,
     _error_category_for_urlerror,
@@ -69,27 +57,15 @@ from ccpulse_net import (  # noqa: F401
     create_ssl_context,
     parse_sse_lines,
 )
-import ccpulse_net as _ccpulse_net  # noqa: E402
-
-import ccpulse_probe  # noqa: E402
+from ccpulse_output import (
+    _c,
+    _output_stream,
+    _pad,
+    _sanitize_for_terminal,
+    _say_colored,
+    say,
+)
 from ccpulse_probe import (  # noqa: F401
-    EXPECTED_ANSWER,
-    FetchModelsResult,
-    HistoryResult,
-    InspectDimensionResult,
-    ModelTier,
-    PROBE_MAX_TOKENS,
-    PROBE_PROMPTS,
-    PROBE_QUESTION,
-    ProbeStreamResult,
-    ProbeTierResult,
-    Protocol,
-    Provider,
-    STEALTH_JITTER_MAX,
-    STEALTH_JITTER_MIN,
-    STEALTH_MAX_WORKERS,
-    TIER_ENV_KEYS,
-    TIER_ORDER,
     _CLAUDE_CLI_VERSION_CACHE,
     _CLAUDE_VERSION_LOCK,
     _COMPARE_DEFAULT_INCLUDE,
@@ -102,6 +78,23 @@ from ccpulse_probe import (  # noqa: F401
     _THINKING_PRONE_RE,
     _TOOL_DESC,
     _TOOL_NAME,
+    EXPECTED_ANSWER,
+    PROBE_MAX_TOKENS,
+    PROBE_PROMPTS,
+    PROBE_QUESTION,
+    STEALTH_JITTER_MAX,
+    STEALTH_JITTER_MIN,
+    STEALTH_MAX_WORKERS,
+    TIER_ENV_KEYS,
+    TIER_ORDER,
+    FetchModelsResult,
+    HistoryResult,
+    InspectDimensionResult,
+    ModelTier,
+    ProbeStreamResult,
+    ProbeTierResult,
+    Protocol,
+    Provider,
     _answer_correct,
     _authenticity_verdict,
     _build_context_filler,
@@ -125,12 +118,12 @@ from ccpulse_probe import (  # noqa: F401
     _is_rate_limited,
     _is_thinking_prone_model,
     _normalize_model_id,
+    _probe_cache_replay,
+    _probe_js_fingerprint,
+    _probe_knowledge_cutoff,
     _probe_one_model,
     _probe_tools,
     _probe_vision,
-    _probe_cache_replay,
-    _probe_knowledge_cutoff,
-    _probe_js_fingerprint,
     _resolve_protocol,
     _response_has_thinking_signal,
     _status_badge,
@@ -150,13 +143,9 @@ from ccpulse_probe import (  # noqa: F401
     probe_tier,
     rebuild_provider_for_inspect,
 )
-
-# 拆分后子模块的私有名经 module __getattr__ 透传，保证 importlib.util
-# 加载本文件时外部仍可按原名访问 net/probe 层符号。
-
-import ccpulse_store  # noqa: E402
 from ccpulse_store import (  # noqa: F401
     _day_key,
+    _fmt_ts,
     _open_ro,
     _percentile,
     _row_is_fail,
@@ -167,7 +156,6 @@ from ccpulse_store import (  # noqa: F401
     analyze_by_provider_day,
     analyze_provider_deep,
     classify_log_error,
-    _fmt_ts,
     load_provider_id_map,
     load_providers,
     parse_provider,
@@ -181,7 +169,8 @@ from ccpulse_store import (  # noqa: F401
     summarize_provider_history,
 )
 
-def __getattr__(name: str):  # noqa: D401
+
+def __getattr__(name: str):
     for _m in (_ccpulse_net, ccpulse_probe, ccpulse_store):
         try:
             return getattr(_m, name)
@@ -216,7 +205,7 @@ def run_list_models(args, providers, say) -> int:
         for i, fut in enumerate(as_completed(futs), 1):
             try:
                 r = fut.result()
-            except Exception as exc:  # noqa: BLE001 - 防御性兜底
+            except Exception as exc:
                 p = futs[fut]
                 r = {
                     "name": getattr(p, "name", "?"),
@@ -360,7 +349,7 @@ def _archive_check_results(args, providers, results) -> None:
             append_record(path, record)
         # 归档轮转：超 5MB 且 >10000 条时保留最新
         trim_archive(path)
-    except Exception as e:  # noqa: BLE001 - 归档失败不影响健康检测
+    except Exception as e:
         sys.stderr.write(f"警告: check 结果归档失败: {e}\n")
 
 
@@ -443,7 +432,7 @@ def run_health_check(args, providers, say) -> int:
         for i, fut in enumerate(as_completed(futs), 1):
             try:
                 r = fut.result()
-            except Exception as exc:  # noqa: BLE001 - 防御性兜底，防 worker 异常穿透
+            except Exception as exc:
                 p = futs[fut]
                 r = {
                     "name": p.name,
@@ -492,7 +481,7 @@ def run_health_check(args, providers, say) -> int:
                             since=getattr(args, "history_since", "24h") or "24h",
                         )
                     )
-                except Exception as e:  # noqa: BLE001 - 历史附加信息不能中断健康检测
+                except Exception as e:
                     say(f"  history: 读取失败 ({type(e).__name__}: {e})")
     ok = [r for r in results if r["overall_ok"]]
     fail = [r for r in results if not r["overall_ok"]]
@@ -515,6 +504,8 @@ def run_health_check(args, providers, say) -> int:
                 )
                 if a["error"]:
                     say(f"               → {a['error']}")
+                elif a["status"] == 200 and a.get("correct") is False:
+                    say(f'               → 答案不符，实际回答:"{a.get("answer", "")[:80]}"')
 
     if ok:
         say("\n可用详情:")
@@ -1077,7 +1068,7 @@ def run_inspect(args, providers, say) -> int:
                 args.db, inspect_p.name, since_ts=parse_since(since)
             )
             report["history_since"] = since
-        except Exception as e:  # noqa: BLE001 - 历史附加信息不能中断 inspect
+        except Exception as e:
             report["history"] = {"error": f"{type(e).__name__}: {e}"}
     if args.output_format == "human" or args.human:
         text = format_inspect_human(report)
@@ -1119,7 +1110,7 @@ def run_inspect(args, providers, say) -> int:
                 "error_category": (text_result or {}).get("error_category"),
             },
         )
-    except Exception as e:  # noqa: BLE001 - 归档失败不影响 inspect
+    except Exception as e:
         sys.stderr.write(f"警告: inspect 结果归档失败: {e}\n")
 
     return 0 if verdict in ("healthy", "skipped") else 1
@@ -1472,10 +1463,10 @@ def format_inspect_human(r: dict) -> str:
     cr = auth.get("cache_replay") or {}
     kc = auth.get("knowledge_cutoff") or {}
     js = auth.get("js_fingerprint") or {}
-    for label, probe in (("缓存回放", cr), ("知识截止", kc), ("分布指纹", js)):
-        if probe.get("note") and "未启用" not in probe.get("note", ""):
-            lines.append(f"  · {label}：{probe.get('note')}")
-    if any("未启用" in (probe.get("note") or "") or not probe for probe in (cr, kc, js)):
+    for label, probe_result in (("缓存回放", cr), ("知识截止", kc), ("分布指纹", js)):
+        if probe_result.get("note") and "未启用" not in probe_result.get("note", ""):
+            lines.append(f"  · {label}：{probe_result.get('note')}")
+    if any("未启用" in (probe_result.get("note") or "") or not probe_result for probe_result in (cr, kc, js)):
         lines.append("  提示：使用 --auth-full 开启缓存回放、知识截止和分布指纹深度鉴别")
     ev = auth.get("evidence") or []
     if ev and av == "suspicious":

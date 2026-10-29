@@ -172,7 +172,7 @@ class AuthenticityVerdictWithCacheTest(unittest.TestCase):
             "usage_consistency": {"suspicious": False, "findings": []},
             "cache_replay": {"suspicious": False, "identical": False},
         }
-        v, ev = mod._authenticity_verdict(auth)
+        v, _ev = mod._authenticity_verdict(auth)
         self.assertEqual(v, "clean")
 
 

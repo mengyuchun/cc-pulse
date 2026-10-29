@@ -49,5 +49,137 @@ class ProbeStreamConsistency(unittest.TestCase):
         self.assertIn("_answer_correct(answer_text, expected)", source[start:end])
 
 
+class HealthCheckWrongAnswerDetail(unittest.TestCase):
+    def test_http_200_wrong_answer_shows_reason(self):
+        provider = mod.Provider(
+            name="WrongAnswer",
+            app_type="claude",
+            base_url="https://example.test",
+            api_key="",
+            auth_mode="none",
+            tiers=[mod.ModelTier("haiku", "model", "model")],
+        )
+        args = type(
+            "Args",
+            (),
+            {
+                "current_only": False,
+                "failover_only": False,
+                "stealth": False,
+                "workers": 1,
+                "timeout": 1,
+                "db": ":memory:",
+                "probe_max_tokens": 16,
+                "probe_enable_thinking": False,
+                "user_agent": None,
+                "stainless_version": None,
+                "with_history": False,
+                "json": False,
+                "skip_tls_verify": False,
+                "retry": 0,
+            },
+        )()
+        result = {
+            "name": "WrongAnswer",
+            "type": "claude",
+            "base_url": "https://example.test",
+            "auth_mode": "none",
+            "overall_ok": False,
+            "best_tier": None,
+            "attempts": [
+                {
+                    "tier": "haiku",
+                    "model": "model",
+                    "status": 200,
+                    "elapsed": 0.1,
+                    "error": "",
+                    "correct": False,
+                    "answer": "错误答案",
+                }
+            ],
+        }
+        original_probe = mod.probe
+        lines = []
+        try:
+            mod.probe = lambda *args, **kwargs: result
+            rc = mod.run_health_check(args, [provider], lines.append)
+        finally:
+            mod.probe = original_probe
+        output = "\n".join(lines)
+        self.assertEqual(rc, 1)
+        self.assertIn("不可用详情", output)
+        self.assertIn("答案不符，实际回答", output)
+        self.assertIn("错误答案", output)
+
+
+class HealthCheckProbeBinding(unittest.TestCase):
+    def test_run_health_check_calls_probe_without_shadowing(self):
+        calls = []
+        providers = [
+            mod.Provider(
+                name=name,
+                app_type="claude",
+                base_url="https://example.test",
+                api_key="",
+                auth_mode="none",
+                tiers=[mod.ModelTier("haiku", "model", "model")],
+            )
+            for name in ("Provider-A", "Provider-B")
+        ]
+        args = type(
+            "Args",
+            (),
+            {
+                "current_only": False,
+                "failover_only": False,
+                "stealth": False,
+                "workers": 1,
+                "timeout": 1,
+                "db": ":memory:",
+                "probe_max_tokens": 16,
+                "probe_enable_thinking": False,
+                "user_agent": None,
+                "stainless_version": None,
+                "with_history": False,
+                "json": False,
+                "skip_tls_verify": False,
+                "retry": 0,
+            },
+        )()
+
+        def fake_probe(provider, *probe_args, **probe_kwargs):
+            calls.append(provider.name)
+            return {
+                "name": provider.name,
+                "type": "claude",
+                "base_url": provider.base_url,
+                "auth_mode": "none",
+                "overall_ok": True,
+                "best_tier": "haiku",
+                "attempts": [
+                    {
+                        "tier": "haiku",
+                        "model": "model",
+                        "status": 200,
+                        "elapsed": 0.1,
+                        "error": "",
+                        "correct": True,
+                        "answer": "5",
+                    }
+                ],
+            }
+
+        original_probe = mod.probe
+        lines = []
+        try:
+            mod.probe = fake_probe
+            rc = mod.run_health_check(args, providers, lines.append)
+        finally:
+            mod.probe = original_probe
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["Provider-A", "Provider-B"])
+        self.assertIn("可用详情", "\n".join(lines))
+
+
 if __name__ == "__main__":
     unittest.main()

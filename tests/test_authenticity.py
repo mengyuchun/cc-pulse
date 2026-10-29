@@ -201,7 +201,7 @@ class AuthenticityVerdictTest(unittest.TestCase):
         self.assertEqual(ev, [])
 
     def test_all_no_data_yields_inconclusive(self):
-        v, ev = mod._authenticity_verdict(self._no_data())
+        v, _ev = mod._authenticity_verdict(self._no_data())
         self.assertEqual(v, "inconclusive")
 
 

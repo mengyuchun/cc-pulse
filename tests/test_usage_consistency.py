@@ -126,7 +126,7 @@ class AuthenticityVerdictWithUsageTest(unittest.TestCase):
             "thinking_signature": {"has_valid_signature": True},
             "usage_consistency": {"suspicious": False, "findings": []},
         }
-        v, ev = mod._authenticity_verdict(auth)
+        v, _ev = mod._authenticity_verdict(auth)
         self.assertEqual(v, "clean")
 
 

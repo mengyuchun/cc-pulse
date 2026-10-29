@@ -5,7 +5,6 @@ TDD：先写测试（RED），再实现 _probe_js_fingerprint + JSD + 参考分�
 """
 
 import importlib.util
-import math
 import os
 import sys
 import unittest
@@ -163,7 +162,7 @@ class AuthenticityVerdictWithJs(unittest.TestCase):
             "knowledge_cutoff": {"suspicious": False, "note": ""},
             "js_fingerprint": {"suspicious": False, "note": "符合 LLM 偏置"},
         }
-        v, ev = mod._authenticity_verdict(auth)
+        v, _ev = mod._authenticity_verdict(auth)
         self.assertEqual(v, "clean")
 
 

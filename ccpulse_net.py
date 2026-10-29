@@ -16,6 +16,7 @@ from enum import Enum
 
 from ccpulse_output import _sanitize_for_terminal
 
+
 class ErrorCategory(str, Enum):
     """统一的错误分类枚举。用于 JSON 报告和 inspect 子命令。"""
 

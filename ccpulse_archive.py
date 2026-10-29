@@ -91,8 +91,7 @@ def trim_archive(path: str, max_records: int = DEFAULT_MAX_RECORDS) -> int:
         keep = recs[-max_records:]
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            for r in keep:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in keep)
         os.replace(tmp, path)
         return len(recs) - len(keep)
     except OSError:

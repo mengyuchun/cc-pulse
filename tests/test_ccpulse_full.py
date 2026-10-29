@@ -1613,7 +1613,7 @@ with open(_dd_file, "w", encoding="utf-8") as _f:
     json.dump(_dd_json, _f)
 try:
     _dd_calls.clear()
-    _ns = lambda **kw: type("Args", (), kw)()  # noqa: E731
+    _ns = lambda **kw: type("Args", (), kw)()
     args_ns = _ns(
         from_file=_dd_file,
         target="fail",

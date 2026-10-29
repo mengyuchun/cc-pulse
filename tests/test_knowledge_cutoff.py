@@ -179,7 +179,7 @@ class AuthenticityVerdictWithKC(unittest.TestCase):
             "cache_replay": {"suspicious": False, "identical": False},
             "knowledge_cutoff": {"suspicious": False, "note": "较新模型"},
         }
-        v, ev = mod._authenticity_verdict(auth)
+        v, _ev = mod._authenticity_verdict(auth)
         self.assertEqual(v, "clean")
 
 
