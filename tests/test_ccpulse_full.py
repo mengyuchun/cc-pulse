@@ -20,6 +20,7 @@ import threading
 import time
 import types
 import urllib.error
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import ClassVar
 
@@ -394,7 +395,9 @@ _opencode_p = mod.Provider(
     protocol=mod.Protocol.OPENAI_CHAT_COMPLETIONS,
 )
 _, _, _oc_headers1, _ = mod.build_probe_request(_opencode_p, _opencode_p.tiers[0])
-_, _, _oc_headers2, _ = mod.build_probe_request(_opencode_p, _opencode_p.tiers[0], stream=True)
+_, _, _oc_headers2, _ = mod.build_probe_request(
+    _opencode_p, _opencode_p.tiers[0], stream=True
+)
 test(
     "OpenCode Go 注入 x-opencode-session",
     bool(_oc_headers1.get("x-opencode-session")),
@@ -455,9 +458,20 @@ test(
 _oc_http_calls = []
 _oc_old_http = mod.ccpulse_probe._http_request
 
+
 def _oc_capture_http(url, method, headers, body, *args):
     _oc_http_calls.append((url, headers))
-    return type("R", (), {"status": 200, "body": '{"data": []}', "error_category": None, "error_msg": ""})()
+    return type(
+        "R",
+        (),
+        {
+            "status": 200,
+            "body": '{"data": []}',
+            "error_category": None,
+            "error_msg": "",
+        },
+    )()
+
 
 mod.ccpulse_probe._http_request = _oc_capture_http
 try:
@@ -466,7 +480,8 @@ finally:
     mod.ccpulse_probe._http_request = _oc_old_http
 test(
     "OpenCode Go /v1 models URL 不重复拼接",
-    _oc_http_calls and _oc_http_calls[-1][0] == "https://opencode.ai/zen/go/v1/models"
+    _oc_http_calls
+    and _oc_http_calls[-1][0] == "https://opencode.ai/zen/go/v1/models"
     and _oc_http_calls[-1][0].count("/v1") == 1,
     f"calls={_oc_http_calls}",
 )
@@ -1563,7 +1578,9 @@ try:
     write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
     # 阈值 1.0（100%）：mock server 全成功 → 无告警
     rc, out, err = run_cli(["check", "--failover-only", "--alert-threshold", "1.0"])
-    test("alert-threshold=1.0 全成功无告警", "告警" not in out, f"out tail={out[-200:]}")
+    test(
+        "alert-threshold=1.0 全成功无告警", "告警" not in out, f"out tail={out[-200:]}"
+    )
     test("alert-threshold=1.0 exit 0", rc == 0, f"rc={rc}")
     # summary.available_ratio 存在
     _, json_out, _ = run_cli(["check", "--failover-only", "--json"])
@@ -1772,9 +1789,7 @@ _chat_prov = mod.Provider(
     protocol=mod.Protocol.OPENAI_CHAT_COMPLETIONS,  # 协议权威
     protocol_source="api_format",
 )
-_chat_body = json.dumps(
-    {"choices": [{"message": {"content": "5"}}]}
-)
+_chat_body = json.dumps({"choices": [{"message": {"content": "5"}}]})
 test(
     "extract_answer openai_chat body → 提取 '5'（不论 app_type）",
     mod.extract_answer(_chat_prov, _chat_body) == "5",
@@ -2288,8 +2303,7 @@ try:
     )
     test(
         "authenticity 含 crosspack 子字段",
-        isinstance(auth.get("crosspack"), dict)
-        and "suspicious" in auth["crosspack"],
+        isinstance(auth.get("crosspack"), dict) and "suspicious" in auth["crosspack"],
         f"crosspack={auth.get('crosspack')}",
     )
     test(
@@ -3011,6 +3025,45 @@ try:
     )
 finally:
     mod._output_stream.reset(token)
+
+
+buf = io.StringIO()
+buf = io.StringIO()
+buf = io.StringIO()
+token = mod._output_stream.set(buf)
+try:
+    mod._say_colored("safe\x1b[2J\x1b[31mred\x1b[0mend")
+    val = buf.getvalue()
+    test("_say_colored 剥离输入控制序列", "\x1b[2J" not in val, f"val={val!r}")
+    test("_say_colored 保留内部颜色 ANSI", "\x1b[31mred\x1b[0m" in val, f"val={val!r}")
+finally:
+    mod._output_stream.reset(token)
+
+print("\n[Unit] URL 展示脱敏")
+_url_key = "sk-test/key+value"
+_encoded_key = urllib.parse.quote(_url_key, safe="")
+_url = (
+    "https://user:pass@example.test/api-key/"
+    + _encoded_key
+    + "?q="
+    + _encoded_key
+    + "&other=ok&api_key=leak#fragment="
+    + _encoded_key
+)
+_safe_url = mod._sanitize_url_for_display(_url, _url_key)
+test(
+    "URL 脱敏 userinfo/敏感 query",
+    "user:pass" not in _safe_url and "api_key=***" in _safe_url,
+)
+test(
+    "URL 脱敏 key 的 path/query/fragment",
+    _safe_url.count("***") >= 4 and _url_key not in _safe_url,
+)
+test(
+    "URL 无 key 时脱敏 credential-like 段",
+    "sk-obvious-secret"
+    not in mod._sanitize_url_for_display("https://x.test/v1/sk-obvious-secret"),
+)
 
 
 print("\n[Unit] _filter_new_watch_rows 去重 helper")
@@ -3764,11 +3817,17 @@ def _watch_run(extra_args, insert_row):
         if insert_row:
             _c = sqlite3.connect(_w_db)
             _c.execute(
-                "INSERT INTO proxy_request_logs VALUES ("
-                + ",".join(["?"] * 27)
-                + ")",
+                "INSERT INTO proxy_request_logs VALUES (" + ",".join(["?"] * 27) + ")",
                 _log_row(
-                    "w-new", "pid-w", "model-w", 1234, 567, 800, 120, 200, None,
+                    "w-new",
+                    "pid-w",
+                    "model-w",
+                    1234,
+                    567,
+                    800,
+                    120,
+                    200,
+                    None,
                     int(time.time()),
                 ),
             )
@@ -3813,8 +3872,7 @@ test(
 )
 test(
     "watch --json 行含 tokens 字段",
-    _w_new_json.get("input_tokens") == 1234
-    and _w_new_json.get("output_tokens") == 567,
+    _w_new_json.get("input_tokens") == 1234 and _w_new_json.get("output_tokens") == 567,
     f"j={_w_new_json}",
 )
 
@@ -3962,7 +4020,9 @@ try:
             json.dumps(
                 {"apiKey": "k", "baseUrl": "https://oc.test", "models": [{"id": "g"}]}
             ),
-            1, 1, 0,
+            1,
+            1,
+            0,
         ),
     )
     _conn_oc.execute(
@@ -3976,10 +4036,13 @@ try:
                     "config": 'base_url = "https://cx.test"',
                 }
             ),
-            1, 1, 0,
+            1,
+            1,
+            0,
         ),
     )
-    _conn_oc.commit(); _conn_oc.close()
+    _conn_oc.commit()
+    _conn_oc.close()
     _provs_oc = mod.load_providers(_db_oc, "openclaw")
     _provs_cx = mod.load_providers(_db_oc, "codex")
     test(
@@ -4456,7 +4519,7 @@ try:
         [mod.ModelTier("default", "m", "m")],
     )
     _resp = mod._http_request(
-        f"http://127.0.0.1:{port}/v1/messages", "POST", body=b'{}', timeout=3
+        f"http://127.0.0.1:{port}/v1/messages", "POST", body=b"{}", timeout=3
     )
     test(
         "IncompleteRead → truncated=True",
@@ -4548,7 +4611,9 @@ _cat, _disp = mod.classify_error(
     '{"error":{"message":"已达到使用上限，将在 2026-08-07 23:10:15 重置"}}', 429
 )
 test("429 -> rate_limit", _cat == mod.ErrorCategory.RATE_LIMIT, f"cat={_cat}")
-test("429 display 含恢复提示", "恢复" in _disp or "23:10:15" in _disp, f"disp={_disp!r}")
+test(
+    "429 display 含恢复提示", "恢复" in _disp or "23:10:15" in _disp, f"disp={_disp!r}"
+)
 
 
 # ============ P1：deep-dive 子命令（CI 串联，非交互） ============
@@ -4618,7 +4683,9 @@ _dd_x = {
 _dd_x_file = os.path.join(tempfile.mkdtemp(prefix="ccpulse_dd_"), "dd_x.json")
 with open(_dd_x_file, "w", encoding="utf-8") as _f:
     json.dump(_dd_x, _f)
-rcx, outx, _ = run_cli(["deep-dive", "--from", _dd_x_file, "--target", "fail", "--json"])
+rcx, outx, _ = run_cli(
+    ["deep-dive", "--from", _dd_x_file, "--target", "fail", "--json"]
+)
 _repx = json.loads(outx) if outx else {}
 _xpairs = {(t["provider"], t["model"]) for t in _repx.get("tasks", [])}
 test(
@@ -4628,7 +4695,16 @@ test(
 )
 
 rc3, out3, _ = run_cli(
-    ["deep-dive", "--from", _dd_file, "--target", "both", "--models", "m-fail", "--json"]
+    [
+        "deep-dive",
+        "--from",
+        _dd_file,
+        "--target",
+        "both",
+        "--models",
+        "m-fail",
+        "--json",
+    ]
 )
 _rep3 = json.loads(out3) if out3 else {}
 test(
@@ -4642,7 +4718,18 @@ test(
 import subprocess as _sp
 
 _p = _sp.run(
-    [PY, SCRIPT, "deep-dive", "--from", "-", "--target", "ok", "--json", "--db", db_path],
+    [
+        PY,
+        SCRIPT,
+        "deep-dive",
+        "--from",
+        "-",
+        "--target",
+        "ok",
+        "--json",
+        "--db",
+        db_path,
+    ],
     input=json.dumps(_dd_json),
     capture_output=True,
     text=True,

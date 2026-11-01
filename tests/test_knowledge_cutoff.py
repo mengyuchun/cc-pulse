@@ -74,6 +74,28 @@ class KnowledgeCutoffLogicTest(unittest.TestCase):
         finally:
             mod.probe_tier = orig
 
+    def test_answers_are_sanitized_in_details(self):
+        p = _provider()
+        key = p.api_key
+        returns = [
+            {"status": 200, "answer": f"东京 {key}\x1b[31m"},
+            {"status": 200, "answer": f"2022 {key}\x1b[0m"},
+            {"status": 200, "answer": f"2016 {key}"},
+            {"status": 200, "answer": f"2024 {key}"},
+            {"status": 200, "answer": f"2024 {key}"},
+            {"status": 200, "answer": f"2024 {key}"},
+        ]
+        orig = self._patch(returns)
+        try:
+            result = mod._probe_knowledge_cutoff(
+                p, p.tiers[0], timeout=5, skip_tls=False, max_tokens=32, user_agent=None
+            )
+            for detail in result["details"]:
+                self.assertNotIn(key, detail["answer"])
+                self.assertNotRegex(detail["answer"], r"[\x00-\x1f\x7f]")
+        finally:
+            mod.probe_tier = orig
+
     def test_before_wrong_is_suspicious(self):
         p = _provider()
         returns = [

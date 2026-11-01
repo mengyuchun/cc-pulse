@@ -512,11 +512,11 @@ python check_ccswitch_health.py inspect \
 | `--with-metadata` | Backward-compatible; metadata is already on and sends no extra request | off |
 | `--probe-delay SEC` | Delay between batch models | `3.0` |
 | `--max-retries N` | Retry count for 429 | `1` |
-| `--format human\|json` | Output format | `json` |
-| `--human` | Human-readable output (default is JSON) | off |
+| `--format human\|json` | Output format (`--format` takes precedence over `--human`) | `json` |
+| `--human` | Human-readable output (used when `--format` is omitted) | off |
 | `--quiet` | Batch silent NDJSON + exit 0/3/4 | off |
 
-**`--include` checks**:
+**`--include` checks**: Unknown dimensions are rejected with exit code 2.
 
 | Item | Default | Meaning |
 |------|---------|---------|

@@ -6,12 +6,16 @@ import re
 import sys
 import threading
 import unicodedata
+import urllib.parse
 from typing import Any
 
 _output_stream = contextvars.ContextVar("output_stream", default=None)
 _say_lock = threading.Lock()
 _CONTROL_RE = re.compile(
-    "\x1b\\[[0-9;]*[A-Za-z]|\x1b\\][^\x07]*\x07|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]"
+    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|"
+    r"(?:\x1b\]|\x9d)[^\x07\x1b]*(?:\x07|\x1b\\|\x9c)|"
+    r"(?:\x1bP|\x1bX|\x1b\^|\x1b_|[\x90\x98\x9e\x9f])[^\x1b\x9c]*(?:\x1b\\|\x9c)|"
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]"
 )
 _ANSI = {
     "reset": "\x1b[0m",
@@ -28,8 +32,99 @@ _ANSI = {
 
 
 def _sanitize_for_terminal(text: str) -> str:
-    """剥离 ANSI 转义和 C0 控制字符，防止恶意响应注入终端指令。"""
-    return _CONTROL_RE.sub("", text)
+    """剥离终端控制与 Unicode 格式字符，保留换行和普通文本。"""
+    cleaned = _CONTROL_RE.sub("", text).replace("\r", "")
+    return "".join(ch for ch in cleaned if unicodedata.category(ch) != "Cf")
+
+
+_SENSITIVE_URL_KEY_RE = re.compile(
+    r"^(?:api[-_]?key|access[-_]?token|token|key|secret|"
+    r"password|passwd|authorization|auth)$",
+    re.IGNORECASE,
+)
+_CREDENTIAL_URL_SEGMENT_RE = _SENSITIVE_URL_KEY_RE
+_CREDENTIAL_VALUE_RE = re.compile(
+    r"^(?:sk-|rk-|xai-|gh[pousr]_ |github_pat_|AIza|xox[baprs]-).{8,}$".replace(
+        "gh[pousr]_ ", "gh[pousr]_"
+    ),
+    re.IGNORECASE,
+)
+
+
+def _mask_url_secret(text: str, secret: str | None) -> str:
+    """在 URL 展示组件中掩码明文、完整和混合百分号编码。"""
+    if not secret:
+        return text
+    masked = text.replace(secret, "***")
+    variants = {urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret)}
+    for encoded in variants:
+        if encoded and encoded != secret:
+            masked = re.sub(re.escape(encoded), "***", masked, flags=re.IGNORECASE)
+
+    # 每个字符允许明文或对应 %HH，覆盖混合编码而不解码普通文本。
+    parts = []
+    for byte in secret.encode("utf-8"):
+        literal = chr(byte) if 32 <= byte < 127 else None
+        hex_part = f"%{byte:02x}"
+        alternatives = [re.escape(hex_part)]
+        if literal:
+            alternatives.insert(0, re.escape(literal))
+        parts.append("(?:" + "|".join(alternatives) + ")")
+    if parts:
+        masked = re.sub("".join(parts), "***", masked, flags=re.IGNORECASE)
+    return masked
+
+
+def _sanitize_url_query(query: str, api_key: str | None) -> str:
+    parts = []
+    for part in query.split("&"):
+        if not part:
+            parts.append(part)
+            continue
+        key, separator, value = part.partition("=")
+        if _SENSITIVE_URL_KEY_RE.fullmatch(urllib.parse.unquote_plus(key).strip()):
+            parts.append(key + (separator or "=") + "***")
+        else:
+            parts.append(key + separator + _mask_url_secret(value, api_key))
+    return "&".join(parts)
+
+
+def _sanitize_url_fragment(fragment: str, api_key: str | None) -> str:
+    parts = re.split(r"([&;])", _mask_url_secret(fragment, api_key))
+    for i in range(0, len(parts), 2):
+        parts[i] = _sanitize_url_query(parts[i], api_key)
+    return "".join(parts)
+
+
+def _sanitize_url_for_display(url: str, api_key: str | None = None) -> str:
+    """脱敏展示 URL 中的凭据，不改变实际请求 URL。"""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        netloc = parsed.netloc
+        if "@" in netloc:
+            netloc = "***@" + netloc.rsplit("@", 1)[1]
+
+        path = _mask_url_secret(parsed.path, api_key)
+        path_parts = path.split("/")
+        for i, part in enumerate(path_parts):
+            previous = urllib.parse.unquote(part)
+            if i and _CREDENTIAL_URL_SEGMENT_RE.fullmatch(
+                urllib.parse.unquote(path_parts[i - 1])
+            ):
+                path_parts[i] = "***"
+            elif _CREDENTIAL_VALUE_RE.fullmatch(previous):
+                path_parts[i] = "***"
+            else:
+                path_parts[i] = _mask_url_secret(part, api_key)
+
+        return parsed._replace(
+            netloc=netloc,
+            path="/".join(path_parts),
+            query=_sanitize_url_query(parsed.query, api_key),
+            fragment=_sanitize_url_fragment(parsed.fragment, api_key),
+        ).geturl()
+    except (TypeError, ValueError):
+        return "<redacted-url>"
 
 
 def _disp_width(text: str) -> int:
@@ -72,8 +167,13 @@ def _c(text: str, *styles: str) -> str:
 
 
 def _say_colored(text: str, **kwargs: Any) -> None:
-    """输出已清洗文本并自行上 ANSI 色；不清洗输入，调用方须先传已清洗文本。"""
+    """输出清洗后的文本，同时保留内部 _c() 生成的 ANSI 样式。"""
     kwargs.setdefault("flush", True)
+    ansi_tokens = set(_ANSI.values())
+    parts = re.split(r"(\x1b\[[0-9;]*m)", str(text))
+    cleaned = "".join(
+        part if part in ansi_tokens else _sanitize_for_terminal(part) for part in parts
+    )
     stream = _output_stream.get() or sys.stdout
     with _say_lock:
-        print(text, file=stream, **kwargs)
+        print(cleaned, file=stream, **kwargs)

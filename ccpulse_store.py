@@ -11,7 +11,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from ccpulse_net import ErrorCategory
+from ccpulse_net import ErrorCategory, _sanitize_raw_body
 from ccpulse_output import say
 from ccpulse_probe import (
     TIER_ENV_KEYS,
@@ -32,6 +32,37 @@ def _fmt_ts(ts) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
     except (TypeError, ValueError, OverflowError, OSError):
         return str(ts)
+
+def _sanitize_log_text(value, secrets: tuple[str, ...] = ()) -> str:
+    """Remove common and known credential forms before reports."""
+    text = str(value or "")
+    for secret in secrets:
+        if secret:
+            text = _sanitize_raw_body(text, secret)
+    text = re.sub(
+        r"(?i)(bearer\s+|(?:api[-_]?key|token|secret|password|authorization)\s*[:=]\s*)[^\s,;]+",
+        r"\1***",
+        text,
+    )
+    return re.sub(
+        r"(?i)\b(?:sk-|rk-|xai-|gh[pousr]_)[A-Za-z0-9_+/=-]{8,}",
+        "***",
+        text,
+    )
+
+
+def _provider_api_keys(db_path: str, id_map: dict) -> tuple[str, ...]:
+    """Best-effort read of provider keys for passive-log redaction."""
+    keys = []
+    try:
+        for app_type in ("claude", "codex", "openclaw"):
+            for provider in load_providers(db_path, app_type):
+                if getattr(provider, "api_key", None):
+                    keys.append(provider.api_key)
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        pass
+    return tuple(dict.fromkeys(keys))
+
 
 # --- from check_ccswitch_health.py:160-356 ---
 def load_providers(db_path: str, app_type: str) -> list:
@@ -351,7 +382,7 @@ def query_proxy_logs(
 ) -> list:
     """查询 proxy_request_logs，返回 dict 列表（已解析供应商名与 error_category）。"""
     id_map = load_provider_id_map(db_path)
-    # reverse name filter: match provider ids whose name contains substr
+    secrets = _provider_api_keys(db_path, id_map)
     name_pids = None
     if provider_substr:
         sub = provider_substr.lower()
@@ -386,6 +417,7 @@ def query_proxy_logs(
         rows = []
         for row in conn.execute(sql, args):
             d = dict(zip(cols, row))
+            d["error_message"] = _sanitize_log_text(d.get("error_message"), secrets)
             d["provider_name"] = resolve_provider_name(d.get("provider_id"), id_map)
             d["error_category"] = classify_log_error(
                 d.get("status_code"), d.get("error_message")
@@ -543,6 +575,7 @@ def query_provider_health(db_path: str) -> list:
     返回每供应商：name / is_healthy / consecutive_failures / last_error / last_success_at。
     """
     id_map = load_provider_id_map(db_path)
+    secrets = _provider_api_keys(db_path, id_map)
     conn = _open_ro(db_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -555,6 +588,7 @@ def query_provider_health(db_path: str) -> list:
             "FROM provider_health"
         ):
             d = dict(r)
+            d["last_error"] = _sanitize_log_text(d.get("last_error"), secrets)
             d["provider_name"] = id_map.get(d.get("provider_id")) or d.get(
                 "provider_id", "?"
             )

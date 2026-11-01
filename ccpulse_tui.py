@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import sys
 
+from ccpulse_output import _sanitize_for_terminal
+
 # ANSI 转义
 _HIDE_CURSOR = "\x1b[?25l"
 _SHOW_CURSOR = "\x1b[?25h"
@@ -63,7 +65,7 @@ def _print_lines(lines: list[str], *, redraw_from: int = 0) -> None:
         for _ in range(redraw_from):
             out.write(_MOVE_UP + _CLEAR_LINE)
     for line in lines:
-        out.write(line + "\n")
+        out.write(_sanitize_for_terminal(line) + "\n")
     out.flush()
 
 

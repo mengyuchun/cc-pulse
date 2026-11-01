@@ -17,7 +17,7 @@ CC-Pulse — cc-switch 供应商健康检测脚本（独立运行，不改 cc-sw
 用法:
     python check_ccswitch_health.py
     python check_ccswitch_health.py --failover-only --workers 8
-    python check_ccswitch_health.py --type claude --timeout 60
+    python check_ccswitch_health.py check --type claude --timeout 60
 """
 
 import argparse
@@ -62,6 +62,7 @@ from ccpulse_output import (
     _output_stream,
     _pad,
     _sanitize_for_terminal,
+    _sanitize_url_for_display,
     _say_colored,
     say,
 )
@@ -148,7 +149,9 @@ from ccpulse_store import (  # noqa: F401
     _fmt_ts,
     _open_ro,
     _percentile,
+    _provider_api_keys,
     _row_is_fail,
+    _sanitize_log_text,
     _sparkline,
     _table_exists,
     analyze_by_day,
@@ -178,8 +181,8 @@ def __getattr__(name: str):
             continue
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
-DB_PATH = str(Path.home() / ".cc-switch" / "cc-switch.db")
 
+DB_PATH = str(Path.home() / ".cc-switch" / "cc-switch.db")
 
 
 def run_list_models(args, providers, say) -> int:
@@ -209,7 +212,9 @@ def run_list_models(args, providers, say) -> int:
                 p = futs[fut]
                 r = {
                     "name": getattr(p, "name", "?"),
-                    "base_url": getattr(p, "base_url", "?"),
+                    "base_url": _sanitize_url_for_display(
+                        getattr(p, "base_url", "?"), getattr(p, "api_key", None)
+                    ),
                     "status": 0,
                     "elapsed": 0,
                     "error": f"内部异常: {type(exc).__name__}: {exc}",
@@ -285,7 +290,7 @@ def run_list_models(args, providers, say) -> int:
                 {
                     "provider": p.name,
                     "app_type": p.app_type,
-                    "base_url": p.base_url,
+                    "base_url": _sanitize_url_for_display(p.base_url, p.api_key),
                     "models": model_reports,
                 }
             )
@@ -437,7 +442,7 @@ def run_health_check(args, providers, say) -> int:
                 r = {
                     "name": p.name,
                     "type": p.app_type,
-                    "base_url": p.base_url,
+                    "base_url": _sanitize_url_for_display(p.base_url, p.api_key),
                     "auth_mode": p.auth_mode,
                     "overall_ok": False,
                     "best_tier": None,
@@ -505,7 +510,9 @@ def run_health_check(args, providers, say) -> int:
                 if a["error"]:
                     say(f"               → {a['error']}")
                 elif a["status"] == 200 and a.get("correct") is False:
-                    say(f'               → 答案不符，实际回答:"{a.get("answer", "")[:80]}"')
+                    say(
+                        f'               → 答案不符，实际回答:"{a.get("answer", "")[:80]}"'
+                    )
 
     if ok:
         say("\n可用详情:")
@@ -519,9 +526,16 @@ def run_health_check(args, providers, say) -> int:
     # 健康供应商推荐：只读不改库，输出可消费的切换提示
     if ok and fail:
         say("\n💡 推荐切换到健康供应商（只读提示，不会自动改库）:")
-        rec = min(ok, key=lambda x: next(a["elapsed"] for a in x["attempts"] if a["tier"] == x["best_tier"]))
+        rec = min(
+            ok,
+            key=lambda x: next(
+                a["elapsed"] for a in x["attempts"] if a["tier"] == x["best_tier"]
+            ),
+        )
         rec_a = next(a for a in rec["attempts"] if a["tier"] == rec["best_tier"])
-        say(f"  首选: {rec['name']}（{rec['best_tier']} 档位 {rec_a['model']}，{rec_a['elapsed']}s）")
+        say(
+            f"  首选: {rec['name']}（{rec['best_tier']} 档位 {rec_a['model']}，{rec_a['elapsed']}s）"
+        )
         say(f"  → 在 cc-switch 切换到「{rec['name']}」即可")
 
     # JSON 模式：最后输出结构化报告到 stdout
@@ -605,6 +619,8 @@ def resolve_inspect_target(args, providers, say) -> tuple:
         )
 
     if args.source == "manual":
+        if not model:
+            return None, None, "inspect --source manual 需要 --model"
         # 强制使用用户提供的字面值；--keep-suffix 决定是否去后缀
         raw = model
         clean = raw if args.keep_suffix else re.sub(r"\[.*?\]$", "", raw)
@@ -639,6 +655,23 @@ def resolve_inspect_target(args, providers, say) -> tuple:
     return None, None, f"未知 source: {args.source}"
 
 
+_INSPECT_INCLUDE_DIMENSIONS = {
+    "text",
+    "streaming",
+    "model-consistency",
+    "protocol",
+    "error-classification",
+    "metadata",
+    "context",
+    "thinking",
+    "tools",
+    "vision",
+    "cache-replay",
+    "knowledge-cutoff",
+    "js-fingerprint",
+}
+
+
 def _parse_include(raw: str | None, default: str) -> set[str]:
     """解析 --include；None/空 → default。"""
     src = default if raw is None else raw
@@ -647,11 +680,25 @@ def _parse_include(raw: str | None, default: str) -> set[str]:
 
 
 def _resolve_inspect_include(args, default: str) -> set[str]:
-    """解析 inspect 维度；--auth-full 追加完整保真探针。"""
+    """解析 inspect 维度；未知维度直接报参数错误。"""
     include = _parse_include(getattr(args, "include", None), default)
+    unknown = sorted(include - _INSPECT_INCLUDE_DIMENSIONS)
+    if unknown:
+        allowed = ", ".join(sorted(_INSPECT_INCLUDE_DIMENSIONS))
+        raise ValueError(
+            f"未知 --include 维度: {', '.join(unknown)}；可用维度: {allowed}"
+        )
     if getattr(args, "auth_full", False):
         include |= {"cache-replay", "knowledge-cutoff", "js-fingerprint"}
     return include
+
+
+def _is_human_output(args) -> bool:
+    """--format 显式指定时优先，否则使用 --human。"""
+    output_format = getattr(args, "output_format", None)
+    if output_format is not None:
+        return output_format == "human"
+    return bool(getattr(args, "human", False))
 
 
 def _parse_compare_targets(spec: str) -> list[tuple[str, str]]:
@@ -701,9 +748,7 @@ def _run_inspect_compare(args, providers, say) -> int:
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
     _ua = getattr(args, "user_agent", None)
-    human = (getattr(args, "output_format", None) == "human") or getattr(
-        args, "human", False
-    )
+    human = _is_human_output(args)
     delay = float(getattr(args, "probe_delay", 3.0) or 0)
 
     say(f"对比模式: {len(targets)} 个目标 · include={','.join(sorted(include))}")
@@ -778,7 +823,7 @@ def _run_inspect_compare(args, providers, say) -> int:
     }
 
     if human:
-        print(_format_compare_human(rows), flush=True)
+        say(_format_compare_human(rows))
     else:
         print(json.dumps(out, ensure_ascii=False, indent=2), flush=True)
 
@@ -817,12 +862,38 @@ def _format_compare_human(rows: list) -> str:
 
 def run_inspect(args, providers, say) -> int:
     """单一模型深度检测（7 维度：text/streaming/metadata/context/thinking/tools/vision）。"""
-    # --format 与 --human 合并：--format human 优先，否则 --human 为 True 时 human，否则 json
-    _fmt = getattr(args, "output_format", None)
-    if _fmt is None:
+    # --format 显式指定时优先；未指定时才使用 --human。
+    if getattr(args, "output_format", None) is None:
         args.output_format = "human" if getattr(args, "human", False) else "json"
+    try:
+        _resolve_inspect_include(args, _INSPECT_DEFAULT_INCLUDE)
+    except ValueError as exc:
+        say(str(exc))
+        print(
+            json.dumps(
+                {"schema_version": 1, "command": "inspect", "error": str(exc)},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
     if getattr(args, "compare", None):
         return _run_inspect_compare(args, providers, say)
+    if (
+        args.source == "manual"
+        and not getattr(args, "model", None)
+        and not (getattr(args, "all_models", False) or getattr(args, "models", None))
+    ):
+        err = "inspect --source manual 需要 --model"
+        say(err)
+        print(
+            json.dumps(
+                {"schema_version": 1, "command": "inspect", "error": err},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
     if not getattr(args, "provider", None):
         say("inspect 需要 --provider，或改用 --compare 'A/m1,B/m2'")
         print(
@@ -977,7 +1048,11 @@ def run_inspect(args, providers, say) -> int:
     elif streaming_result and streaming_result.get("raw_preview"):
         auth_body = streaming_result.get("raw_preview", "")
     crosspack = _detect_crosspack_fields(auth_body, inspect_p.app_type)
-    enabled_body = thinking_result.pop("_enabled_raw_body", "") if isinstance(thinking_result, dict) else ""
+    enabled_body = (
+        thinking_result.pop("_enabled_raw_body", "")
+        if isinstance(thinking_result, dict)
+        else ""
+    )
     _sigs = _extract_thinking_signatures(enabled_body)
     thinking_signature = {
         "has_valid_signature": _has_valid_thinking_signature(_sigs),
@@ -986,28 +1061,53 @@ def run_inspect(args, providers, say) -> int:
     # P1: usage 自洽静态校验（复用 text_raw 的 usage + answer，零新请求）
     _usage_raw = text_raw.get("usage") if text_raw else None
     _answer_raw = text_raw.get("answer", "") if text_raw else ""
-    usage_consistency = _check_usage_consistency(_usage_raw, _answer_raw, inspect_p.app_type)
+    usage_consistency = _check_usage_consistency(
+        _usage_raw, _answer_raw, inspect_p.app_type
+    )
     # P2-A: 缓存回放/钳温双发探测（可选 --include cache-replay；2 次新请求）
-    cache_replay = {"suspicious": False, "identical": None, "note": "未启用（--include cache-replay 开启）"}
+    cache_replay = {
+        "suspicious": False,
+        "identical": None,
+        "note": "未启用（--include cache-replay 开启）",
+    }
     if "cache-replay" in include:
         cache_replay = _probe_cache_replay(
-            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
-            max_tokens=16, user_agent=_ua,
+            inspect_p,
+            inspect_p.tiers[0],
+            args.timeout,
+            args.skip_tls_verify,
+            max_tokens=16,
+            user_agent=_ua,
         )
     # P2-B: 知识截止 before/after 题库（可选 --include knowledge-cutoff；6 次新请求）
-    knowledge_cutoff = {"suspicious": False, "note": "未启用（--include knowledge-cutoff 开启）"}
+    knowledge_cutoff = {
+        "suspicious": False,
+        "note": "未启用（--include knowledge-cutoff 开启）",
+    }
     if "knowledge-cutoff" in include:
         knowledge_cutoff = _probe_knowledge_cutoff(
-            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
-            max_tokens=32, user_agent=_ua,
+            inspect_p,
+            inspect_p.tiers[0],
+            args.timeout,
+            args.skip_tls_verify,
+            max_tokens=32,
+            user_agent=_ua,
         )
     # P2-C: 单 token 随机数分布指纹（可选 --include js-fingerprint；默认 50 次新请求）
     js_samples = getattr(args, "js_samples", 50) or 50
-    js_fingerprint = {"suspicious": False, "note": "未启用（--include js-fingerprint 开启）"}
+    js_fingerprint = {
+        "suspicious": False,
+        "note": "未启用（--include js-fingerprint 开启）",
+    }
     if "js-fingerprint" in include:
         js_fingerprint = _probe_js_fingerprint(
-            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
-            samples=js_samples, max_tokens=16, user_agent=_ua,
+            inspect_p,
+            inspect_p.tiers[0],
+            args.timeout,
+            args.skip_tls_verify,
+            samples=js_samples,
+            max_tokens=16,
+            user_agent=_ua,
         )
     auth_verdict, auth_evidence = _authenticity_verdict(
         {
@@ -1029,7 +1129,7 @@ def run_inspect(args, providers, say) -> int:
         "provider": inspect_p.name,
         "model": model_id,
         "model_source": args.source,
-        "base_url": inspect_p.base_url,
+        "base_url": _sanitize_url_for_display(inspect_p.base_url, inspect_p.api_key),
         "auth_mode": inspect_p.auth_mode,
         "custom_user_agent": p.custom_user_agent,  # 原始 Provider（未 rebuild）
         "notes": p.notes,  # 原始 Provider 运营备注
@@ -1070,7 +1170,7 @@ def run_inspect(args, providers, say) -> int:
             report["history_since"] = since
         except Exception as e:
             report["history"] = {"error": f"{type(e).__name__}: {e}"}
-    if args.output_format == "human" or args.human:
+    if _is_human_output(args):
         text = format_inspect_human(report)
         if report.get("history") and not report["history"].get("error"):
             h = report["history"]
@@ -1163,9 +1263,7 @@ def _run_inspect_all(args, providers, say) -> int:
 
     delay = float(getattr(args, "probe_delay", 3.0) or 0)
     max_retries = int(getattr(args, "max_retries", 1) or 0)
-    human = (getattr(args, "output_format", None) == "human") or getattr(
-        args, "human", False
-    )
+    human = _is_human_output(args)
     say(
         f"模型间延迟 {delay}s · 429 重试 {max_retries} 次 · 输出={'human' if human else 'json'}\n"
     )
@@ -1244,12 +1342,12 @@ def _run_inspect_all(args, providers, say) -> int:
     say(f"{'=' * 60}")
     # human 模式末尾再打一张汇总表
     if human and reports:
-        print(f"\n{'#':>3}  {'模型':<42}  verdict")
-        print("-" * 60)
+        say("\n" + f"{'#':>3}  {'模型':<42}  verdict")
+        say("-" * 60)
         for i, r in enumerate(reports, 1):
             v = (r.get("summary") or {}).get("verdict", "error")
             m = r.get("model", "?")
-            print(f"{i:>3}  {m[:40]:<42}  {v}")
+            say(f"{i:>3}  {m[:40]:<42}  {v}")
     # 退出码粒度：0 全成功 / 1 部分失败 / 3 全部失败（仅批量模式）
     if fail_count == 0:
         return 0
@@ -1449,9 +1547,11 @@ def format_inspect_human(r: dict) -> str:
         lines.append(f"  · 换芯字段：{cp.get('note', '未取得数据')}")
     ts = auth.get("thinking_signature") or {}
     sig = ts.get("has_valid_signature")
-    sig_str = {True: "有效签名（确为真 Claude 服务端产出）",
-               False: "thinking 块无签名，疑似伪造",
-               None: "未触发 thinking 块"}.get(sig, "未知")
+    sig_str = {
+        True: "有效签名（确为真 Claude 服务端产出）",
+        False: "thinking 块无签名，疑似伪造",
+        None: "未触发 thinking 块",
+    }.get(sig, "未知")
     lines.append(f"  · thinking 签名：{sig_str}")
     uc = auth.get("usage_consistency") or {}
     if uc.get("findings"):
@@ -1466,8 +1566,13 @@ def format_inspect_human(r: dict) -> str:
     for label, probe_result in (("缓存回放", cr), ("知识截止", kc), ("分布指纹", js)):
         if probe_result.get("note") and "未启用" not in probe_result.get("note", ""):
             lines.append(f"  · {label}：{probe_result.get('note')}")
-    if any("未启用" in (probe_result.get("note") or "") or not probe_result for probe_result in (cr, kc, js)):
-        lines.append("  提示：使用 --auth-full 开启缓存回放、知识截止和分布指纹深度鉴别")
+    if any(
+        "未启用" in (probe_result.get("note") or "") or not probe_result
+        for probe_result in (cr, kc, js)
+    ):
+        lines.append(
+            "  提示：使用 --auth-full 开启缓存回放、知识截止和分布指纹深度鉴别"
+        )
     ev = auth.get("evidence") or []
     if ev and av == "suspicious":
         lines.append(f"  证据：{'；'.join(ev)}")
@@ -1545,11 +1650,14 @@ def run_history(args, say) -> int:
     # 可选磁盘日志
     log_file = getattr(args, "log_file", None)
     if log_file:
-        report["log_file_tail"] = read_log_file_tail(
-            log_file,
-            lines=getattr(args, "log_lines", 50) or 50,
-            keyword=getattr(args, "log_keyword", None),
-        )
+        report["log_file_tail"] = [
+            _sanitize_for_terminal(_sanitize_log_text(ln, _provider_api_keys(args.db, {})))
+            for ln in read_log_file_tail(
+                log_file,
+                lines=getattr(args, "log_lines", 50) or 50,
+                keyword=getattr(args, "log_keyword", None),
+            )
+        ]
 
     if getattr(args, "json", False):
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
@@ -1757,9 +1865,7 @@ def run_watch(args, say) -> int:
     def _emit_row(r: dict) -> None:
         if json_mode:
             print(
-                json.dumps(
-                    {"event": "row", **r}, ensure_ascii=False, default=str
-                ),
+                json.dumps({"event": "row", **r}, ensure_ascii=False, default=str),
                 flush=True,
             )
             return
@@ -1788,9 +1894,7 @@ def run_watch(args, say) -> int:
         _say_colored(tok)
         if r.get("error_message"):
             cat = _sanitize_for_terminal(str(r.get("error_category") or ""))
-            msg = _sanitize_for_terminal(str(r.get("error_message") or ""))[
-                :160
-            ]
+            msg = _sanitize_for_terminal(str(r.get("error_message") or ""))[:160]
             _say_colored(f"  {_c('[' + cat + ']', 'red')} {msg}")
 
     # 起点：当前最新 created_at（避免启动时刷屏历史）
@@ -2382,14 +2486,14 @@ def _build_parser():
     p_inspect.add_argument(
         "--human",
         action="store_true",
-        help="以人类可读格式输出到 stdout（默认 JSON；与 --format human 等价）",
+        help="以人类可读格式输出到 stdout（默认 JSON；未指定 --format 时与 --human 等价）",
     )
     p_inspect.add_argument(
         "--format",
         default=None,
         choices=["human", "json"],
         dest="output_format",
-        help="输出格式：human / json（默认 json；--human 等价于 human）",
+        help="输出格式：human / json（显式 --format 优先于 --human）",
     )
     p_inspect.add_argument(
         "--compare",
@@ -2494,7 +2598,7 @@ def _build_parser():
     p_watch.add_argument(
         "--json",
         action="store_true",
-        help="NDJSON 流输出（每行一个 {\"event\":\"row\",...} 到 stdout，人类进度走 stderr）",
+        help='NDJSON 流输出（每行一个 {"event":"row",...} 到 stdout，人类进度走 stderr）',
     )
 
     p_analyze = sub.add_parser(
@@ -2568,10 +2672,10 @@ def _build_parser():
     p_deep.add_argument(
         "--models", default=None, help="指定模型（逗号分隔，默认全部去重）"
     )
+    p_deep.add_argument("--yes", action="store_true", help="跳过容量确认（>20 组合时）")
     p_deep.add_argument(
-        "--yes", action="store_true", help="跳过容量确认（>20 组合时）"
+        "--json", action="store_true", help="只输出任务列表 JSON 不执行"
     )
-    p_deep.add_argument("--json", action="store_true", help="只输出任务列表 JSON 不执行")
 
     # 兜底默认（注入 check 后子解析器会覆盖这些）
     ap.set_defaults(command="check", type="claude", failover_only=False, json=False)
@@ -2618,7 +2722,7 @@ def run_deep_dive(args, say) -> int:
     seen: dict[str, bool] = {}
     all_models: list[str] = []
     for p in targets:
-        for a in (p.get("attempts") or []):
+        for a in p.get("attempts") or []:
             m = a.get("model")
             if m and m not in seen:
                 seen[m] = True
@@ -2634,10 +2738,16 @@ def run_deep_dive(args, say) -> int:
 
     # 任务列表：每家供应商只测它自己 attempts 里出现过的、且被选中的模型
     # （交集，非笛卡尔积——与 PS1 Invoke-DeepDive 37837e5 一致，避免测没配的模型白吃 403）
-    sel_set = {m.strip() for m in args.models.split(",") if m.strip()} if args.models else None
+    sel_set = (
+        {m.strip() for m in args.models.split(",") if m.strip()}
+        if args.models
+        else None
+    )
     tasks = []
     for p in targets:
-        prov_models = {a.get("model") for a in (p.get("attempts") or []) if a.get("model")}
+        prov_models = {
+            a.get("model") for a in (p.get("attempts") or []) if a.get("model")
+        }
         for m in prov_models:
             if sel_set is None or m in sel_set:
                 tasks.append((p["name"], p.get("type", "claude"), m))
@@ -2645,19 +2755,7 @@ def run_deep_dive(args, say) -> int:
         say("选中供应商均无选中模型")
         return 0
 
-    # 容量保护
-    if len(tasks) > 20 and not args.yes:
-        est_min = len(tasks) * 35 // 60
-        say(f"⚠ 组合数较多（{len(tasks)} 个），预计约 {est_min} 分钟。加 --yes 跳过确认。")
-        if not sys.stdin.isatty():
-            say("非交互环境，加 --yes 确认执行。")
-            return 0
-        ans = input("继续？[y/N] ").strip().lower()
-        if ans != "y":
-            say("已取消")
-            return 0
-
-    # --json 只输出任务列表（dry-run），不执行
+    # --json 只输出任务列表（dry-run），不执行；dry-run 不受执行容量确认阻断。
     if args.json:
         print(
             json.dumps(
@@ -2675,6 +2773,24 @@ def run_deep_dive(args, say) -> int:
             flush=True,
         )
         return 0
+
+    # 容量保护只约束真正执行，避免非 TTY dry-run 空 stdout。
+    if len(tasks) > 20 and not args.yes:
+        est_min = len(tasks) * 35 // 60
+        say(
+            f"⚠ 组合数较多（{len(tasks)} 个），预计约 {est_min} 分钟。加 --yes 跳过确认。"
+        )
+        if not sys.stdin.isatty():
+            say("非交互环境，加 --yes 确认执行。")
+            return 0
+        try:
+            ans = input("继续？[y/N] ").strip().lower()
+        except EOFError:
+            say("非交互环境，未确认执行。")
+            return 0
+        if ans != "y":
+            say("已取消")
+            return 0
 
     say(f"深挖: {len(targets)} 家供应商 × {len(models)} 模型 = {len(tasks)} 个组合")
     script = str(Path(__file__).resolve())
@@ -2734,9 +2850,7 @@ def main():
     ap, *_ = _build_parser()
     args = ap.parse_args()
 
-    if getattr(args, "quiet", False) and (
-        getattr(args, "human", False) or getattr(args, "output_format", None) == "human"
-    ):
+    if getattr(args, "quiet", False) and (_is_human_output(args)):
         print(
             "--quiet 与 --human 互斥；忽略 --human，强制 JSON",
             file=sys.stderr,
@@ -2748,7 +2862,7 @@ def main():
     output_token = _output_stream.set(
         sys.stderr
         if getattr(args, "json", False)
-        or (args.command == "inspect" and not getattr(args, "human", False))
+        or (args.command == "inspect" and not _is_human_output(args))
         else sys.stdout
     )
 
@@ -2828,8 +2942,10 @@ def _main_with_args(args) -> int:
         say(f"--failover-only: {before} → {len(providers)}（只保留队列内+当前激活）")
 
     # --select: 交互式 TUI 选择供应商（非 TTY 自动降级到 --provider / 全量）
-    if getattr(args, "select", False) and providers and not getattr(
-        args, "compare", None
+    if (
+        getattr(args, "select", False)
+        and providers
+        and not getattr(args, "compare", None)
     ):
         from ccpulse_tui import select_providers
 

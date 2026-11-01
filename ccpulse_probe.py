@@ -35,16 +35,14 @@ from ccpulse_net import (
     classify_error,
     create_ssl_context,
 )
-from ccpulse_output import (
-    _c,
-    _sanitize_for_terminal,
-)
+from ccpulse_output import _c, _sanitize_url_for_display
 
 # 默认兜底的 claude-cli 版本（读取本机版本失败时用）
 _DEFAULT_CLAUDE_CLI_VERSION = "2.1.44"
 # 本机 claude-cli 版本缓存（懒加载）；有锁保护的幂等懒缓存
 _CLAUDE_CLI_VERSION_CACHE: str | None = None
 _CLAUDE_VERSION_LOCK = threading.Lock()
+
 
 # --- from check_ccswitch_health.py:93-327 ---
 def _detect_claude_cli_version() -> str:
@@ -320,6 +318,7 @@ class Provider:
     # OpenCode Go 运行期会话；不参与 repr/比较，不进入数据库或报告
     _opencode_session_id: str | None = field(default=None, repr=False, compare=False)
 
+
 # --- from check_ccswitch_health.py:526-2196 ---
 def build_auth_headers(p: Provider) -> dict:
     """按 auth_mode 只发一个认证头（和真实 Claude Code 一致）"""
@@ -505,60 +504,61 @@ def build_probe_request(
 
 
 def extract_answer(p: Provider, resp_body: str) -> str:
-    """从响应里提取模型的实际回答文本。
-
-    按权威协议分支（而非 app_type）：claude+apiFormat=openai_chat 这类
-    供应商请求发对了但响应按 Anthropic content[] 解析会丢成空串。
-    """
+    """从响应里提取模型的实际回答文本。"""
     try:
         j = json.loads(resp_body)
     except (json.JSONDecodeError, TypeError):
         return ""
+    if not isinstance(j, dict):
+        return ""
 
-    # OpenAI chat/completions / OpenAI Responses：统一按 choices[].message.content
-    if p.protocol in (Protocol.OPENAI_CHAT_COMPLETIONS, Protocol.OPENAI_RESPONSES):
-        for ch in j.get("choices", []):
+    if p.protocol == Protocol.OPENAI_RESPONSES:
+        output_text = j.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+        for output in j.get("output", []) or []:
+            if not isinstance(output, dict):
+                continue
+            for content in output.get("content", []) or []:
+                if isinstance(content, dict) and isinstance(content.get("text"), str):
+                    if content["text"].strip():
+                        return content["text"].strip()
+        return ""
+
+    if p.protocol == Protocol.OPENAI_CHAT_COMPLETIONS:
+        for ch in j.get("choices", []) or []:
             if not isinstance(ch, dict):
                 continue
             msg = ch.get("message") or {}
             if isinstance(msg, dict) and msg.get("content"):
                 return str(msg["content"]).strip()
-            # 少数兼容层把 content 放在 choice 顶层
             if ch.get("content"):
                 return str(ch["content"]).strip()
-            # Responses 协议可能在 output_text/output
-            ot = j.get("output_text")
-            if isinstance(ot, str) and ot:
-                return ot.strip()
         return ""
 
-    # Anthropic messages: {"content": [{"type":"text","text":"5"}]}
-    parts = []
-    for blk in j.get("content", []):
-        if isinstance(blk, dict) and blk.get("text"):
-            parts.append(blk["text"])
-    # Responses API: {"output":[{"content":[{"text":"5"}]}]}
-    for o in j.get("output", []):
-        if not isinstance(o, dict):
+    parts = [
+        str(block["text"])
+        for block in j.get("content", []) or []
+        if isinstance(block, dict) and block.get("text")
+    ]
+    if parts:
+        return "".join(parts).strip()
+    for output in j.get("output", []) or []:
+        if not isinstance(output, dict):
             continue
-        for c in o.get("content", []):
-            if isinstance(c, dict) and c.get("text"):
-                return c["text"].strip()
-    return "".join(parts).strip()
+        for content in output.get("content", []) or []:
+            if isinstance(content, dict) and content.get("text"):
+                return str(content["text"]).strip()
+    return ""
 
 
 def extract_usage(resp_body: str) -> dict:
-    """从响应 JSON 提取 usage 字段（诚实：解析不到则 present=False）。
-
-    兼容：
-      - Anthropic: usage.input_tokens / output_tokens
-      - OpenAI chat: usage.prompt_tokens / completion_tokens
-      - Responses: usage.input_tokens / output_tokens
-    """
+    """从响应 JSON 提取 usage 字段（诚实：解析不到则 present=False）。"""
     empty = {
         "present": False,
         "input_tokens": None,
         "output_tokens": None,
+        "total_tokens": None,
         "source": None,
         "missing_fields": ["input_tokens", "output_tokens"],
     }
@@ -577,6 +577,7 @@ def extract_usage(resp_body: str) -> dict:
     out = usage.get("output_tokens")
     if out is None:
         out = usage.get("completion_tokens")
+    total = usage.get("total_tokens")
     missing = []
     if inp is None:
         missing.append("input_tokens")
@@ -587,9 +588,33 @@ def extract_usage(resp_body: str) -> dict:
         "present": present,
         "input_tokens": int(inp) if isinstance(inp, (int, float)) else None,
         "output_tokens": int(out) if isinstance(out, (int, float)) else None,
+        "total_tokens": int(total) if isinstance(total, (int, float)) else None,
         "source": "response_body" if present else None,
         "missing_fields": missing,
     }
+
+
+def _response_failure_reason(p: Provider, resp_body: str, answer: str) -> str:
+    """返回 HTTP 200 JSON 的结构化失败原因，空串表示结构有效。"""
+    try:
+        payload = json.loads(resp_body)
+    except (json.JSONDecodeError, TypeError):
+        return "HTTP 200 响应不是有效 JSON"
+    if not isinstance(payload, dict):
+        return "HTTP 200 响应 JSON 顶层不是对象"
+    if payload.get("error") is not None:
+        error = payload["error"]
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("type")
+        else:
+            message = str(error)
+        return f"HTTP 200 响应包含 error: {message or '未知错误'}"
+    if p.protocol == Protocol.OPENAI_RESPONSES:
+        if payload.get("status") == "failed":
+            return "Responses 响应 status=failed"
+        if not answer:
+            return "Responses 响应无有效输出"
+    return ""
 
 
 def _response_has_thinking_signal(resp_body: str) -> bool:
@@ -638,7 +663,9 @@ _ANTHROPIC_ONLY_USAGE_FIELDS = (
 )
 
 
-def _detect_crosspack_fields(resp_body: str, app_type: str) -> dict:
+def _detect_crosspack_fields(
+    resp_body: str, app_type: str, protocol: Protocol | None = None
+) -> dict:
     """换芯字段检测：响应里出现"本协议不该有"的字段 → 中转把请求偷转给异协议后端。
 
     原理借鉴 veridrop（AGPL-3.0）：原生 OpenAI usage 只有 prompt/completion/total
@@ -656,8 +683,19 @@ def _detect_crosspack_fields(resp_body: str, app_type: str) -> dict:
     if not isinstance(j, dict):
         return {**empty, "note": "响应非对象，无法解析"}
 
-    is_openai = app_type in ("codex", "openclaw")
-    is_anthropic = app_type == "claude"
+    is_openai = protocol in (
+        Protocol.OPENAI_CHAT_COMPLETIONS,
+        Protocol.OPENAI_RESPONSES,
+    ) or (protocol is None and app_type in ("codex", "openclaw"))
+    is_anthropic = protocol in (
+        None,
+        Protocol.ANTHROPIC_MESSAGES,
+        Protocol.UNKNOWN,
+    ) and (
+        protocol in (None, Protocol.UNKNOWN)
+        and app_type == "claude"
+        or protocol == Protocol.ANTHROPIC_MESSAGES
+    )
     findings: list[dict] = []
 
     usage = j.get("usage")
@@ -668,10 +706,16 @@ def _detect_crosspack_fields(resp_body: str, app_type: str) -> dict:
         for f in _ANTHROPIC_ONLY_USAGE_FIELDS:
             if f in usage:
                 findings.append(
-                    {"field": f"usage.{f}", "reason": "Anthropic 专属字段出现在 OpenAI 格式响应，疑似后端换芯为 Claude"}
+                    {
+                        "field": f"usage.{f}",
+                        "reason": "Anthropic 专属字段出现在 OpenAI 格式响应，疑似后端换芯为 Claude",
+                    }
                 )
         # 顶层 usage_source 自曝来源
-        if isinstance(j.get("usage_source"), str) and "anthropic" in j["usage_source"].lower():
+        if (
+            isinstance(j.get("usage_source"), str)
+            and "anthropic" in j["usage_source"].lower()
+        ):
             findings.append(
                 {"field": "usage_source", "reason": "中转自曝后端来源为 anthropic"}
             )
@@ -679,7 +723,10 @@ def _detect_crosspack_fields(resp_body: str, app_type: str) -> dict:
         m = j.get("model")
         if isinstance(m, str) and "claude" in m.lower():
             findings.append(
-                {"field": "model", "reason": "OpenAI 协议响应回 Claude 模型名，疑似后端换芯"}
+                {
+                    "field": "model",
+                    "reason": "OpenAI 协议响应回 Claude 模型名，疑似后端换芯",
+                }
             )
     elif is_anthropic:
         # Anthropic 响应里出现 OpenAI 专属字段 → 后端疑似 OpenAI 系
@@ -687,18 +734,28 @@ def _detect_crosspack_fields(resp_body: str, app_type: str) -> dict:
             if f in j or f in usage:
                 loc = "usage." + f if f in usage else f
                 findings.append(
-                    {"field": loc, "reason": "OpenAI 专属字段出现在 Anthropic 格式响应，疑似后端换芯为 OpenAI 系"}
+                    {
+                        "field": loc,
+                        "reason": "OpenAI 专属字段出现在 Anthropic 格式响应，疑似后端换芯为 OpenAI 系",
+                    }
                 )
         m = j.get("model")
-        if isinstance(m, str) and ("gpt" in m.lower() or "o1" in m.lower() or "o3" in m.lower()):
+        if isinstance(m, str) and (
+            "gpt" in m.lower() or "o1" in m.lower() or "o3" in m.lower()
+        ):
             findings.append(
-                {"field": "model", "reason": "Anthropic 协议响应回 GPT/o 系模型名，疑似后端换芯"}
+                {
+                    "field": "model",
+                    "reason": "Anthropic 协议响应回 GPT/o 系模型名，疑似后端换芯",
+                }
             )
 
     return {"suspicious": bool(findings), "findings": findings}
 
 
-def _extract_thinking_signatures(resp_body: str) -> list[dict]:
+def _extract_thinking_signatures(
+    resp_body: str, protocol: Protocol | None = None
+) -> list[dict]:
     """从响应提取 thinking/reasoning 块的签名信息。
 
     Anthropic：content[].type == "thinking" 且带 signature（服务端密钥签名，不可伪造）。
@@ -712,6 +769,9 @@ def _extract_thinking_signatures(resp_body: str) -> list[dict]:
     except (json.JSONDecodeError, TypeError):
         return []
     if not isinstance(j, dict):
+        return []
+
+    if protocol in (Protocol.OPENAI_CHAT_COMPLETIONS, Protocol.OPENAI_RESPONSES):
         return []
 
     out: list[dict] = []
@@ -731,7 +791,9 @@ def _extract_thinking_signatures(resp_body: str) -> list[dict]:
             if not isinstance(ch, dict):
                 continue
             msg = ch.get("message") or {}
-            if isinstance(msg, dict) and (msg.get("reasoning_content") or msg.get("reasoning")):
+            if isinstance(msg, dict) and (
+                msg.get("reasoning_content") or msg.get("reasoning")
+            ):
                 out.append({"signature_present": False, "signature_length": 0})
     return out
 
@@ -800,17 +862,29 @@ def _probe_cache_replay(
     """
     fixed_q = PROBE_PROMPTS[0]["q"] if PROBE_PROMPTS else "1+4="
     r1 = probe_tier(
-        p, tier, timeout, skip_tls, max_tokens=max_tokens,
-        disable_thinking=True, user_agent=user_agent,
-        temperature=1.0, question=fixed_q,
+        p,
+        tier,
+        timeout,
+        skip_tls,
+        max_tokens=max_tokens,
+        disable_thinking=True,
+        user_agent=user_agent,
+        temperature=1.0,
+        question=fixed_q,
     )
     r2 = probe_tier(
-        p, tier, timeout, skip_tls, max_tokens=max_tokens,
-        disable_thinking=True, user_agent=user_agent,
-        temperature=1.0, question=fixed_q,
+        p,
+        tier,
+        timeout,
+        skip_tls,
+        max_tokens=max_tokens,
+        disable_thinking=True,
+        user_agent=user_agent,
+        temperature=1.0,
+        question=fixed_q,
     )
-    a1 = str(r1.get("answer", "") or "")
-    a2 = str(r2.get("answer", "") or "")
+    a1 = _sanitize_display(str(r1.get("answer", "") or ""), p.api_key)
+    a2 = _sanitize_display(str(r2.get("answer", "") or ""), p.api_key)
     if r1.get("status") != 200 or r2.get("status") != 200:
         return {
             "suspicious": False,
@@ -823,7 +897,9 @@ def _probe_cache_replay(
     return {
         "suspicious": identical,
         "identical": identical,
-        "note": "temp=1 双发逐字相同，疑似缓存回放或强制钳温" if identical else "双发答案不同，无缓存回放迹象",
+        "note": "temp=1 双发逐字相同，疑似缓存回放或强制钳温"
+        if identical
+        else "双发答案不同，无缓存回放迹象",
         "first_answer": a1,
         "second_answer": a2,
     }
@@ -835,12 +911,36 @@ def _probe_cache_replay(
 # era="after" 只有较新模型（截止 ≥2024-09）才该会。
 # 答案键内置代码不进 prompt，防 Agent 抄答案。
 KNOWLEDGE_CUTOFF_QUESTIONS = [
-    {"q": "2020 年奥运会在哪个城市举办？只答城市名。", "expected": "东京", "era": "before"},
-    {"q": "ChatGPT 首次公开发布是哪一年？只答年份。", "expected": "2022", "era": "before"},
-    {"q": "AlphaGo 击败李世石是哪一年？只答年份。", "expected": "2016", "era": "before"},
-    {"q": "Claude 3.5 Sonnet 公开发布于哪一年？只答年份。", "expected": "2024", "era": "after"},
-    {"q": "OpenAI 发布的 o1 模型是哪一年？只答年份。", "expected": "2024", "era": "after"},
-    {"q": "DeepSeek-V3 公开发布于哪一年？只答年份。", "expected": "2024", "era": "after"},
+    {
+        "q": "2020 年奥运会在哪个城市举办？只答城市名。",
+        "expected": "东京",
+        "era": "before",
+    },
+    {
+        "q": "ChatGPT 首次公开发布是哪一年？只答年份。",
+        "expected": "2022",
+        "era": "before",
+    },
+    {
+        "q": "AlphaGo 击败李世石是哪一年？只答年份。",
+        "expected": "2016",
+        "era": "before",
+    },
+    {
+        "q": "Claude 3.5 Sonnet 公开发布于哪一年？只答年份。",
+        "expected": "2024",
+        "era": "after",
+    },
+    {
+        "q": "OpenAI 发布的 o1 模型是哪一年？只答年份。",
+        "expected": "2024",
+        "era": "after",
+    },
+    {
+        "q": "DeepSeek-V3 公开发布于哪一年？只答年份。",
+        "expected": "2024",
+        "era": "after",
+    },
 ]
 
 
@@ -873,16 +973,37 @@ def _probe_knowledge_cutoff(
     after_ok = after_total = 0
     for item in KNOWLEDGE_CUTOFF_QUESTIONS:
         r = probe_tier(
-            p, tier, timeout, skip_tls, max_tokens=max_tokens,
-            disable_thinking=True, user_agent=user_agent,
+            p,
+            tier,
+            timeout,
+            skip_tls,
+            max_tokens=max_tokens,
+            disable_thinking=True,
+            user_agent=user_agent,
             question=item["q"],
         )
         if r.get("status") != 200:
-            details.append({"q": item["q"], "era": item["era"], "correct": None, "answer": r.get("answer", "")})
+            details.append(
+                {
+                    "q": item["q"],
+                    "era": item["era"],
+                    "correct": None,
+                    "answer": _sanitize_display(
+                        str(r.get("answer", "") or ""), p.api_key
+                    ),
+                }
+            )
             continue
         ans = str(r.get("answer", "") or "")
         ok = _kc_check_answer(ans, item["expected"])
-        details.append({"q": item["q"], "era": item["era"], "correct": ok, "answer": ans[:80]})
+        details.append(
+            {
+                "q": item["q"],
+                "era": item["era"],
+                "correct": ok,
+                "answer": _sanitize_display(ans, p.api_key)[:80],
+            }
+        )
         if item["era"] == "before":
             before_total += 1
             if ok:
@@ -985,8 +1106,13 @@ def _probe_js_fingerprint(
     failures = 0
     for _ in range(samples):
         r = probe_tier(
-            p, tier, timeout, skip_tls, max_tokens=max_tokens,
-            disable_thinking=True, user_agent=user_agent,
+            p,
+            tier,
+            timeout,
+            skip_tls,
+            max_tokens=max_tokens,
+            disable_thinking=True,
+            user_agent=user_agent,
             question=q,
         )
         if r.get("status") != 200:
@@ -1068,7 +1194,6 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     return "clean", evidence
 
 
-
 def _drain_non_sse_stream(resp, p: Provider) -> dict:
     """消费非 SSE 响应（供应商对 stream=true 仍返回普通 JSON）。
 
@@ -1100,8 +1225,9 @@ def _drain_non_sse_stream(resp, p: Provider) -> dict:
     content_type = resp.headers.get("Content-Type", "")
     if content_type.startswith("application/json") and raw:
         try:
-            j = json.loads(raw.decode("utf-8", errors="replace"))
-            text = extract_answer(p, json.dumps(j, ensure_ascii=False))
+            raw_text = raw.decode("utf-8", errors="replace")
+            j = json.loads(raw_text)
+            text = extract_answer(p, raw_text)
             for path in [("model",), ("message", "model"), ("response", "model")]:
                 cur = j
                 for k in path:
@@ -1119,6 +1245,9 @@ def _drain_non_sse_stream(resp, p: Provider) -> dict:
         "text": text,
         "response_model": response_model,
         "raw_preview": bytes(raw)[:200],
+        "raw_body": _sanitize_raw_body(
+            raw.decode("utf-8", errors="replace"), p.api_key
+        ),
         "stream_truncated": stream_truncated,
     }
 
@@ -1131,7 +1260,7 @@ def _drain_sse_stream(
     event_count = 0
     response_model = None
     response_text_buf: list[str] = []
-    usage_values = {"input_tokens": None, "output_tokens": None}
+    usage_values = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
     got_done = False
     sse_done = False
     stream_truncated = False
@@ -1150,8 +1279,10 @@ def _drain_sse_stream(
         proto_name, ("event", "message_stop")
     )
 
+    failure_reason = None
+
     def _on_event(ev: StreamEvent):
-        nonlocal first_event_at, event_count, response_model, got_done
+        nonlocal first_event_at, event_count, response_model, got_done, failure_reason
         if first_event_at is None and ev.get("kind") in (
             "first_chunk",
             "message_start",
@@ -1187,17 +1318,22 @@ def _drain_sse_stream(
                     if output_tokens is not None
                     else usage.get("completion_tokens", usage_values["output_tokens"])
                 )
+                total_tokens = usage.get("total_tokens")
+                if total_tokens is not None:
+                    usage_values["total_tokens"] = total_tokens
         if ev.get("kind") == "text_delta" and ev.get("text_delta"):
             response_text_buf.append(ev["text_delta"])
         if ev.get("kind") == "done":
             got_done = True
+        if ev.get("kind") == "error":
+            failure_reason = ev.get("failure") or "Responses 响应失败"
 
     def _process(event_bytes: bytes):
         nonlocal sse_done
         # _process_sse_event 通过 _on_event 统一更新 first_event_at /
         # response_model / event_count / response_text_buf / got_done，
         # 这里不再重复解析（避免双实现分叉）。
-        _process_sse_event(
+        terminal = _process_sse_event(
             event_bytes,
             proto_name,
             _on_event,
@@ -1205,7 +1341,7 @@ def _drain_sse_stream(
             done_marker_value,
             response_text_buf,
         )
-        if got_done:
+        if terminal or got_done:
             sse_done = True
 
     def _take_event(buf: bytes) -> tuple:
@@ -1285,11 +1421,16 @@ def _drain_sse_stream(
         if not sse_done and sse_buffer.strip():
             _process(sse_buffer)
 
-    missing_fields = [field for field, value in usage_values.items() if value is None]
+    missing_fields = [
+        field
+        for field in ("input_tokens", "output_tokens")
+        if usage_values[field] is None
+    ]
     usage = {
         "present": any(value is not None for value in usage_values.values()),
         "input_tokens": usage_values["input_tokens"],
         "output_tokens": usage_values["output_tokens"],
+        "total_tokens": usage_values["total_tokens"],
         "source": "stream_events"
         if any(value is not None for value in usage_values.values())
         else None,
@@ -1302,6 +1443,7 @@ def _drain_sse_stream(
         "text": "".join(response_text_buf),
         "raw_preview": bytes(raw_buf),
         "usage": usage,
+        "failure": failure_reason,
         "stream_truncated": stream_truncated,
         "event_too_large": event_too_large,
     }
@@ -1374,12 +1516,16 @@ def probe_stream(
                 text = drain["text"]
                 response_model = drain["response_model"]
                 raw_preview = drain["raw_preview"]
-                usage = extract_usage(
-                    raw_preview.decode("utf-8", errors="replace") if raw_preview else ""
-                )
+                raw_body = drain.get("raw_body", "")
+                usage = extract_usage(raw_body)
                 if drain["stream_truncated"]:
                     error_category = ErrorCategory.STREAM_INCOMPLETE.value
                     error_msg = "流式响应不完整"
+                elif raw_body and "application/json" in content_type.lower():
+                    reason = _response_failure_reason(p, raw_body, text)
+                    if reason:
+                        error_category = ErrorCategory.INVALID_RESPONSE.value
+                        error_msg = reason
             else:
                 proto_name = detect_protocol(p)["detected"]
                 ttft_deadline = ttft_timeout if ttft_timeout is not None else None
@@ -1390,7 +1536,10 @@ def probe_stream(
                 text = drain["text"]
                 raw_preview = drain["raw_preview"]
                 usage = drain["usage"]
-                if drain["stream_truncated"]:
+                if drain.get("failure"):
+                    error_category = ErrorCategory.INVALID_RESPONSE.value
+                    error_msg = f"Responses 响应失败: {drain['failure']}"
+                elif drain["stream_truncated"]:
                     error_category = ErrorCategory.STREAM_INCOMPLETE.value
                     error_msg = "流式响应不完整"
 
@@ -1415,9 +1564,13 @@ def probe_stream(
             )
     except Exception as e:
         error_category = (
-            _error_category_for_urlerror(e)
-            if _is_tls_error(e)
-            else ErrorCategory.UNKNOWN.value
+            ErrorCategory.STREAM_INCOMPLETE.value
+            if http_status == 200 and is_sse
+            else (
+                _error_category_for_urlerror(e)
+                if _is_tls_error(e)
+                else ErrorCategory.UNKNOWN.value
+            )
         )
         error_msg = f"异常: {type(e).__name__}: {e}"
 
@@ -1429,6 +1582,9 @@ def probe_stream(
     correct = _answer_correct(answer_text, expected)
 
     # 状态判定
+    if is_sse and error_category == ErrorCategory.UNKNOWN.value:
+        # SSE 读取异常通常表现为连接提前关闭，统一归为流不完整。
+        error_category = ErrorCategory.STREAM_INCOMPLETE.value
     if error_msg:
         if error_category in (ErrorCategory.NONE.value, "", None):
             error_category = (
@@ -1439,6 +1595,13 @@ def probe_stream(
         elif is_sse and error_category == ErrorCategory.UNKNOWN.value:
             # SSE 流遭遇未预期异常（IncompleteRead/RemoteDisconnected 等）→ 归为流不完整
             error_category = ErrorCategory.STREAM_INCOMPLETE.value
+        status = "error"
+    elif is_sse and drain.get("stream_truncated"):
+        # 连接提前断（无 done marker）或缓冲丢弃 → 视为不完整，即使异常信息已存在
+        status = "error"
+        error_category = ErrorCategory.STREAM_INCOMPLETE.value
+        error_msg = error_msg or "流式响应不完整"
+    elif error_msg:
         status = "error"
     elif not is_sse:
         if http_status == 200 and answer_text:
@@ -1474,6 +1637,12 @@ def probe_stream(
             status = "error"
             error_category = ErrorCategory.STREAM_INCOMPLETE.value
 
+    if (
+        "text/event-stream" in (content_type or "").lower()
+        and error_category == ErrorCategory.UNKNOWN.value
+    ):
+        error_category = ErrorCategory.STREAM_INCOMPLETE.value
+
     return {
         "status": status,
         "http_status": http_status,
@@ -1482,14 +1651,12 @@ def probe_stream(
         "response_model": response_model,
         "content_type": content_type,
         "event_count": event_count,
-        "text": _sanitize_for_terminal(text[:80]),
+        "text": _sanitize_display(text[:80], p.api_key),
         "is_sse": is_sse,
         "error": _sanitize_display(error_msg, p.api_key),
         "error_category": error_category,
         "raw_preview": (
-            _sanitize_display(
-                raw_preview.decode("utf-8", errors="replace"), p.api_key
-            )
+            _sanitize_display(raw_preview.decode("utf-8", errors="replace"), p.api_key)
             if raw_preview
             else ""
         ),
@@ -1584,7 +1751,7 @@ def probe_tier(
             "model": tier.model,
             "status": 0,
             "elapsed": elapsed,
-            "error": resp.error_msg,
+            "error": _sanitize_display(resp.error_msg, p.api_key),
             "error_category": resp.error_category,
             "answer": "",
             "question": question,
@@ -1610,6 +1777,27 @@ def probe_tier(
         }
 
     answer = extract_answer(p, resp.body)
+    content_type = getattr(resp, "content_type", "") or ""
+    failure_reason = (
+        _response_failure_reason(p, resp.body, answer)
+        if "application/json" in content_type.lower()
+        else ""
+    )
+    if failure_reason:
+        return {
+            "tier": tier.tier,
+            "model": tier.model,
+            "status": 200,
+            "elapsed": elapsed,
+            "error": _sanitize_display(failure_reason, p.api_key),
+            "answer": _sanitize_display(answer, p.api_key)[:80],
+            "correct": False,
+            "question": question,
+            "error_category": ErrorCategory.INVALID_RESPONSE.value,
+            "usage": extract_usage(resp.body),
+            "raw_body": _sanitize_raw_body(resp.body[:8000], p.api_key),
+            "has_thinking_signal": _response_has_thinking_signal(resp.body),
+        }
     correct = _answer_correct(answer, expected)
     return {
         "tier": tier.tier,
@@ -1617,7 +1805,7 @@ def probe_tier(
         "status": 200,
         "elapsed": elapsed,
         "error": "",
-        "answer": answer[:80],
+        "answer": _sanitize_display(answer, p.api_key)[:80],
         "correct": correct,
         "question": question,
         "error_category": ErrorCategory.NONE.value
@@ -1675,7 +1863,7 @@ def probe(
     return {
         "name": p.name,
         "type": p.app_type,
-        "base_url": p.base_url,
+        "base_url": _sanitize_url_for_display(p.base_url, p.api_key),
         "auth_mode": p.auth_mode,
         "overall_ok": overall_ok,
         "best_tier": best_tier["tier"] if best_tier else None,
@@ -1700,7 +1888,11 @@ def fetch_models(
         url = _strip_v1("/models", p.base_url)
 
     auth_h = build_auth_headers(p)
-    headers = {**auth_h, "Content-Type": "application/json", **_opencode_session_headers(p)}
+    headers = {
+        **auth_h,
+        "Content-Type": "application/json",
+        **_opencode_session_headers(p),
+    }
     if p.app_type == "claude":
         headers.update(_claude_code_headers(user_agent))
 
@@ -1713,10 +1905,10 @@ def fetch_models(
     if resp.error_category is not None:
         return {
             "name": p.name,
-            "base_url": p.base_url,
+            "base_url": _sanitize_url_for_display(p.base_url, p.api_key),
             "status": 0,
             "elapsed": elapsed,
-            "error": resp.error_msg,
+            "error": _sanitize_display(resp.error_msg, p.api_key),
             "error_category": resp.error_category,
             "models": [],
         }
@@ -1725,7 +1917,7 @@ def fetch_models(
         category, display = classify_error(resp.body, resp.status)
         return {
             "name": p.name,
-            "base_url": p.base_url,
+            "base_url": _sanitize_url_for_display(p.base_url, p.api_key),
             "status": resp.status,
             "elapsed": elapsed,
             "error": _sanitize_display(display, p.api_key),
@@ -1736,7 +1928,7 @@ def fetch_models(
     models = extract_model_ids(resp.body)
     return {
         "name": p.name,
-        "base_url": p.base_url,
+        "base_url": _sanitize_url_for_display(p.base_url, p.api_key),
         "status": 200,
         "elapsed": elapsed,
         "error": "",
@@ -1793,7 +1985,9 @@ def probe_model_metadata(
     }
 
     if resp.error_category is not None:
-        return _unavail(resp.error_category, resp.error_msg)
+        return _unavail(
+            resp.error_category, _sanitize_display(resp.error_msg, p.api_key)
+        )
 
     if resp.status != 200:
         category, display = classify_error(resp.body, resp.status)
@@ -1996,7 +2190,7 @@ def probe_context_smoke(
             "token_estimate": te,
             "http_status": 0,
             "error_category": resp.error_category,
-            "error": resp.error_msg,
+            "error": _sanitize_display(resp.error_msg, p.api_key),
             "elapsed_seconds": elapsed,
         }
 
@@ -2025,7 +2219,9 @@ def probe_context_smoke(
             "token_estimate": te,
             "http_status": resp.status,
             "error_category": ErrorCategory.PROTOCOL_INCOMPATIBLE.value,
-            "error": _sanitize_display(classify_error(resp.body, resp.status)[1], p.api_key),
+            "error": _sanitize_display(
+                classify_error(resp.body, resp.status)[1], p.api_key
+            ),
             "elapsed_seconds": elapsed,
         }
 
@@ -2087,7 +2283,10 @@ def _probe_tools(
         f"You must call the tool {_TOOL_NAME} to answer. "
         "Do not answer with a bare number; invoke the tool."
     )
-    if p.app_type == "claude" and not p.is_openrouter:
+    proto = _resolve_protocol(p)
+    if proto == Protocol.UNKNOWN and p.app_type == "claude":
+        proto = Protocol.ANTHROPIC_MESSAGES
+    if proto == Protocol.ANTHROPIC_MESSAGES:
         payload = {
             "model": model_id,
             "max_tokens": 64,
@@ -2105,7 +2304,7 @@ def _probe_tools(
             ],
             "thinking": {"type": "disabled"},
         }
-    elif p.app_type in ("openclaw",) or p.is_openrouter:
+    elif proto == Protocol.OPENAI_CHAT_COMPLETIONS:
         payload = {
             "model": model_id,
             "max_tokens": 64,
@@ -2122,8 +2321,7 @@ def _probe_tools(
             ],
             "tool_choice": "auto",
         }
-    elif p.app_type == "codex":
-        # Responses API function tools（简化）
+    elif proto == Protocol.OPENAI_RESPONSES:
         payload = {
             "model": model_id,
             "max_output_tokens": 64,
@@ -2160,7 +2358,7 @@ def _probe_tools(
             "tool_name_seen": None,
             "http_status": 0,
             "error_category": resp.error_category,
-            "error": resp.error_msg,
+            "error": _sanitize_display(resp.error_msg, p.api_key),
             "evidence": "",
             "elapsed_seconds": elapsed,
         }
@@ -2175,7 +2373,9 @@ def _probe_tools(
             "tool_name_seen": None,
             "http_status": resp.status,
             "error_category": ErrorCategory.PROTOCOL_INCOMPATIBLE.value,
-            "error": _sanitize_display(classify_error(resp.body, resp.status)[1], p.api_key),
+            "error": _sanitize_display(
+                classify_error(resp.body, resp.status)[1], p.api_key
+            ),
             "evidence": _sanitize_display((resp.body or "")[:200], p.api_key),
             "elapsed_seconds": elapsed,
         }
@@ -2259,7 +2459,10 @@ def _probe_vision(
         }
 
     q = "What is the main color of this image? Reply with one English color word only."
-    if p.app_type == "claude" and not p.is_openrouter:
+    proto = _resolve_protocol(p)
+    if proto == Protocol.UNKNOWN and p.app_type == "claude":
+        proto = Protocol.ANTHROPIC_MESSAGES
+    if proto == Protocol.ANTHROPIC_MESSAGES:
         payload = {
             "model": model_id,
             "max_tokens": 32,
@@ -2281,7 +2484,7 @@ def _probe_vision(
                 }
             ],
         }
-    elif p.app_type in ("openclaw",) or p.is_openrouter:
+    elif proto in (Protocol.OPENAI_CHAT_COMPLETIONS,):
         payload = {
             "model": model_id,
             "max_tokens": 32,
@@ -2320,7 +2523,7 @@ def _probe_vision(
             "status": "error",
             "http_status": 0,
             "error_category": resp.error_category,
-            "error": resp.error_msg,
+            "error": _sanitize_display(resp.error_msg, p.api_key),
             "answer": "",
             "evidence": "",
             "elapsed_seconds": elapsed,
@@ -2334,7 +2537,9 @@ def _probe_vision(
             "status": "fail",
             "http_status": resp.status,
             "error_category": ErrorCategory.PROTOCOL_INCOMPATIBLE.value,
-            "error": _sanitize_display(classify_error(resp.body, resp.status)[1], p.api_key),
+            "error": _sanitize_display(
+                classify_error(resp.body, resp.status)[1], p.api_key
+            ),
             "answer": "",
             "evidence": _sanitize_display((resp.body or "")[:200], p.api_key),
             "elapsed_seconds": elapsed,
@@ -2362,7 +2567,7 @@ def _probe_vision(
         if status == "pass"
         else ErrorCategory.ANSWER_MISMATCH.value,
         "error": None if status == "pass" else "empty vision answer",
-        "answer": ans[:80],
+        "answer": _sanitize_display(ans, p.api_key)[:80],
         "evidence": "image accepted; answer not strictly validated",
         "elapsed_seconds": elapsed,
     }
@@ -2436,9 +2641,14 @@ def _probe_one_model(p, model_id, args, deep):
         return out
 
     out["streaming"] = probe_stream(
-        ip, tier, to, tls,
+        ip,
+        tier,
+        to,
+        tls,
         ttft_timeout=getattr(args, "ttft_timeout", None),
-        max_tokens=mt, disable_thinking=dt, user_agent=ua,
+        max_tokens=mt,
+        disable_thinking=dt,
+        user_agent=ua,
     )
     out["metadata"] = probe_model_metadata(
         ip, re.sub(r"\[.*?\]$", "", model_id), to, tls, user_agent=ua
@@ -2453,7 +2663,6 @@ def _probe_one_model(p, model_id, args, deep):
         ip, re.sub(r"\[.*?\]$", "", model_id), to, tls, user_agent=ua
     )
     return out
-
 
 
 # --- from check_ccswitch_health.py:2652-2947 ---
@@ -2756,7 +2965,6 @@ _INSPECT_DEFAULT_INCLUDE = (
 _COMPARE_DEFAULT_INCLUDE = "text,streaming"
 
 
-
 # --- from check_ccswitch_health.py:3355-3474 ---
 def _is_rate_limited(result) -> bool:
     """判断探测结果是否因 429/rate_limit 失败。"""
@@ -2861,9 +3069,15 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
         auth_body = text_raw.get("raw_body", "")
     elif streaming_result and streaming_result.get("raw_preview"):
         auth_body = streaming_result.get("raw_preview", "")
-    crosspack = _detect_crosspack_fields(auth_body, inspect_p.app_type)
-    enabled_body = thinking_result.pop("_enabled_raw_body", "") if isinstance(thinking_result, dict) else ""
-    sigs = _extract_thinking_signatures(enabled_body)
+    crosspack = _detect_crosspack_fields(
+        auth_body, inspect_p.app_type, inspect_p.protocol
+    )
+    enabled_body = (
+        thinking_result.pop("_enabled_raw_body", "")
+        if isinstance(thinking_result, dict)
+        else ""
+    )
+    sigs = _extract_thinking_signatures(enabled_body, inspect_p.protocol)
     thinking_signature = {
         "has_valid_signature": _has_valid_thinking_signature(sigs),
         "blocks": sigs,
@@ -2873,26 +3087,49 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
     _answer = (text_raw or {}).get("answer", "") if text_raw else ""
     usage_consistency = _check_usage_consistency(_usage, _answer, inspect_p.app_type)
     # P2-A: 缓存回放/钳温双发探测（可选 --include cache-replay；2 次新请求）
-    cache_replay = {"suspicious": False, "identical": None, "note": "未启用（--include cache-replay 开启）"}
+    cache_replay = {
+        "suspicious": False,
+        "identical": None,
+        "note": "未启用（--include cache-replay 开启）",
+    }
     if "cache-replay" in include:
         cache_replay = _probe_cache_replay(
-            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
-            max_tokens=16, user_agent=_ua,
+            inspect_p,
+            inspect_p.tiers[0],
+            args.timeout,
+            args.skip_tls_verify,
+            max_tokens=16,
+            user_agent=_ua,
         )
     # P2-B: 知识截止 before/after 题库（可选 --include knowledge-cutoff；6 次新请求）
-    knowledge_cutoff = {"suspicious": False, "note": "未启用（--include knowledge-cutoff 开启）"}
+    knowledge_cutoff = {
+        "suspicious": False,
+        "note": "未启用（--include knowledge-cutoff 开启）",
+    }
     if "knowledge-cutoff" in include:
         knowledge_cutoff = _probe_knowledge_cutoff(
-            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
-            max_tokens=32, user_agent=_ua,
+            inspect_p,
+            inspect_p.tiers[0],
+            args.timeout,
+            args.skip_tls_verify,
+            max_tokens=32,
+            user_agent=_ua,
         )
     # P2-C: 单 token 随机数分布指纹（可选 --include js-fingerprint；默认 50 次新请求）
     js_samples = getattr(args, "js_samples", 50) or 50
-    js_fingerprint = {"suspicious": False, "note": "未启用（--include js-fingerprint 开启）"}
+    js_fingerprint = {
+        "suspicious": False,
+        "note": "未启用（--include js-fingerprint 开启）",
+    }
     if "js-fingerprint" in include:
         js_fingerprint = _probe_js_fingerprint(
-            inspect_p, inspect_p.tiers[0], args.timeout, args.skip_tls_verify,
-            samples=js_samples, max_tokens=16, user_agent=_ua,
+            inspect_p,
+            inspect_p.tiers[0],
+            args.timeout,
+            args.skip_tls_verify,
+            samples=js_samples,
+            max_tokens=16,
+            user_agent=_ua,
         )
     auth_verdict, auth_evidence = _authenticity_verdict(
         {
@@ -2939,6 +3176,3 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             "recommended_actions": recommended,
         },
     }
-
-
-

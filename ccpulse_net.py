@@ -9,7 +9,6 @@ import re
 import ssl
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from enum import Enum
@@ -146,11 +145,57 @@ def _sanitize_raw_body(body: str, api_key: str) -> str:
     mask = api_key[:show] + "***"
     if api_key in body:
         body = body.replace(api_key, mask)
-    # 中转站错误体可能回显 URL 编码的 key
-    encoded = urllib.parse.quote(api_key, safe="")
-    if encoded != api_key and encoded in body:
-        body = body.replace(encoded, mask)
-    return body
+    # JSON 字符串可能逐字符使用 \uXXXX，且可与明文混合；只匹配 key 的精确表示，
+    # 不对普通文本整体解码，避免改写非 JSON 内容。
+    def _unicode_escape_pattern(code_point: int) -> str:
+        if code_point <= 0xFFFF:
+            code_units = (code_point,)
+        else:
+            code_point -= 0x10000
+            code_units = (
+                0xD800 + (code_point >> 10),
+                0xDC00 + (code_point & 0x3FF),
+            )
+        escaped_units = []
+        for unit in code_units:
+            hex_code = f"{unit:04x}"
+            hex_pattern = "".join(
+                f"[{digit.lower()}{digit.upper()}]"
+                if digit in "abcdef"
+                else digit
+                for digit in hex_code
+            )
+            escaped_units.append(chr(92) * 2 + "u" + hex_pattern)
+        return "".join(escaped_units)
+
+    def _json_char_pattern(char: str) -> str:
+        variants = [re.escape(char), _unicode_escape_pattern(ord(char))]
+        if char == "/":
+            variants.append(re.escape(r"\/"))
+        return "(?:" + "|".join(variants) + ")"
+
+    unicode_key_pattern = "".join(_json_char_pattern(char) for char in api_key)
+    body = re.sub(unicode_key_pattern, lambda _match: mask, body)
+
+    # 中转站错误体可能回显 URL 编码的 key。逐字节定向匹配，覆盖 %HH 大小写
+    # 变体、明文/编码混合和 %73%6b... 这类全字节编码，不解码普通响应全文。
+    def _percent_byte_pattern(byte: int) -> str:
+        hex_code = f"{byte:02x}"
+        hex_pattern = "".join(
+            f"[{digit.lower()}{digit.upper()}]"
+            if digit in "abcdef"
+            else digit
+            for digit in hex_code
+        )
+        encoded_byte = "%" + hex_pattern
+        if 0x21 <= byte <= 0x7E:
+            return "(?:" + re.escape(chr(byte)) + "|" + encoded_byte + ")"
+        return encoded_byte
+
+    url_key_pattern = "".join(
+        _percent_byte_pattern(byte) for byte in api_key.encode("utf-8")
+    )
+    return re.sub(url_key_pattern, lambda _match: mask, body)
 
 
 def _sanitize_display(text: str, api_key: str | None) -> str:
@@ -436,7 +481,7 @@ def parse_sse_lines(raw_iter, on_event, protocol: str):
                 )
                 on_event(StreamEvent(kind="first_chunk", raw=evt_dict or {}))
 
-            _process_sse_event(
+            terminal = _process_sse_event(
                 event_bytes,
                 protocol,
                 _inner_on_event,
@@ -444,7 +489,8 @@ def parse_sse_lines(raw_iter, on_event, protocol: str):
                 done_marker_value,
                 text_buf,
             )
-            if got_done:
+            if terminal:
+                got_done = True
                 # 不 return；继续消费直到 raw_iter 耗尽
                 continue
 
@@ -495,7 +541,13 @@ def _process_sse_event(
         if line.startswith(f"{done_marker_field}:"):
             val = line[len(done_marker_field) + 1 :].strip()
             if val == done_marker_value:
-                on_event(StreamEvent(kind="done", raw=evt))
+                terminal_raw = evt
+                if proto_name == "openai_responses" and evt.get("data"):
+                    try:
+                        terminal_raw = json.loads(evt["data"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                on_event(StreamEvent(kind="done", raw=terminal_raw))
                 return True
 
     data = evt.get("data")
@@ -547,7 +599,20 @@ def _process_sse_event(
         elif j.get("type") == "response.output_text.delta":
             chunk = j.get("delta", "")
             on_event(StreamEvent(kind="text_delta", text_delta=chunk, raw=j))
-        elif j.get("type") in ("response.completed", "response.failed"):
+        elif j.get("type") == "response.failed":
+            response = j.get("response") or {}
+            failure = response.get("error") if isinstance(response, dict) else None
+            failure = failure if failure is not None else j.get("error")
+            if isinstance(failure, dict):
+                failure = (
+                    failure.get("message")
+                    or failure.get("code")
+                    or failure.get("type")
+                )
+            failure = str(failure or "Responses response.failed")
+            on_event(StreamEvent(kind="error", failure=failure, raw=j))
+            return True
+        elif j.get("type") == "response.completed":
             on_event(StreamEvent(kind="message_stop", raw=j))
 
     # first_chunk 标记：on_event 由内部决定（已分类型处理）

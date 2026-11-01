@@ -343,7 +343,7 @@ python check_ccswitch_health.py deep-dive --from check.json --target fail
 python check_ccswitch_health.py check --failover-only --json | \
   python check_ccswitch_health.py deep-dive --from - --target both --yes
 # 只看会跑哪些组合（dry-run，不执行）
-python check_ccswitch_health.py deep-dive --from check.json --target both --json
+python check_ccswitch_health.py deep-dive --from check.json --target both --json  # >20 个组合也只输出任务 JSON
 ```
 
 | 参数 | 说明 | 默认 |
@@ -528,11 +528,11 @@ python check_ccswitch_health.py inspect \
 | `--with-metadata` | 兼容旧命令；metadata 默认已开启，不会额外发请求 | 关 |
 | `--probe-delay SEC` | 批量模型间延迟 | `3.0` |
 | `--max-retries N` | 429 重试次数 | `1` |
-| `--format human\|json` | 输出格式 | `json` |
-| `--human` | 人类可读输出（默认 JSON） | 关 |
+| `--format human\|json` | 输出格式（显式指定时优先于 `--human`） | `json` |
+| `--human` | 人类可读输出（未指定 `--format` 时生效） | 关 |
 | `--quiet` | 批量静默 NDJSON + 退出码 0/1/3 | 关 |
 
-**`--include` 检查项**：
+**`--include` 检查项**：未知维度会以参数错误（退出码 2）拒绝，不会静默跳过。
 
 | 项 | 默认 | 说明 |
 |----|------|------|

@@ -95,6 +95,26 @@ class CacheReplayVerdictTest(unittest.TestCase):
         finally:
             mod.probe_tier = orig
 
+    def test_answers_are_sanitized_before_report(self):
+        p = self._provider()
+        key = p.api_key
+        orig = self._patch_probe_tier(
+            [
+                {"status": 200, "answer": f"first {key}\x1b[31m", "raw_body": "{}"},
+                {"status": 200, "answer": f"second {key}\x1b[0m", "raw_body": "{}"},
+            ]
+        )
+        try:
+            r = mod._probe_cache_replay(
+                p, p.tiers[0], timeout=5, skip_tls=False, max_tokens=16, user_agent=None
+            )
+            self.assertNotIn(key, r["first_answer"])
+            self.assertNotIn(key, r["second_answer"])
+            self.assertNotRegex(r["first_answer"], r"[\x00-\x1f\x7f]")
+            self.assertNotRegex(r["second_answer"], r"[\x00-\x1f\x7f]")
+        finally:
+            mod.probe_tier = orig
+
     def test_different_answers_are_clean(self):
         p = self._provider()
         orig = self._patch_probe_tier(

@@ -88,6 +88,30 @@ class CrosspackOpenAITest(unittest.TestCase):
         r = mod._detect_crosspack_fields(body, "claude")
         self.assertFalse(r["suspicious"])
 
+    def test_claude_app_type_with_explicit_openai_chat_uses_openai_fields(self):
+        """显式 OpenAI Chat 协议的 claude app_type 不应因合法字段误报。"""
+        body = json.dumps({
+            "model": "gpt-5",
+            "choices": [{"message": {"content": "5"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "system_fingerprint": "fp_abc",
+        })
+        r = mod._detect_crosspack_fields(
+            body, "claude", mod.Protocol.OPENAI_CHAT_COMPLETIONS
+        )
+        self.assertFalse(r["suspicious"])
+
+    def test_explicit_openai_chat_reasoning_without_signature_is_not_anthropic_failure(self):
+        """OpenAI Chat 无 Anthropic signature 不应被当作伪造 Claude。"""
+        body = json.dumps({
+            "model": "gpt-5",
+            "choices": [{"message": {"content": "5", "reasoning_content": "thinking"}}],
+        })
+        sigs = mod._extract_thinking_signatures(
+            body, mod.Protocol.OPENAI_CHAT_COMPLETIONS
+        )
+        self.assertEqual(sigs, [])
+
     def test_non_json_is_clean_with_note(self):
         """非 JSON / 空串 → 不可疑，但 note 标注无法解析。"""
         r = mod._detect_crosspack_fields("", "claude")
