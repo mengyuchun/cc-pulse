@@ -268,7 +268,7 @@ test(
     "run_trend json 结构",
     report.get("schema_version") == 1
     and report.get("command") == "trend"
-    and report.get("archive") == arc,
+    and Path(report.get("archive", "")).resolve() == Path(arc).resolve(),
     f"report={report}",
 )
 test("run_trend json trend total", report["trend"]["total"] == 6)
