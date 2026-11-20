@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "fix/*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run Python test suites
+        run: |
+          python -c "
+          import subprocess, sys
+          suites = [
+              'tests/test_ccpulse_full.py',
+              'tests/test_p0_protocol_fix.py',
+              'tests/test_env_check.py',
+              'tests/test_archive_trend.py',
+              'tests/test_tui.py',
+              'tests/test_authenticity.py',
+              'tests/test_usage_consistency.py',
+              'tests/test_cache_replay.py',
+              'tests/test_p0_p1_fixes.py',
+              'tests/test_docs_consistency.py',
+          ]
+          for s in suites:
+              print(f'=== {s} ===', flush=True)
+              r = subprocess.run([sys.executable, s])
+              if r.returncode != 0:
+                  sys.exit(r.returncode)
+          "
+
+      - name: Run PS1 launcher tests (Windows)
+        if: runner.os == 'Windows'
+        run: python tests/test_ps1_launcher.py
+
+      - name: Lint and format check
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: |
+          pip install ruff
+          ruff check .
+          ruff format --check .
+
+      - name: Build and smoke-test wheel entrypoint
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: |
+          pip install build
+          python -m build --wheel
+          pip install dist/*.whl
+          cc-pulse --help
+          cc-pulse check --help
+          cc-pulse env-check --no-db --json

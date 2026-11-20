@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: cc-pulse-windows-x64
+            ext: .exe
+          - os: ubuntu-latest
+            asset: cc-pulse-linux-x64
+            ext: ""
+          - os: macos-latest
+            asset: cc-pulse-macos-arm64
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build single-file executable
+        shell: bash
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --clean --name "${{ matrix.asset }}" \
+            --hidden-import ccpulse_archive \
+            --hidden-import ccpulse_env \
+            --hidden-import ccpulse_net \
+            --hidden-import ccpulse_output \
+            --hidden-import ccpulse_probe \
+            --hidden-import ccpulse_store \
+            --hidden-import ccpulse_tui \
+            check_ccswitch_health.py
+
+      - name: Smoke-test binary
+        shell: bash
+        run: |
+          "./dist/${{ matrix.asset }}${{ matrix.ext }}" --help
+          "./dist/${{ matrix.asset }}${{ matrix.ext }}" env-check --no-db --json
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}${{ matrix.ext }}
+
+  build-python-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and single-file .pyz
+        run: |
+          pip install build
+          python -m build --wheel
+          mkdir -p build_pyz
+          cp check_ccswitch_health.py ccpulse_*.py build_pyz/
+          python -m zipapp build_pyz -o dist/cc-pulse.pyz -m "check_ccswitch_health:main" -p "/usr/bin/env python3"
+          python dist/cc-pulse.pyz --help
+          python dist/cc-pulse.pyz env-check --no-db --json
+
+      - name: Upload Python package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-packages
+          path: |
+            dist/*.whl
+            dist/cc-pulse.pyz
+
+  publish-release:
+    needs: [build-binaries, build-python-packages]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --title "CC-Pulse ${GITHUB_REF_NAME}" \
+            --generate-notes
