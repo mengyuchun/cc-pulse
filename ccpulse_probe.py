@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-import math
+import platform
 import random
 import re
 import subprocess
@@ -34,6 +34,7 @@ from ccpulse_net import (
     _sanitize_raw_body,
     classify_error,
     create_ssl_context,
+    open_url_no_redirect,
 )
 from ccpulse_output import _c, _sanitize_url_for_display
 
@@ -88,10 +89,32 @@ def _user_agent(override: str | None = None) -> str:
     return f"claude-cli/{_claude_cli_version()} (external, sdk-cli)"
 
 
+def _stainless_os_and_arch() -> tuple[str, str]:
+    """映射当前宿主机系统与 CPU 架构为 Stainless SDK 请求头规范值。"""
+    sys_name = platform.system()
+    os_val = {
+        "Windows": "Windows",
+        "Darwin": "MacOS",
+        "Linux": "Linux",
+    }.get(sys_name, sys_name or "Unknown")
+    mach = platform.machine().lower()
+    arch_val = {
+        "amd64": "x64",
+        "x86_64": "x64",
+        "arm64": "arm64",
+        "aarch64": "arm64",
+        "x86": "x32",
+        "i386": "x32",
+        "i686": "x32",
+    }.get(mach, mach or "x64")
+    return os_val, arch_val
+
+
 def _claude_code_headers(
     user_agent: str | None = None, stainless_version: str | None = None
 ) -> dict:
     """构造 Claude Code 指纹头（User-Agent 动态，stainless 版本可覆盖）。"""
+    os_val, arch_val = _stainless_os_and_arch()
     return {
         "User-Agent": _user_agent(user_agent),
         "x-app": "cli",
@@ -101,8 +124,8 @@ def _claude_code_headers(
         "x-stainless-package-version": stainless_version or _STAINLESS_PACKAGE_VERSION,
         "x-stainless-runtime": "node",
         "x-stainless-runtime-version": "v24.3.0",
-        "x-stainless-arch": "x64",
-        "x-stainless-os": "Windows",
+        "x-stainless-arch": arch_val,
+        "x-stainless-os": os_val,
     }
 
 
@@ -157,6 +180,44 @@ PROBE_PROMPTS = [
     {"q": "计算 12 减 7，只给数字。", "a": "5"},
     {"q": "What is 5 times 3? Only the number, please.", "a": "15"},
 ]
+
+
+def _pick_probe_prompt() -> dict[str, str]:
+    """动态参数化生成简单算术题，防止中转站用静态正则白名单硬匹配绕过测活。"""
+    op = random.choice(("+", "-", "*"))
+    if op == "+":
+        a, b = random.randint(2, 29), random.randint(2, 29)
+        ans = a + b
+        tpl = random.choice(
+            (
+                f"What is {a}+{b}? Reply with only the number, nothing else.",
+                f"Compute {a} plus {b}. Answer with the number only.",
+                f"计算 {a} 加 {b}，只回答数字。",
+            )
+        )
+    elif op == "-":
+        b = random.randint(2, 19)
+        a = b + random.randint(2, 25)
+        ans = a - b
+        tpl = random.choice(
+            (
+                f"What is {a} minus {b}? Reply with only the number.",
+                f"Calculate {a}-{b}. Just the number.",
+                f"计算 {a} 减 {b}，只给数字。",
+            )
+        )
+    else:
+        a, b = random.randint(2, 12), random.randint(2, 12)
+        ans = a * b
+        tpl = random.choice(
+            (
+                f"What is {a} times {b}? Only the number, please.",
+                f"Multiply {a} by {b}. Number only.",
+                f"计算 {a} 乘以 {b}，只回数字。",
+            )
+        )
+    return {"q": tpl, "a": str(ans)}
+
 
 # max_tokens：设为自然值（1024）而非刺眼的 20。这是上限非实际消耗，
 # 回答一个数字仍只按实际输出计费；避免「20」这一测活脚本典型信号。
@@ -845,6 +906,31 @@ def _check_usage_consistency(usage: dict, answer: str, app_type: str) -> dict:
     return {"suspicious": bool(findings), "findings": findings}
 
 
+_CACHE_REPLAY_NOUNS = (
+    "lantern",
+    "glacier",
+    "compass",
+    "velvet",
+    "harbor",
+    "orchid",
+    "quartz",
+    "ember",
+    "falcon",
+    "meadow",
+    "cypress",
+    "mosaic",
+)
+
+
+def _build_cache_replay_prompt() -> str:
+    """构造高熵开放式短 Prompt（单次检测内双发同题，防止确定性算术题误报）。"""
+    w1, w2 = random.sample(_CACHE_REPLAY_NOUNS, 2)
+    return (
+        f"Invent a brand-new 8-word creative sentence combining '{w1}', '{w2}', "
+        "and a random 4-digit number. Reply with only that sentence."
+    )
+
+
 def _probe_cache_replay(
     p: Provider,
     tier: ModelTier,
@@ -854,34 +940,34 @@ def _probe_cache_replay(
     max_tokens: int,
     user_agent: str | None,
 ) -> dict:
-    """缓存回放/钳温双发探测：temp=1 发两次同一 prompt，逐字相同 -> 疑似缓存或钳温。
+    """缓存回放/钳温双发探测：temp=1 发两次同一高熵开放 prompt，逐字相同 -> 疑似缓存或钳温。
 
-    正常 temp=1 下同一 prompt 两次请求应有随机性差异；逐字完全相同是强可疑信号。
-    用固定 question（不随机），max_tokens 限低（16）省 token。
+    正常 temp=1 下开放式高熵 prompt 两次请求应产生随机性差异；逐字完全相同是强可疑信号。
+    max_tokens 限低（16-32）省 token。
     返回 {suspicious, identical, note, first_answer, second_answer}。
     """
-    fixed_q = PROBE_PROMPTS[0]["q"] if PROBE_PROMPTS else "1+4="
+    open_q = _build_cache_replay_prompt()
     r1 = probe_tier(
         p,
         tier,
         timeout,
         skip_tls,
-        max_tokens=max_tokens,
+        max_tokens=max(max_tokens, 32),
         disable_thinking=True,
         user_agent=user_agent,
         temperature=1.0,
-        question=fixed_q,
+        question=open_q,
     )
     r2 = probe_tier(
         p,
         tier,
         timeout,
         skip_tls,
-        max_tokens=max_tokens,
+        max_tokens=max(max_tokens, 32),
         disable_thinking=True,
         user_agent=user_agent,
         temperature=1.0,
-        question=fixed_q,
+        question=open_q,
     )
     a1 = _sanitize_display(str(r1.get("answer", "") or ""), p.api_key)
     a2 = _sanitize_display(str(r2.get("answer", "") or ""), p.api_key)
@@ -905,249 +991,80 @@ def _probe_cache_replay(
     }
 
 
-# ── P2-B 知识截止 before/after 题库 ──────────────────────────────────
-
-# 内置题库：era="before" 所有模型都该答对（2023 年前事实）；
-# era="after" 只有较新模型（截止 ≥2024-09）才该会。
-# 答案键内置代码不进 prompt，防 Agent 抄答案。
-KNOWLEDGE_CUTOFF_QUESTIONS = [
-    {
-        "q": "2020 年奥运会在哪个城市举办？只答城市名。",
-        "expected": "东京",
-        "era": "before",
-    },
-    {
-        "q": "ChatGPT 首次公开发布是哪一年？只答年份。",
-        "expected": "2022",
-        "era": "before",
-    },
-    {
-        "q": "AlphaGo 击败李世石是哪一年？只答年份。",
-        "expected": "2016",
-        "era": "before",
-    },
-    {
-        "q": "Claude 3.5 Sonnet 公开发布于哪一年？只答年份。",
-        "expected": "2024",
-        "era": "after",
-    },
-    {
-        "q": "OpenAI 发布的 o1 模型是哪一年？只答年份。",
-        "expected": "2024",
-        "era": "after",
-    },
-    {
-        "q": "DeepSeek-V3 公开发布于哪一年？只答年份。",
-        "expected": "2024",
-        "era": "after",
-    },
-]
-
-
-def _kc_check_answer(answer: str, expected: str) -> bool:
-    """宽松判分：答案含目标关键词即对（年份/城市名等）。"""
-    a = str(answer or "").strip()
-    e = str(expected or "").strip()
-    if not a or not e:
-        return False
-    return e.lower() in a.lower()
-
-
-def _probe_knowledge_cutoff(
-    p: Provider,
-    tier: ModelTier,
-    timeout: int,
-    skip_tls: bool,
-    *,
-    max_tokens: int,
-    user_agent: str | None,
+def _detect_cloud_backend(
+    headers: dict[str, str] | None,
+    body_text: str,
+    protocol: Protocol | None = None,
 ) -> dict:
-    """知识截止 before/after 题库探测：区分模型版本/世代。
+    """零额外请求云后端来源归因：复用已有响应头与响应体特征信号。
 
-    before 题（2023 年前事实）所有模型该答对，答错 -> suspicious（异常）。
-    after 题（2024-2025 事件）只有较新模型该会，全错 -> note 标旧模型（不报 suspicious）。
-    每题 1 次请求，本地关键词判分。
+    仅作为参考信号（中转可剥离/伪造响应头），不单独触发 suspicious。
     """
-    details = []
-    before_ok = before_total = 0
-    after_ok = after_total = 0
-    for item in KNOWLEDGE_CUTOFF_QUESTIONS:
-        r = probe_tier(
-            p,
-            tier,
-            timeout,
-            skip_tls,
-            max_tokens=max_tokens,
-            disable_thinking=True,
-            user_agent=user_agent,
-            question=item["q"],
-        )
-        if r.get("status") != 200:
-            details.append(
-                {
-                    "q": item["q"],
-                    "era": item["era"],
-                    "correct": None,
-                    "answer": _sanitize_display(
-                        str(r.get("answer", "") or ""), p.api_key
-                    ),
-                }
-            )
-            continue
-        ans = str(r.get("answer", "") or "")
-        ok = _kc_check_answer(ans, item["expected"])
-        details.append(
-            {
-                "q": item["q"],
-                "era": item["era"],
-                "correct": ok,
-                "answer": _sanitize_display(ans, p.api_key)[:80],
-            }
-        )
-        if item["era"] == "before":
-            before_total += 1
-            if ok:
-                before_ok += 1
-        else:
-            after_total += 1
-            if ok:
-                after_ok += 1
+    hdrs = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    body = str(body_text or "")
+    signals: list[str] = []
 
-    # before 错 = 异常（连老事实都不对）
-    suspicious = before_total > 0 and before_ok < before_total
-    if before_total == 0 and after_total == 0:
-        note = "探测失败无法判定"
-    elif suspicious:
-        note = f"before 题答错 {before_total - before_ok}/{before_total}，连老事实都不对，异常"
-    elif after_total > 0 and after_ok == after_total:
-        note = f"答对 {after_ok}/{after_total} 较新事件，疑似较新模型"
-    elif after_total > 0 and after_ok == 0:
-        note = f"较新事件全错（{after_ok}/{after_total}），疑似旧模型或降级"
-    else:
-        note = f"before {before_ok}/{before_total}，after {after_ok}/{after_total}"
-
-    return {
-        "suspicious": suspicious,
-        "before_correct": before_ok,
-        "before_total": before_total,
-        "after_correct": after_ok,
-        "after_total": after_total,
-        "note": note,
-        "details": details,
-    }
-
-
-# ── P2-C 单 token 随机数分布指纹（JSD）─────────────────────────────────
-
-# LLM 通用偏置参考分布（程序化构造，零外部数据）：
-# 起点 1/100 均匀，偏好数加权 ×3，整数抑制 ×0.3，再归一化。
-_JS_BIAS_NUMS = {7, 17, 23, 42, 73, 37, 47, 67, 77, 83}
-_JS_ROUND_NUMS = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100}
-
-
-def _build_llm_bias_reference() -> list[float]:
-    """构造 LLM 通用偏置参考分布（100 桶，索引 0→数 1）。"""
-    raw = [1.0 / 100] * 100
-    for n in _JS_BIAS_NUMS:
-        raw[n - 1] *= 3.0
-    for n in _JS_ROUND_NUMS:
-        raw[n - 1] *= 0.3
-    s = sum(raw)
-    return [v / s for v in raw]
-
-
-LLM_BIAS_REFERENCE = _build_llm_bias_reference()
-_JS_UNIF = [1.0 / 100] * 100
-_JS_MIN_SAMPLES = 20
-
-
-def _jsd(p_dist: list[float], q_dist: list[float]) -> float:
-    """Jensen-Shannon 散度（base 2，∈[0,1]）。两分布等长、已归一化。"""
-    m = [0.5 * (pi + qi) for pi, qi in zip(p_dist, q_dist)]
-
-    def _kl(a: list[float], b: list[float]) -> float:
-        s = 0.0
-        for ai, bi in zip(a, b):
-            if ai <= 0.0:
-                continue
-            s += ai * math.log2(ai / bi)
-        return s
-
-    return 0.5 * _kl(p_dist, m) + 0.5 * _kl(q_dist, m)
-
-
-def _js_parse_number(text: str) -> int | None:
-    """从回答里取首个 1-100 整数；范围外/无数字返回 None。"""
-    for m in re.finditer(r"\d+", str(text or "")):
-        n = int(m.group())
-        if 1 <= n <= 100:
-            return n
-    return None
-
-
-def _probe_js_fingerprint(
-    p: Provider,
-    tier: ModelTier,
-    timeout: int,
-    skip_tls: bool,
-    *,
-    samples: int,
-    max_tokens: int,
-    user_agent: str | None,
-) -> dict:
-    """单 token 随机数分布指纹：问 N 次"给个 1-100 随机数"，统计 JSD。
-
-    真 LLM 永远不均匀（有偏置）；脚本 random.randint 近似均匀。
-    jsd_unif < jsd_ref → 观测更接近均匀 → suspicious（疑似非 LLM 后端）。
-    """
-    q = "Pick a random number between 1 and 100. Reply with only the number."
-    counts = [0] * 100
-    ok = 0
-    failures = 0
-    for _ in range(samples):
-        r = probe_tier(
-            p,
-            tier,
-            timeout,
-            skip_tls,
-            max_tokens=max_tokens,
-            disable_thinking=True,
-            user_agent=user_agent,
-            question=q,
-        )
-        if r.get("status") != 200:
-            failures += 1
-            continue
-        n = _js_parse_number(r.get("answer", ""))
-        if n is None:
-            continue
-        counts[n - 1] += 1
-        ok += 1
-
-    if ok < _JS_MIN_SAMPLES:
+    bedrock_hits = [
+        k
+        for k in hdrs
+        if k.startswith("x-amzn-bedrock") or k in ("x-amzn-requestid", "x-amz-apigw-id")
+    ]
+    if "toolu_bdrk_" in body:
+        bedrock_hits.append("toolu_bdrk_")
+    if bedrock_hits:
         return {
-            "suspicious": False,
-            "samples": ok,
-            "jsd_ref": None,
-            "jsd_unif": None,
-            "note": f"有效样本 {ok} 不足（需 ≥{_JS_MIN_SAMPLES}），无法判定",
+            "origin": "aws_bedrock",
+            "label": "AWS Bedrock",
+            "confidence": "high",
+            "signals": bedrock_hits[:5],
         }
 
-    total = float(sum(counts))
-    obs = [c / total for c in counts]
-    jsd_ref = _jsd(obs, LLM_BIAS_REFERENCE)
-    jsd_unif = _jsd(obs, _JS_UNIF)
-    suspicious = jsd_unif < jsd_ref
-    if suspicious:
-        note = f"分布更接近均匀（jsd_unif={jsd_unif:.3f} < jsd_ref={jsd_ref:.3f}），疑似非 LLM 后端"
-    else:
-        note = f"符合 LLM 偏置特征（jsd_ref={jsd_ref:.3f} ≤ jsd_unif={jsd_unif:.3f}），样本 {ok}"
+    vertex_hits = [k for k in hdrs if k.startswith("x-goog-")]
+    if "toolu_vrtx_" in body:
+        vertex_hits.append("toolu_vrtx_")
+    if vertex_hits:
+        return {
+            "origin": "google_vertex",
+            "label": "Google Vertex AI",
+            "confidence": "high",
+            "signals": vertex_hits[:5],
+        }
+
+    anthropic_hits = [
+        k for k in hdrs if k == "inference-geo" or k.startswith("anthropic-ratelimit-")
+    ]
+    if '"inference_geo"' in body:
+        anthropic_hits.append("inference_geo")
+    if "toolu_01" in body:
+        anthropic_hits.append("toolu_01")
+    if anthropic_hits:
+        return {
+            "origin": "anthropic_official",
+            "label": "Anthropic Official",
+            "confidence": "high"
+            if ("inference-geo" in hdrs or '"inference_geo"' in body)
+            else "medium",
+            "signals": anthropic_hits[:5],
+        }
+
+    if protocol in (Protocol.OPENAI_CHAT_COMPLETIONS, Protocol.OPENAI_RESPONSES):
+        openai_hits = [
+            k for k in hdrs if k in ("openai-processing-ms", "openai-organization")
+        ]
+        if openai_hits:
+            signals.extend(openai_hits)
+            return {
+                "origin": "openai_official",
+                "label": "OpenAI Official",
+                "confidence": "medium",
+                "signals": signals[:5],
+            }
+
     return {
-        "suspicious": suspicious,
-        "samples": ok,
-        "jsd_ref": round(jsd_ref, 4),
-        "jsd_unif": round(jsd_unif, 4),
-        "note": note,
+        "origin": "unknown",
+        "label": "Unknown",
+        "confidence": "none",
+        "signals": [],
     }
 
 
@@ -1161,13 +1078,9 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
     tsig = auth.get("thinking_signature") or {}
     usage_c = auth.get("usage_consistency") or {}
     cache_r = auth.get("cache_replay") or {}
-    kc = auth.get("knowledge_cutoff") or {}
-    js = auth.get("js_fingerprint") or {}
     cp_susp = bool(crosspack.get("suspicious"))
     uc_susp = bool(usage_c.get("suspicious"))
     cr_susp = bool(cache_r.get("suspicious"))
-    kc_susp = bool(kc.get("suspicious"))
-    js_susp = bool(js.get("suspicious"))
     has_sig = tsig.get("has_valid_signature")  # True/False/None
 
     evidence: list[str] = []
@@ -1179,12 +1092,8 @@ def _authenticity_verdict(auth: dict) -> tuple[str, list[str]]:
         evidence.append(f"计费疑似：{f.get('check')} - {f.get('reason')}")
     if cr_susp:
         evidence.append(f"缓存/钳温疑似：{cache_r.get('note', '')}")
-    if kc_susp:
-        evidence.append(f"知识截止疑似：{kc.get('note', '')}")
-    if js_susp:
-        evidence.append(f"分布指纹疑似：{js.get('note', '')}")
 
-    if cp_susp or has_sig is False or uc_susp or cr_susp or kc_susp or js_susp:
+    if cp_susp or has_sig is False or uc_susp or cr_susp:
         return "suspicious", evidence
     if has_sig is None and not crosspack:
         return "inconclusive", evidence
@@ -1272,8 +1181,19 @@ def _drain_sse_stream(
     original_socket_timeout = (
         stream_socket.gettimeout() if stream_socket is not None else None
     )
+
+    def _safe_set_socket_timeout(val: float | None) -> None:
+        if stream_socket is None:
+            return
+        try:
+            if hasattr(stream_socket, "fileno") and stream_socket.fileno() == -1:
+                return
+            stream_socket.settimeout(val)
+        except OSError:
+            pass
+
     if stream_socket is not None and ttft_deadline is not None:
-        stream_socket.settimeout(ttft_deadline)
+        _safe_set_socket_timeout(ttft_deadline)
 
     done_marker_field, done_marker_value = STREAM_DONE_MARKERS.get(
         proto_name, ("event", "message_stop")
@@ -1291,7 +1211,7 @@ def _drain_sse_stream(
             first_event_at = time.time()
             # TTFT 已达标：恢复原始 socket 超时，避免首事件后残余短超时误杀慢流
             if stream_socket is not None and ttft_deadline is not None:
-                stream_socket.settimeout(original_socket_timeout)
+                _safe_set_socket_timeout(original_socket_timeout)
         if ev.get("kind") == "first_chunk":
             event_count += 1
             return
@@ -1353,6 +1273,7 @@ def _drain_sse_stream(
         return None, buf
 
     sse_buffer = b""
+    eof_reached = False
     try:
         stream_iter = iter(resp)
         while not sse_done:
@@ -1364,12 +1285,11 @@ def _drain_sse_stream(
                 remaining = ttft_deadline - (time.time() - start)
                 if remaining <= 0:
                     raise TimeoutError("ttft_timeout")
-                stream_socket.settimeout(remaining)
+                _safe_set_socket_timeout(remaining)
             try:
                 line = next(stream_iter)
             except StopIteration:
-                if not sse_done:
-                    stream_truncated = True  # 连接提前关闭，未收到完成标记
+                eof_reached = True
                 break
             if (
                 first_event_at is None
@@ -1405,10 +1325,9 @@ def _drain_sse_stream(
             raise TimeoutError("ttft_timeout") from e
         raise
     finally:
-        if stream_socket is not None:
-            stream_socket.settimeout(original_socket_timeout)
+        _safe_set_socket_timeout(original_socket_timeout)
 
-    # 末尾残留
+    # 末尾残留（先排空最后未以双换行结束的缓冲，再判定是否真正截断）
     if not sse_done and sse_buffer.strip():
         while True:
             event_bytes, sse_buffer = _take_event(sse_buffer)
@@ -1420,6 +1339,8 @@ def _drain_sse_stream(
                 break
         if not sse_done and sse_buffer.strip():
             _process(sse_buffer)
+    if eof_reached and not sse_done:
+        stream_truncated = True
 
     missing_fields = [
         field
@@ -1502,13 +1423,19 @@ def probe_stream(
     text = ""
     raw_preview = b""
     usage = extract_usage("")
+    resp_headers: dict[str, str] = {}
     error_msg = ""
     error_category = ErrorCategory.NONE.value
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with open_url_no_redirect(req, timeout=timeout, context=ctx) as resp:
             http_status = resp.status
             content_type = resp.headers.get("Content-Type", "")
+            resp_headers = (
+                {str(k).lower(): str(v) for k, v in resp.headers.items()}
+                if resp.headers
+                else {}
+            )
             is_sse = "text/event-stream" in content_type.lower()
 
             if not is_sse:
@@ -1661,6 +1588,7 @@ def probe_stream(
             else ""
         ),
         "usage": usage,
+        "_resp_headers": resp_headers,
     }
 
 
@@ -1707,7 +1635,7 @@ def probe_tier(
     question 非 None 时覆盖随机抽取（双发探测需固定同一问题）。
     """
     if question is None:
-        prompt = random.choice(PROBE_PROMPTS)
+        prompt = _pick_probe_prompt()
         question, expected = prompt["q"], prompt["a"]
     else:
         expected = ""
@@ -1814,6 +1742,7 @@ def probe_tier(
         "usage": extract_usage(resp.body),
         "raw_body": _sanitize_raw_body(resp.body[:8000], p.api_key),
         "has_thinking_signal": _response_has_thinking_signal(resp.body),
+        "_resp_headers": getattr(resp, "headers", {}) or {},
     }
 
 
@@ -1850,14 +1779,15 @@ def probe(
             stealth=stealth,
             max_retries=max_retries,
         )
-        attempts.append(r)
+        r_clean = {k: v for k, v in r.items() if k != "_resp_headers"}
+        attempts.append(r_clean)
         if on_attempt is not None:
             try:
-                on_attempt(p, r)
+                on_attempt(p, r_clean)
             except Exception as e:
                 sys.stderr.write(f"警告: on_attempt 回调失败: {e}\n")
-        if r["status"] == 200 and r.get("correct"):
-            best_tier = r
+        if r_clean["status"] == 200 and r_clean.get("correct"):
+            best_tier = r_clean
             break  # 找到能正确回答的档位，停止回退
     overall_ok = best_tier is not None
     return {
@@ -2016,6 +1946,18 @@ def probe_model_metadata(
             "source": "provider_metadata",
             "error_category": ErrorCategory.INVALID_RESPONSE.value,
             "error": "响应非 JSON",
+            "elapsed_seconds": elapsed,
+        }
+    if not isinstance(j, dict):
+        return {
+            "status": "unavailable",
+            "http_status": resp.status,
+            "declared_context_window": None,
+            "max_output_tokens": None,
+            "capabilities": {},
+            "source": "provider_metadata",
+            "error_category": ErrorCategory.INVALID_RESPONSE.value,
+            "error": "元数据响应 JSON 非对象",
             "elapsed_seconds": elapsed,
         }
 
@@ -2581,13 +2523,19 @@ def extract_model_ids(resp_body: str) -> list:
         return []
     ids = []
     # OpenAI/Anthropic 通用：{"data": [{"id": "..."}]}
-    for m in j.get("data", []):
-        if isinstance(m, dict) and m.get("id"):
-            ids.append(m["id"])
-    # 少数站直接返回 {"models": [...]} 或 [...]
-    if not ids:
-        raw = j.get("models", j if isinstance(j, list) else [])
-        for m in raw:
+    if isinstance(j, dict):
+        for m in j.get("data", []):
+            if isinstance(m, dict) and m.get("id"):
+                ids.append(m["id"])
+        # 少数站直接返回 {"models": [...]}
+        if not ids:
+            for m in j.get("models", []):
+                if isinstance(m, dict) and (m.get("id") or m.get("name")):
+                    ids.append(m.get("id") or m.get("name"))
+                elif isinstance(m, str):
+                    ids.append(m)
+    elif isinstance(j, list):
+        for m in j:
             if isinstance(m, dict) and (m.get("id") or m.get("name")):
                 ids.append(m.get("id") or m.get("name"))
             elif isinstance(m, str):
@@ -2978,8 +2926,18 @@ def _is_rate_limited(result) -> bool:
     return "rate" in err and ("limit" in err or "frequent" in err or "too many" in err)
 
 
-def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
-    """对单个模型跑 7 维探测，返回 report dict（不含重试；重试由 _run_inspect_all 负责）。"""
+def _inspect_one_model(
+    inspect_p,
+    model_id,
+    args,
+    include,
+    _mt,
+    _dt,
+    _ua,
+    *,
+    orig_provider=None,
+):
+    """对单个模型跑 8 维探测，返回 report dict（不含重试；重试由 _run_inspect_all 负责）。"""
     protocol = detect_protocol(inspect_p)
     text_result, text_raw = (None, None)
     if "text" in include:
@@ -3014,9 +2972,7 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             user_agent=_ua,
         )
     context_result = {"status": "skipped"}
-    if "context" in include or (
-        getattr(args, "include", None) is None and "metadata" in include
-    ):
+    if "context" in include:
         has_declared = (
             metadata_result.get("declared_context_window") is not None
             and metadata_result.get("status") == "available"
@@ -3063,12 +3019,27 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
         text_result, model_consistency, thinking_result, tools_result
     )
 
-    # 保真鉴别 P0：换芯字段检测（复用 text/streaming 响应体）+ thinking 签名提取（复用 thinking enable 响应体）
+    # 收集响应头与响应体做零请求云后端归因与保真检测
+    merged_headers: dict[str, str] = {}
+    if isinstance(text_raw, dict):
+        merged_headers.update(text_raw.pop("_resp_headers", {}) or {})
+    if isinstance(streaming_result, dict):
+        merged_headers.update(streaming_result.pop("_resp_headers", {}) or {})
+
     auth_body = ""
     if text_raw and text_raw.get("status") == 200:
         auth_body = text_raw.get("raw_body", "")
     elif streaming_result and streaming_result.get("raw_preview"):
         auth_body = streaming_result.get("raw_preview", "")
+    tools_ev = (
+        (tools_result or {}).get("evidence", "")
+        if isinstance(tools_result, dict)
+        else ""
+    )
+    backend_origin = _detect_cloud_backend(
+        merged_headers, f"{auth_body}\n{tools_ev}", _resolve_protocol(inspect_p)
+    )
+
     crosspack = _detect_crosspack_fields(
         auth_body, inspect_p.app_type, inspect_p.protocol
     )
@@ -3101,55 +3072,41 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
             max_tokens=16,
             user_agent=_ua,
         )
-    # P2-B: 知识截止 before/after 题库（可选 --include knowledge-cutoff；6 次新请求）
-    knowledge_cutoff = {
-        "suspicious": False,
-        "note": "未启用（--include knowledge-cutoff 开启）",
-    }
-    if "knowledge-cutoff" in include:
-        knowledge_cutoff = _probe_knowledge_cutoff(
-            inspect_p,
-            inspect_p.tiers[0],
-            args.timeout,
-            args.skip_tls_verify,
-            max_tokens=32,
-            user_agent=_ua,
-        )
-    # P2-C: 单 token 随机数分布指纹（可选 --include js-fingerprint；默认 50 次新请求）
-    js_samples = getattr(args, "js_samples", 50) or 50
-    js_fingerprint = {
-        "suspicious": False,
-        "note": "未启用（--include js-fingerprint 开启）",
-    }
-    if "js-fingerprint" in include:
-        js_fingerprint = _probe_js_fingerprint(
-            inspect_p,
-            inspect_p.tiers[0],
-            args.timeout,
-            args.skip_tls_verify,
-            samples=js_samples,
-            max_tokens=16,
-            user_agent=_ua,
-        )
     auth_verdict, auth_evidence = _authenticity_verdict(
         {
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
-            "knowledge_cutoff": knowledge_cutoff,
-            "js_fingerprint": js_fingerprint,
         }
     )
     if auth_verdict == "suspicious":
         recommended.append("保真告警：" + "；".join(auth_evidence))
 
+    usage = {
+        "present": False,
+        "input_tokens": None,
+        "output_tokens": None,
+        "source": None,
+        "missing_fields": ["input_tokens", "output_tokens"],
+    }
+    if text_raw and text_raw.get("usage"):
+        usage = text_raw["usage"]
+    src_p = orig_provider if orig_provider is not None else inspect_p
+
     return {
         "schema_version": 1,
         "command": "inspect",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "provider": inspect_p.name,
         "model": model_id,
+        "model_source": getattr(args, "source", "configured"),
+        "base_url": _sanitize_url_for_display(inspect_p.base_url, inspect_p.api_key),
+        "auth_mode": inspect_p.auth_mode,
+        "custom_user_agent": src_p.custom_user_agent,
+        "notes": src_p.notes,
         "protocol": protocol,
+        "backend_origin": backend_origin,
         "text": text_result,
         "streaming": streaming_result
         if streaming_result is not None
@@ -3160,13 +3117,12 @@ def _inspect_one_model(inspect_p, model_id, args, include, _mt, _dt, _ua):
         "tools": tools_result,
         "vision": vision_result,
         "model_consistency": model_consistency,
+        "usage": usage,
         "authenticity": {
             "crosspack": crosspack,
             "thinking_signature": thinking_signature,
             "usage_consistency": usage_consistency,
             "cache_replay": cache_replay,
-            "knowledge_cutoff": knowledge_cutoff,
-            "js_fingerprint": js_fingerprint,
             "verdict": auth_verdict,
             "evidence": auth_evidence,
         },

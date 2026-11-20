@@ -22,26 +22,28 @@ FORBIDDEN = [
 ]
 
 DOCS = ["README.md", "README.en.md"]
-REQUIRED_MARKERS = {
+MAIN_MARKERS = {
+    "env-check": "--no-db",
+    "--base-url": "--api-key-env",
+    "--format card": "SKILL.md",
+    "cli-reference.md": "uvx",
+}
+REF_DOC = "docs/cli-reference.md"
+REF_MARKERS = {
     "--quiet": "NDJSON",
     "--compare": "--provider",
     "--probe-context": "512k",
     "--probe-max-tokens": "--probe-enable-thinking",
     "--user-agent": "--stainless-version",
-    "--since": "analyze",
+    "--since": "trend",
     "--select": "--provider",
     "probe_history.jsonl": "cc-switch",
-    "deep-dive": "--target",
     "--alert-threshold": "cron",
     "trim_archive": "5MB",
     "trend_direction": "↑",
-    # b49b83c：--auth-full 快捷开关必须在中英文 README 留档
     "--auth-full": "cache-replay",
-}
-
-MENU_MARKERS = {
-    "README.md": ("快速体检", "高级设置", "运行日志", "五项深探"),
-    "README.en.md": ("Quick health check", "Advanced settings", "Runtime logs", "five-check"),
+    "--no-db": "--base-url",
+    "scripts/ccswitch_logs.py": "run_health_check.ps1",
 }
 
 
@@ -91,12 +93,19 @@ def _actual_counts() -> dict[str, int]:
             continue
         proc = subprocess.run(
             [sys.executable, os.path.join("tests", fname)],
-            capture_output=True, text=True, cwd=ROOT, check=False,
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            check=False,
         )
         out = proc.stdout + proc.stderr
         n = 0
-        for pat in (r"PASS: (\d+)", r"PS1 PASS: (\d+)",
-                    r"Ran (\d+) tests", r"总计: (\d+) PASS"):
+        for pat in (
+            r"PASS: (\d+)",
+            r"PS1 PASS: (\d+)",
+            r"Ran (\d+) tests",
+            r"总计: (\d+) PASS",
+        ):
             hit = re.findall(pat, out)
             if hit:
                 n = int(hit[-1])
@@ -124,45 +133,75 @@ def _check_actual(name: str, text: str) -> list[str]:
     return failures
 
 
+def _check_exit_codes(name: str, text: str) -> list[str]:
+    heading = re.search(r"^## .*?(?:退出码|Exit codes)", text, re.M)
+    if heading:
+        exit_section = text[heading.start() :]
+    elif "退出码" in text:
+        exit_section = text[text.find("退出码") :]
+    elif "Exit codes" in text:
+        exit_section = text[text.find("Exit codes") :]
+    else:
+        return [f"{name}: 缺少退出码表标题"]
+    # 仅截取退出码章节（到下一条分隔线或二级标题为止），避免误匹配后续测试计数表中的数字 4
+    end_match = re.search(r"\n(?:---|\#\# )", exit_section[1:])
+    if end_match:
+        exit_section = exit_section[: end_match.start() + 1]
+    failures = []
+    for code in ("0", "1", "2", "3"):
+        if not re.search(rf"\|\s*{code}\s*\|", exit_section):
+            failures.append(f"{name}: 退出码表缺少 {code}")
+    if re.search(r"\|\s*4\s*\|", exit_section):
+        failures.append(f"{name}: 退出码表不应包含不存在的退出码 4")
+    return failures
+
+
 def check_doc(name: str) -> list[str]:
     path = os.path.join(ROOT, name)
     if not os.path.exists(path):
-        return []
+        return [f"{name}: 文件不存在"]
     with open(path, encoding="utf-8") as f:
         text = f.read()
     failures = []
     for pat, msg in FORBIDDEN:
         if pat.search(text):
             failures.append(f"{name}: {msg}")
-    for marker, companion in REQUIRED_MARKERS.items():
+    for marker, companion in MAIN_MARKERS.items():
         if marker not in text or companion not in text:
             failures.append(f"{name}: 缺少 {marker} 或配套文案 {companion}")
-    for marker in MENU_MARKERS[name]:
-        if marker not in text:
-            failures.append(f"{name}: 缺少菜单文案 {marker}")
     failures.extend(_check_counts(name, text))
     if "--counts" in sys.argv or os.environ.get("CC_PULSE_VERIFY_COUNTS"):
         failures.extend(_check_actual(name, text))
-    if "退出码" in text:
-        exit_section = text[text.find("退出码") :]
-    elif "Exit codes" in text:
-        exit_section = text[text.find("Exit codes") :]
-    else:
-        return [*failures, f"{name}: 缺少退出码表标题"]
-    for code in ("0", "1", "2", "3", "4"):
-        if not re.search(rf"\|\s*{code}\s*\|", exit_section):
-            failures.append(f"{name}: 退出码表缺少 {code}")
+    failures.extend(_check_exit_codes(name, text))
+    return failures
+
+
+def check_ref_doc(name: str) -> list[str]:
+    path = os.path.join(ROOT, name)
+    if not os.path.exists(path):
+        return [f"{name}: 文件不存在"]
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    failures = []
+    for pat, msg in FORBIDDEN:
+        if pat.search(text):
+            failures.append(f"{name}: {msg}")
+    for marker, companion in REF_MARKERS.items():
+        if marker not in text or companion not in text:
+            failures.append(f"{name}: 缺少 {marker} 或配套文案 {companion}")
+    failures.extend(_check_exit_codes(name, text))
     return failures
 
 
 def main() -> int:
     failures = [failure for name in DOCS for failure in check_doc(name)]
+    failures.extend(check_ref_doc(REF_DOC))
     if failures:
         for failure in failures:
             print(failure)
         print(f"\n✗ 文档漂移：{len(failures)} 处需修正")
         return 1
-    print("✓ 文档与代码一致 (7 维度、关键参数、退出码)")
+    print("✓ 文档与代码一致 (核心参数、测试计数、退出码 0/1/2/3)")
     return 0
 
 

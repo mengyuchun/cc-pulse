@@ -22,19 +22,19 @@ CC-Pulse — cc-switch 供应商健康检测脚本（独立运行，不改 cc-sw
 
 import argparse
 import json
+import os
 import re
-import sqlite3
-import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import ccpulse_net as _ccpulse_net
+import ccpulse_output as _ccpulse_output
 import ccpulse_probe
 
 # 拆分后子模块的私有名经 module __getattr__ 透传，保证 importlib.util
-# 加载本文件时外部仍可按原名访问 net/probe 层符号。
+# 加载本文件时外部仍可按原名访问 net/output/probe/store 层符号。
 import ccpulse_store
 from ccpulse_archive import parse_since, run_trend
 from ccpulse_env import run_env_check
@@ -55,15 +55,13 @@ from ccpulse_net import (  # noqa: F401
     _sse_event_to_dict,
     classify_error,
     create_ssl_context,
+    open_url_no_redirect,
     parse_sse_lines,
 )
 from ccpulse_output import (
-    _c,
     _output_stream,
-    _pad,
     _sanitize_for_terminal,
     _sanitize_url_for_display,
-    _say_colored,
     say,
 )
 from ccpulse_probe import (  # noqa: F401
@@ -106,6 +104,7 @@ from ccpulse_probe import (  # noqa: F401
     _claude_code_headers,
     _collect_models_for_probe,
     _detect_claude_cli_version,
+    _detect_cloud_backend,
     _detect_crosspack_fields,
     _drain_non_sse_stream,
     _drain_sse_stream,
@@ -120,8 +119,6 @@ from ccpulse_probe import (  # noqa: F401
     _is_thinking_prone_model,
     _normalize_model_id,
     _probe_cache_replay,
-    _probe_js_fingerprint,
-    _probe_knowledge_cutoff,
     _probe_one_model,
     _probe_tools,
     _probe_vision,
@@ -145,36 +142,16 @@ from ccpulse_probe import (  # noqa: F401
     rebuild_provider_for_inspect,
 )
 from ccpulse_store import (  # noqa: F401
-    _day_key,
-    _fmt_ts,
-    _open_ro,
-    _percentile,
-    _provider_api_keys,
-    _row_is_fail,
-    _sanitize_log_text,
-    _sparkline,
-    _table_exists,
-    analyze_by_day,
-    analyze_by_model,
-    analyze_by_provider_day,
-    analyze_provider_deep,
-    classify_log_error,
-    load_provider_id_map,
+    build_manual_provider,
     load_providers,
+    load_standalone_providers,
     parse_provider,
-    query_analyze_raw,
-    query_provider_health,
-    query_proxy_logs,
-    query_routing,
-    query_stats,
-    read_log_file_tail,
-    resolve_provider_name,
     summarize_provider_history,
 )
 
 
 def __getattr__(name: str):
-    for _m in (_ccpulse_net, ccpulse_probe, ccpulse_store):
+    for _m in (_ccpulse_net, _ccpulse_output, ccpulse_probe, ccpulse_store):
         try:
             return getattr(_m, name)
         except AttributeError:
@@ -194,7 +171,8 @@ def run_list_models(args, providers, say) -> int:
     else:
         scope = "全部"
     args_type = getattr(args, "type", "claude")
-    say(f"从 {args.db} 加载 {len(providers)} 个供应商 ({scope})")
+    source_label = getattr(args, "_config_source_label", None) or args.db
+    say(f"从 {source_label} 加载 {len(providers)} 个供应商 ({scope})")
     say(
         f"拉取模型列表: GET /v1/models  并发: {args.workers}  超时: {args.timeout}s (type={args_type})\n"
     )
@@ -217,7 +195,10 @@ def run_list_models(args, providers, say) -> int:
                     ),
                     "status": 0,
                     "elapsed": 0,
-                    "error": f"内部异常: {type(exc).__name__}: {exc}",
+                    "error": _sanitize_display(
+                        f"内部异常: {type(exc).__name__}: {exc}",
+                        getattr(p, "api_key", None),
+                    ),
                     "error_category": ErrorCategory.UNKNOWN.value,
                     "models": [],
                 }
@@ -245,17 +226,13 @@ def run_list_models(args, providers, say) -> int:
         for r in fail:
             say(f"  ❌ {r['name'][:24]:24} [{r['status']}] {r['error']}")
 
-    # --probe / --deep：拉列表后逐模型探测（轻量或深度 12356）
+    # --probe：拉列表后逐模型轻量探测（验证真实可用）
     probe_reports = []
-    if getattr(args, "probe", False) or getattr(args, "deep", False):
-        deep = getattr(args, "deep", False)
+    if getattr(args, "probe", False):
         source = getattr(args, "source", "listed")
         result_by_name = {r["name"]: r for r in results}
         say(f"\n{'=' * 60}")
-        say(
-            f"探测模式: {'深度(text/streaming/metadata/thinking/tools)' if deep else '轻量(text)'}"
-            f"  来源: {source}"
-        )
+        say(f"探测模式: 轻量(text)  来源: {source}")
         say(f"{'=' * 60}")
         for p in providers:
             fr = result_by_name.get(p.name, {"status": 0, "models": []})
@@ -266,7 +243,7 @@ def run_list_models(args, providers, say) -> int:
             say(f"\n■ {p.name}  待探测 {len(model_ids)} 个模型")
             model_reports = []
             for j, mid in enumerate(model_ids, 1):
-                rep = _probe_one_model(p, mid, args, deep)
+                rep = _probe_one_model(p, mid, args, False)
                 model_reports.append(rep)
                 tr = rep["text"]
                 badge = (
@@ -277,14 +254,8 @@ def run_list_models(args, providers, say) -> int:
                 line = (
                     f"  [{j:>2}/{len(model_ids)}] {badge} {mid[:32]:32} "
                     f"[{tr['http_status']}] {tr['elapsed_seconds']}s"
+                    f'  "{tr["answer"][:20]}"'
                 )
-                if deep:
-                    sm = rep["streaming"].get("status")
-                    tk = rep["thinking"].get("verdict", "?")
-                    to = rep["tools"].get("protocol_support", "?")
-                    line += f"  stream:{sm} think:{tk} tools:{to}"
-                else:
-                    line += f'  "{tr["answer"][:20]}"'
                 say(line)
             probe_reports.append(
                 {
@@ -312,9 +283,8 @@ def run_list_models(args, providers, say) -> int:
             "type": args_type,
             "providers": results,
         }
-        if getattr(args, "probe", False) or getattr(args, "deep", False):
+        if getattr(args, "probe", False):
             report["probe"] = {
-                "deep": getattr(args, "deep", False),
                 "source": getattr(args, "source", "listed"),
                 "reports": probe_reports,
             }
@@ -374,7 +344,8 @@ def run_health_check(args, providers, say) -> int:
         scope = "全部"
     _stealth = getattr(args, "stealth", False)
     _workers = min(args.workers, STEALTH_MAX_WORKERS) if _stealth else args.workers
-    say(f"从 {args.db} 加载 {len(providers)} 个供应商 ({scope})")
+    source_label = getattr(args, "_config_source_label", None) or args.db
+    say(f"从 {source_label} 加载 {len(providers)} 个供应商 ({scope})")
     _mode = f"  隐身: 开(并发≤{STEALTH_MAX_WORKERS}+随机延迟)" if _stealth else ""
     say(f"并发: {_workers}  超时: {args.timeout}s{_mode}")
     say(f"探测问题: 问题池随机抽取（{len(PROBE_PROMPTS)} 条，答案宽松匹配）")
@@ -452,7 +423,9 @@ def run_health_check(args, providers, say) -> int:
                             "model": "?",
                             "status": 0,
                             "elapsed": 0,
-                            "error": f"内部异常: {type(exc).__name__}: {exc}",
+                            "error": _sanitize_display(
+                                f"内部异常: {type(exc).__name__}: {exc}", p.api_key
+                            ),
                             "error_category": ErrorCategory.UNKNOWN.value,
                         }
                     ],
@@ -477,7 +450,11 @@ def run_health_check(args, providers, say) -> int:
                 say(
                     f"[{i:>2}/{len(providers)}] {icon} {r['name'][:24]:24} {fails}{_sfx}"
                 )
-            if getattr(args, "with_history", False):
+            if (
+                getattr(args, "with_history", False)
+                and not getattr(args, "no_db", False)
+                and Path(args.db).exists()
+            ):
                 try:
                     say(
                         format_history_sidebar(
@@ -490,6 +467,11 @@ def run_health_check(args, providers, say) -> int:
                     say(f"  history: 读取失败 ({type(e).__name__}: {e})")
     ok = [r for r in results if r["overall_ok"]]
     fail = [r for r in results if not r["overall_ok"]]
+    ratio = len(ok) / len(results) if results else 0.0
+    alert_threshold = getattr(args, "alert_threshold", None)
+    alert_triggered = bool(
+        alert_threshold is not None and results and ratio < alert_threshold
+    )
     say(f"\n{'=' * 60}")
     say(
         f"完成: ✅ {len(ok)} 可用(能正确回答)  ❌ {len(fail)} 不可用  共 {len(results)} 个"
@@ -548,10 +530,19 @@ def run_health_check(args, providers, say) -> int:
             results,
             key=lambda r: order.get((r.get("type"), r.get("name")), 1_000_000),
         )
+        summary_obj = {
+            "total": len(results),
+            "available": len(ok),
+            "unavailable": len(fail),
+            "available_ratio": round(ratio, 4) if results else 0,
+        }
+        if alert_threshold is not None:
+            summary_obj["alert_threshold"] = alert_threshold
+            summary_obj["alert_triggered"] = alert_triggered
         json_report = {
             "schema_version": 2,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "db_path": args.db,
+            "db_path": source_label,
             "scope": (
                 "current"
                 if getattr(args, "current_only", False)
@@ -565,12 +556,7 @@ def run_health_check(args, providers, say) -> int:
             "stealth": _stealth,
             "tier_order": TIER_ORDER,
             "elapsed_seconds": round(time.time() - health_started, 2),
-            "summary": {
-                "total": len(results),
-                "available": len(ok),
-                "unavailable": len(fail),
-                "available_ratio": round(len(ok) / len(results), 4) if results else 0,
-            },
+            "summary": summary_obj,
             "providers": results_sorted,
         }
         print(json.dumps(json_report, ensure_ascii=False, indent=2), flush=True)
@@ -578,15 +564,16 @@ def run_health_check(args, providers, say) -> int:
     # 归档：每次 check 探测结果追加一行 JSONL（供 trend 跨次聚合），失败不阻断
     _archive_check_results(args, providers, results)
 
-    # 告警阈值：可用率低于阈值时输出告警（cron 可据此触发）
-    alert_threshold = getattr(args, "alert_threshold", None)
-    if alert_threshold is not None and results:
-        ratio = len(ok) / len(results)
-        if ratio < alert_threshold:
-            say(
-                f"⚠ 告警: 可用率 {ratio * 100:.0f}% 低于阈值 {alert_threshold * 100:.0f}%",
-            )
-    return 0 if ok else 1
+    # 告警阈值：可用率低于阈值时输出告警并触发非零退出码（cron 可据此触发）
+    if alert_triggered:
+        say(
+            f"⚠ 告警: 可用率 {ratio * 100:.0f}% 低于阈值 {alert_threshold * 100:.0f}%",
+        )
+    if results and not ok:
+        return 3
+    if fail or alert_triggered:
+        return 1
+    return 0
 
 
 def resolve_inspect_target(args, providers, say) -> tuple:
@@ -667,8 +654,6 @@ _INSPECT_INCLUDE_DIMENSIONS = {
     "tools",
     "vision",
     "cache-replay",
-    "knowledge-cutoff",
-    "js-fingerprint",
 }
 
 
@@ -689,7 +674,7 @@ def _resolve_inspect_include(args, default: str) -> set[str]:
             f"未知 --include 维度: {', '.join(unknown)}；可用维度: {allowed}"
         )
     if getattr(args, "auth_full", False):
-        include |= {"cache-replay", "knowledge-cutoff", "js-fingerprint"}
+        include |= {"cache-replay"}
     return include
 
 
@@ -896,41 +881,48 @@ def run_inspect(args, providers, say) -> int:
         return 2
     if not getattr(args, "provider", None):
         say("inspect 需要 --provider，或改用 --compare 'A/m1,B/m2'")
-        print(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "command": "inspect",
-                    "error": "missing --provider",
-                },
-                ensure_ascii=False,
-                indent=2,
+        if (
+            not _is_human_output(args)
+            and getattr(args, "output_format", None) != "card"
+        ):
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "command": "inspect",
+                        "error": "missing --provider",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
             )
-        )
         return 2
     if getattr(args, "all_models", False) or getattr(args, "models", None):
         return _run_inspect_all(args, providers, say)
     p, model_id, err = resolve_inspect_target(args, providers, say)
     if p is None:
         say(err)
-        print(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "command": "inspect",
-                    "error": err,
-                    "provider": getattr(args, "provider", None),
-                    "model": getattr(args, "model", None),
-                    "source": getattr(args, "source", None),
-                },
-                ensure_ascii=False,
-                indent=2,
+        if (
+            not _is_human_output(args)
+            and getattr(args, "output_format", None) != "card"
+        ):
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "command": "inspect",
+                        "error": err,
+                        "provider": getattr(args, "provider", None),
+                        "model": getattr(args, "model", None),
+                        "source": getattr(args, "source", None),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
             )
-        )
         return 2
 
     inspect_p = rebuild_provider_for_inspect(p, model_id)
-    protocol = detect_protocol(p)
     include = _resolve_inspect_include(args, _INSPECT_DEFAULT_INCLUDE)
     _mt = getattr(args, "probe_max_tokens", PROBE_MAX_TOKENS)
     _dt = not getattr(args, "probe_enable_thinking", False)
@@ -939,229 +931,25 @@ def run_inspect(args, providers, say) -> int:
     if getattr(args, "with_metadata", False):
         say("提示: --with-metadata 已废弃，metadata 默认包含在 --include 中")
 
-    # ---- 7 维度探测 ----
-    text_result, text_raw = (None, None)
-    if "text" in include:
-        text_result, text_raw = _inspect_text(
-            inspect_p,
-            inspect_p.tiers[0],
-            args.timeout,
-            args.skip_tls_verify,
-            max_tokens=_mt,
-            disable_thinking=_dt,
-            user_agent=_ua,
-        )
+    report = _inspect_one_model(
+        inspect_p,
+        model_id,
+        args,
+        include,
+        _mt,
+        _dt,
+        _ua,
+        orig_provider=p,
+    )
+    verdict = (report.get("summary") or {}).get("verdict", "unavailable")
+    streaming_result = report.get("streaming") or {}
+    text_result = report.get("text") or {}
 
-    streaming_result = None
-    if "streaming" in include:
-        streaming_result = probe_stream(
-            inspect_p,
-            inspect_p.tiers[0],
-            args.timeout,
-            args.skip_tls_verify,
-            ttft_timeout=getattr(args, "ttft_timeout", None),
-            max_tokens=_mt,
-            disable_thinking=_dt,
-            user_agent=_ua,
-        )
-
-    metadata_result = {"status": "skipped"}
-    if "metadata" in include:
-        metadata_result = probe_model_metadata(
-            inspect_p,
-            re.sub(r"\[.*?\]$", "", model_id),
-            args.timeout,
-            args.skip_tls_verify,
-            user_agent=_ua,
-        )
-
-    context_result = {"status": "skipped"}
-    if "context" in include or (
-        getattr(args, "include", None) is None and "metadata" in include
+    if (
+        getattr(args, "with_history", False)
+        and not getattr(args, "no_db", False)
+        and Path(args.db).exists()
     ):
-        has_declared = (
-            metadata_result.get("declared_context_window") is not None
-            and metadata_result.get("status") == "available"
-        )
-        if not has_declared:
-            _ctx = {"512k": 524288, "1m": 1048576}.get(
-                getattr(args, "probe_context", "512k"), 524288
-            )
-            context_result = probe_context_smoke(
-                inspect_p,
-                model_id,
-                _ctx,
-                args.timeout,
-                args.skip_tls_verify,
-                user_agent=_ua,
-            )
-
-    thinking_result = {"status": "skipped"}
-    if "thinking" in include:
-        thinking_result = _inspect_thinking(
-            inspect_p,
-            inspect_p.tiers[0],
-            text_raw,
-            args.timeout,
-            args.skip_tls_verify,
-            max_tokens=_mt,
-            user_agent=_ua,
-        )
-
-    tools_result = {"status": "skipped"}
-    if "tools" in include:
-        tools_result = _probe_tools(
-            inspect_p, model_id, args.timeout, args.skip_tls_verify, _ua
-        )
-
-    vision_result = {"status": "skipped"}
-    if "vision" in include:
-        vision_result = _probe_vision(
-            inspect_p, model_id, args.timeout, args.skip_tls_verify, _ua
-        )
-
-    # ---- 汇总 ----
-    if text_result and text_result["status"] == "pass":
-        protocol["confidence"] = "confirmed"
-
-    responded_model = (streaming_result or {}).get("response_model")
-    model_consistency = _inspect_model_consistency(model_id, responded_model, include)
-
-    usage = {
-        "present": False,
-        "input_tokens": None,
-        "output_tokens": None,
-        "source": None,
-        "missing_fields": ["input_tokens", "output_tokens"],
-    }
-    if text_raw and text_raw.get("usage"):
-        usage = text_raw["usage"]
-
-    verdict, anomaly, recommended = _inspect_verdict(
-        text_result, model_consistency, thinking_result, tools_result
-    )
-
-    # 保真鉴别 P0：换芯字段检测（复用 text/streaming 响应体）+ thinking 签名（复用 enable 响应体）
-    auth_body = ""
-    if text_raw and text_raw.get("status") == 200:
-        auth_body = text_raw.get("raw_body", "")
-    elif streaming_result and streaming_result.get("raw_preview"):
-        auth_body = streaming_result.get("raw_preview", "")
-    crosspack = _detect_crosspack_fields(auth_body, inspect_p.app_type)
-    enabled_body = (
-        thinking_result.pop("_enabled_raw_body", "")
-        if isinstance(thinking_result, dict)
-        else ""
-    )
-    _sigs = _extract_thinking_signatures(enabled_body)
-    thinking_signature = {
-        "has_valid_signature": _has_valid_thinking_signature(_sigs),
-        "blocks": _sigs,
-    }
-    # P1: usage 自洽静态校验（复用 text_raw 的 usage + answer，零新请求）
-    _usage_raw = text_raw.get("usage") if text_raw else None
-    _answer_raw = text_raw.get("answer", "") if text_raw else ""
-    usage_consistency = _check_usage_consistency(
-        _usage_raw, _answer_raw, inspect_p.app_type
-    )
-    # P2-A: 缓存回放/钳温双发探测（可选 --include cache-replay；2 次新请求）
-    cache_replay = {
-        "suspicious": False,
-        "identical": None,
-        "note": "未启用（--include cache-replay 开启）",
-    }
-    if "cache-replay" in include:
-        cache_replay = _probe_cache_replay(
-            inspect_p,
-            inspect_p.tiers[0],
-            args.timeout,
-            args.skip_tls_verify,
-            max_tokens=16,
-            user_agent=_ua,
-        )
-    # P2-B: 知识截止 before/after 题库（可选 --include knowledge-cutoff；6 次新请求）
-    knowledge_cutoff = {
-        "suspicious": False,
-        "note": "未启用（--include knowledge-cutoff 开启）",
-    }
-    if "knowledge-cutoff" in include:
-        knowledge_cutoff = _probe_knowledge_cutoff(
-            inspect_p,
-            inspect_p.tiers[0],
-            args.timeout,
-            args.skip_tls_verify,
-            max_tokens=32,
-            user_agent=_ua,
-        )
-    # P2-C: 单 token 随机数分布指纹（可选 --include js-fingerprint；默认 50 次新请求）
-    js_samples = getattr(args, "js_samples", 50) or 50
-    js_fingerprint = {
-        "suspicious": False,
-        "note": "未启用（--include js-fingerprint 开启）",
-    }
-    if "js-fingerprint" in include:
-        js_fingerprint = _probe_js_fingerprint(
-            inspect_p,
-            inspect_p.tiers[0],
-            args.timeout,
-            args.skip_tls_verify,
-            samples=js_samples,
-            max_tokens=16,
-            user_agent=_ua,
-        )
-    auth_verdict, auth_evidence = _authenticity_verdict(
-        {
-            "crosspack": crosspack,
-            "thinking_signature": thinking_signature,
-            "usage_consistency": usage_consistency,
-            "cache_replay": cache_replay,
-            "knowledge_cutoff": knowledge_cutoff,
-            "js_fingerprint": js_fingerprint,
-        }
-    )
-    if auth_verdict == "suspicious":
-        recommended.append("保真告警：" + "；".join(auth_evidence))
-
-    report = {
-        "schema_version": 1,
-        "command": "inspect",
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "provider": inspect_p.name,
-        "model": model_id,
-        "model_source": args.source,
-        "base_url": _sanitize_url_for_display(inspect_p.base_url, inspect_p.api_key),
-        "auth_mode": inspect_p.auth_mode,
-        "custom_user_agent": p.custom_user_agent,  # 原始 Provider（未 rebuild）
-        "notes": p.notes,  # 原始 Provider 运营备注
-        "protocol": protocol,
-        "text": text_result,
-        "streaming": streaming_result
-        if streaming_result is not None
-        else {"status": "not_run"},
-        "metadata": metadata_result,
-        "context": context_result,
-        "thinking": thinking_result,
-        "tools": tools_result,
-        "vision": vision_result,
-        "model_consistency": model_consistency,
-        "usage": usage,
-        "authenticity": {
-            "crosspack": crosspack,
-            "thinking_signature": thinking_signature,
-            "usage_consistency": usage_consistency,
-            "cache_replay": cache_replay,
-            "knowledge_cutoff": knowledge_cutoff,
-            "js_fingerprint": js_fingerprint,
-            "verdict": auth_verdict,
-            "evidence": auth_evidence,
-        },
-        "summary": {
-            "verdict": verdict,
-            "model_routing_anomaly": anomaly,
-            "recommended_actions": recommended,
-        },
-    }
-    if getattr(args, "with_history", False):
         try:
             since = getattr(args, "history_since", "24h") or "24h"
             report["history"] = summarize_provider_history(
@@ -1170,7 +958,9 @@ def run_inspect(args, providers, say) -> int:
             report["history_since"] = since
         except Exception as e:
             report["history"] = {"error": f"{type(e).__name__}: {e}"}
-    if _is_human_output(args):
+    if getattr(args, "output_format", None) == "card":
+        print(format_inspect_card(report), flush=True)
+    elif _is_human_output(args):
         text = format_inspect_human(report)
         if report.get("history") and not report["history"].get("error"):
             h = report["history"]
@@ -1365,6 +1155,10 @@ def format_inspect_human(r: dict) -> str:
     lines.append(
         f"  Protocol:  {r['protocol']['detected']} · {r['protocol']['confidence']}"
     )
+    bo = r.get("backend_origin") or {}
+    if bo.get("label"):
+        sigs_s = ", ".join(bo.get("signals") or [])
+        lines.append(f"  Backend:   {bo['label']}" + (f" ({sigs_s})" if sigs_s else ""))
     if r.get("custom_user_agent"):
         lines.append(f"  UA:        {r['custom_user_agent']}")
     if r.get("notes"):
@@ -1376,22 +1170,22 @@ def format_inspect_human(r: dict) -> str:
     if r.get("text"):
         t = r["text"]
         if t["status"] == "pass":
-            lines.append("[1/7] 文本探测")
+            lines.append("[1/8] 文本探测")
             lines.append(f"  状态：✅ pass · {t['elapsed_seconds']}s")
             lines.append(f'  答案："{t["answer"]}" · 正确')
         elif t["status"] == "fail":
-            lines.append("[1/7] 文本探测")
+            lines.append("[1/8] 文本探测")
             lines.append(f"  状态：⚠ fail · {t['elapsed_seconds']}s")
             lines.append(f'  答案："{t["answer"]}" · 不正确')
         else:
-            lines.append("[1/7] 文本探测")
+            lines.append("[1/8] 文本探测")
             lines.append(
                 f"  状态：❌ error · {t['elapsed_seconds']}s · [{t['error_category']}]"
             )
             if t["error"]:
                 lines.append(f"  错误：{t['error']}")
     else:
-        lines.append("[1/7] 文本探测 · skipped")
+        lines.append("[1/8] 文本探测 · skipped")
     u = r.get("usage") or {}
     if u.get("present"):
         lines.append(
@@ -1406,7 +1200,7 @@ def format_inspect_human(r: dict) -> str:
     if s.get("status") in ("pass", "fail", "error"):
         ttft = s.get("ttft_seconds")
         ttft_str = f"TTFT {ttft}s" if ttft is not None else "无首 token"
-        lines.append("[2/7] 流式探测")
+        lines.append("[2/8] 流式探测")
         if s["status"] == "pass":
             lines.append(f"  状态：✅ pass · {ttft_str} · 总 {s['elapsed_seconds']}s")
         elif s["status"] == "fail":
@@ -1422,26 +1216,26 @@ def format_inspect_human(r: dict) -> str:
         if s.get("event_count") is not None:
             lines.append(f"  事件数: {s['event_count']}")
     else:
-        lines.append(f"[2/7] 流式探测 · {s.get('status', 'not_run')}")
+        lines.append(f"[2/8] 流式探测 · {s.get('status', 'not_run')}")
 
     # [3] 模型路由
     lines.append("")
     m = r.get("model_consistency") or {}
     if m.get("responded"):
         warn = m.get("warning") or ""
-        lines.append("[3/7] 模型路由比对")
+        lines.append("[3/8] 模型路由比对")
         lines.append(f"  请求：{m['requested']}")
         lines.append(f"  响应：{m['responded']}")
         lines.append(f"  匹配：{m.get('match')} {warn}")
     else:
-        lines.append(f"[3/7] 模型路由比对 · {m.get('match', 'not_run')}")
+        lines.append(f"[3/8] 模型路由比对 · {m.get('match', 'not_run')}")
 
     # [4] 元数据 / 上下文
     lines.append("")
     md = r.get("metadata") or {}
     ctx = r.get("context") or {}
     if md.get("status") in ("available", "unavailable"):
-        lines.append("[4/7] 模型元数据")
+        lines.append("[4/8] 模型元数据")
         if md["status"] == "available":
             cwin = md.get("declared_context_window")
             mout = md.get("max_output_tokens")
@@ -1454,14 +1248,12 @@ def format_inspect_human(r: dict) -> str:
                 true_caps = [k for k, v in caps.items() if v]
                 if true_caps:
                     lines.append(f"  能力：{', '.join(true_caps)}")
-            if not cwin:
-                lines.append("  无声明窗口 → 触发上下文冒烟")
         else:
             lines.append(f"  状态：unavailable · [{md.get('error_category')}]")
             if md.get("error"):
                 lines.append(f"  错误：{md['error'][:120]}")
     else:
-        lines.append(f"[4/7] 模型元数据 · {md.get('status', 'not_run')}")
+        lines.append(f"[4/8] 模型元数据 · {md.get('status', 'not_run')}")
     if ctx.get("status") and ctx.get("status") != "skipped":
         lines.append(
             f"  上下文冒烟：{ctx.get('status')} · chars≈{ctx.get('approx_input_chars')} · "
@@ -1473,14 +1265,10 @@ def format_inspect_human(r: dict) -> str:
     # [5] Thinking
     lines.append("")
     th = r.get("thinking") or {}
-    if (
-        th.get("status") == "skipped"
-        or th.get("verdict") is None
-        and th.get("status") == "skipped"
-    ):
-        lines.append(f"[5/7] Thinking · {th.get('status', 'not_run')}")
+    if th.get("status") == "skipped":
+        lines.append(f"[5/8] Thinking · {th.get('status', 'not_run')}")
     elif th.get("verdict") or th.get("disabled") or th.get("enabled"):
-        lines.append("[5/7] Thinking")
+        lines.append("[5/8] Thinking")
         lines.append(f"  verdict：{th.get('verdict', 'unknown')}")
         d = th.get("disabled") or {}
         e = th.get("enabled") or {}
@@ -1495,13 +1283,13 @@ def format_inspect_human(r: dict) -> str:
                 f"answer={e.get('has_answer')} think_sig={e.get('has_thinking_signal')}"
             )
     else:
-        lines.append(f"[5/7] Thinking · {th.get('status', 'not_run')}")
+        lines.append(f"[5/8] Thinking · {th.get('status', 'not_run')}")
 
     # [6] Tools
     lines.append("")
     tools = r.get("tools") or {}
     if tools.get("status") in ("pass", "fail", "error", "unsupported"):
-        lines.append("[6/7] Tool use")
+        lines.append("[6/8] Tool use")
         icon = {"pass": "✅", "fail": "⚠", "error": "❌", "unsupported": "·"}.get(
             tools["status"], "·"
         )
@@ -1513,13 +1301,13 @@ def format_inspect_human(r: dict) -> str:
         if tools.get("error"):
             lines.append(f"  错误：{str(tools['error'])[:120]}")
     else:
-        lines.append(f"[6/7] Tool use · {tools.get('status', 'not_run')}")
+        lines.append(f"[6/8] Tool use · {tools.get('status', 'not_run')}")
 
     # [7] Vision
     lines.append("")
     vis = r.get("vision") or {}
     if vis.get("status") in ("pass", "fail", "error", "unsupported"):
-        lines.append("[7/7] Vision")
+        lines.append("[7/8] Vision")
         icon = {"pass": "✅", "fail": "⚠", "error": "❌", "unsupported": "·"}.get(
             vis["status"], "·"
         )
@@ -1529,7 +1317,7 @@ def format_inspect_human(r: dict) -> str:
         if vis.get("error"):
             lines.append(f"  错误：{str(vis['error'])[:120]}")
     else:
-        lines.append(f"[7/7] Vision · {vis.get('status', 'not_run')}")
+        lines.append(f"[7/8] Vision · {vis.get('status', 'not_run')}")
 
     # [8] 保真鉴别（authenticity）
     auth = r.get("authenticity") or {}
@@ -1559,20 +1347,11 @@ def format_inspect_human(r: dict) -> str:
             lines.append(f"  · 计费疑似：{f.get('check')} - {f.get('reason')}")
     else:
         lines.append(f"  · usage 自洽：{uc.get('note', '未取得数据')}")
-    # P2 可选探针
     cr = auth.get("cache_replay") or {}
-    kc = auth.get("knowledge_cutoff") or {}
-    js = auth.get("js_fingerprint") or {}
-    for label, probe_result in (("缓存回放", cr), ("知识截止", kc), ("分布指纹", js)):
-        if probe_result.get("note") and "未启用" not in probe_result.get("note", ""):
-            lines.append(f"  · {label}：{probe_result.get('note')}")
-    if any(
-        "未启用" in (probe_result.get("note") or "") or not probe_result
-        for probe_result in (cr, kc, js)
-    ):
-        lines.append(
-            "  提示：使用 --auth-full 开启缓存回放、知识截止和分布指纹深度鉴别"
-        )
+    if cr.get("note") and "未启用" not in cr.get("note", ""):
+        lines.append(f"  · 缓存回放：{cr.get('note')}")
+    else:
+        lines.append("  提示：使用 --auth-full 开启缓存回放深度鉴别")
     ev = auth.get("evidence") or []
     if ev and av == "suspicious":
         lines.append(f"  证据：{'；'.join(ev)}")
@@ -1593,536 +1372,74 @@ def format_inspect_human(r: dict) -> str:
     return "\n".join(lines)
 
 
-# ---------- cc-switch 运行日志（只读） ----------
+def format_inspect_card(r: dict) -> str:
+    """生成 ≤25 行的脱敏 Markdown 战报卡（不含 API Key 与敏感 URL）。"""
+    prov = _sanitize_for_terminal(str(r.get("provider") or "unknown"))
+    model = _sanitize_for_terminal(str(r.get("model") or "unknown"))
+    proto = (r.get("protocol") or {}).get("detected", "unknown")
+    bo = r.get("backend_origin") or {}
+    bo_label = bo.get("label") or "Unknown"
+    bo_sigs = ", ".join(bo.get("signals") or [])
+    bo_str = f"{bo_label} ({bo_sigs})" if bo_sigs else bo_label
 
-LOGS_DIR = str(Path.home() / ".cc-switch" / "logs")
-
-
-def _resolve_since_or_fail(args, output) -> tuple[int | None, int | None]:
-    """解析日志命令的 --since；失败时输出提示并返回 (None, 2)。"""
-    try:
-        return parse_since(getattr(args, "since", None)), None
-    except ValueError as exc:
-        output(str(exc))
-        return None, 2
-
-
-def run_history(args, say) -> int:
-    """history 子命令。"""
-    since_ts, error_code = _resolve_since_or_fail(args, say)
-    if error_code is not None:
-        return error_code
-    limit = getattr(args, "limit", 20) or 20
-    fails = getattr(args, "fails", False)
-    prov = getattr(args, "provider", None) or None
-    rows = query_proxy_logs(
-        args.db, since_ts=since_ts, limit=limit, fails_only=fails, provider_substr=prov
+    t = r.get("text") or {}
+    t_str = (
+        f"{t.get('status', 'skipped')} ({t.get('elapsed_seconds', '-')}s)"
+        if t
+        else "skipped"
     )
-    report = {
-        "schema_version": 1,
-        "command": "history",
-        "since": getattr(args, "since", None),
-        "limit": limit,
-        "fails_only": fails,
-        "count": len(rows),
-        "entries": [
-            {
-                "created_at": r.get("created_at"),
-                "created_at_fmt": r.get("created_at_fmt"),
-                "provider_name": r.get("provider_name"),
-                "app_type": r.get("app_type"),
-                "request_model": r.get("request_model"),
-                "model": r.get("model"),
-                "status_code": r.get("status_code"),
-                "latency_ms": r.get("latency_ms"),
-                "first_token_ms": r.get("first_token_ms"),
-                "input_tokens": r.get("input_tokens"),
-                "output_tokens": r.get("output_tokens"),
-                "total_cost_usd": r.get("total_cost_usd"),
-                "error_message": r.get("error_message"),
-                "error_category": r.get("error_category"),
-                "routing_mismatch": r.get("routing_mismatch"),
-                "data_source": r.get("data_source"),
-            }
-            for r in rows
-        ],
-    }
-    # 可选磁盘日志
-    log_file = getattr(args, "log_file", None)
-    if log_file:
-        report["log_file_tail"] = [
-            _sanitize_for_terminal(_sanitize_log_text(ln, _provider_api_keys(args.db, {})))
-            for ln in read_log_file_tail(
-                log_file,
-                lines=getattr(args, "log_lines", 50) or 50,
-                keyword=getattr(args, "log_keyword", None),
-            )
-        ]
-
-    if getattr(args, "json", False):
-        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
-    else:
-        say(
-            f"history: {len(rows)} 条"
-            f"{'（仅失败）' if fails else ''}"
-            f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}"
-        )
-        for i, r in enumerate(rows, 1):
-            st = r.get("status_code")
-            ok = st == 200 and not r.get("error_message")
-            badge = _status_badge(ok, st, r.get("error_category"))
-            pname = _sanitize_for_terminal(str(r.get("provider_name") or "?"))
-            ts = r.get("created_at_fmt") or "?"
-            _say_colored(f"[{i:02d}] {badge} {_c(ts, 'dim')}  {pname}")
-            req_m = _sanitize_for_terminal(str(r.get("request_model") or "?"))
-            act_m = _sanitize_for_terminal(str(r.get("model") or "?"))
-            model_line = f"     {req_m} -> {act_m}"
-            if r.get("routing_mismatch"):
-                model_line += _c("  ⚡路由不一致", "yellow")
-            _say_colored(
-                f"{model_line}  "
-                f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms"
-                f"  in={r.get('input_tokens') or 0} out={r.get('output_tokens') or 0}"
-                f"  cost=${float(r.get('total_cost_usd') or 0):.4f}"
-            )
-            if r.get("error_message"):
-                cat = _sanitize_for_terminal(str(r.get("error_category") or ""))
-                msg = _sanitize_for_terminal(str(r.get("error_message") or ""))[:160]
-                _say_colored(f"     {_c('[' + cat + ']', 'red')} {msg}")
-        if log_file and report.get("log_file_tail"):
-            say(f"\n--- log file tail: {log_file} ---")
-            for ln in report["log_file_tail"]:
-                say(ln)
-    return 0
-
-
-def run_stats(args, say) -> int:
-    since_ts, error_code = _resolve_since_or_fail(args, say)
-    if error_code is not None:
-        return error_code
-    stats = query_stats(args.db, since_ts=since_ts)
-    include_deleted = getattr(args, "include_deleted", False)
-    if not include_deleted:
-        stats = [s for s in stats if not s.get("is_deleted")]
-    report = {
-        "schema_version": 1,
-        "command": "stats",
-        "since": getattr(args, "since", None),
-        "include_deleted": include_deleted,
-        "providers": stats,
-    }
-    if getattr(args, "json", False):
-        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
-    else:
-        say(
-            f"stats: {len(stats)} 个供应商"
-            f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}"
-            f"{'（已隐藏已删除供应商，--include-deleted 显示）' if not include_deleted else ''}"
-        )
-        hdr = (
-            f"{_pad('供应商', 24)} {'请求':>6} {'成功%':>7} {'失败':>5} "
-            f"{_pad('主失败因', 22)} {'中位延迟':>9} {'路由≠%':>7} {'成本$':>8} {'入token':>9} {'出token':>9}"
-        )
-        _say_colored(_c(hdr, "bold"))
-        say("-" * 120)
-        for s in stats:
-            sr = s["success_rate"]
-            rate_s = f"{sr * 100:.0f}%"
-            if sr >= 0.95:
-                rate_c = _c(rate_s, "green")
-            elif sr >= 0.7:
-                rate_c = _c(rate_s, "yellow")
-            else:
-                rate_c = _c(rate_s, "red", "bold")
-            med_val = s["median_latency_ms"]
-            med = f"{med_val:.0f}ms" if med_val is not None else "-"
-            # 延迟 >10s 标红，>3s 标黄
-            if med_val is not None and med_val > 10000:
-                med_c = _c(med, "red", "bold")
-            elif med_val is not None and med_val > 3000:
-                med_c = _c(med, "yellow")
-            else:
-                med_c = med
-            mm_r = s["mismatch_rate"]
-            mm_s = f"{mm_r * 100:.0f}%"
-            # 路由不一致 >50% 标红，>10% 标黄
-            if mm_r > 0.5:
-                mm_c = _c(mm_s, "red", "bold")
-            elif mm_r > 0.1:
-                mm_c = _c(mm_s, "yellow")
-            else:
-                mm_c = mm_s
-            cat = s.get("top_fail_category") or "-"
-            cat_c = _c(_pad(cat[:22], 22), "red") if cat != "-" else _pad(cat[:22], 22)
-            fail_c = _c(str(s["fail"]), "red") if s["fail"] > 0 else str(s["fail"])
-            cost = s.get("cost_usd") or 0.0
-            cost_s = f"{cost:.2f}" if cost > 0 else "-"
-            inp_tok = s.get("input_tokens") or 0
-            out_tok = s.get("output_tokens") or 0
-            inp_s = f"{inp_tok:,}" if inp_tok else "-"
-            out_s = f"{out_tok:,}" if out_tok else "-"
-            pname = _sanitize_for_terminal(s["provider_name"][:24])
-            _say_colored(
-                f"{_pad(pname, 24)} {s['total']:6d} {rate_c:>7} {fail_c:>5} "
-                f"{cat_c} {med_c:>9} {mm_c:>7} {cost_s:>8} {inp_s:>9} {out_s:>9}"
-            )
-    return 0
-
-
-def run_routing(args, say) -> int:
-    since_ts, error_code = _resolve_since_or_fail(args, say)
-    if error_code is not None:
-        return error_code
-    limit = getattr(args, "limit", 20) or 20
-    pairs = query_routing(args.db, since_ts=since_ts, limit=limit)
-    report = {
-        "schema_version": 1,
-        "command": "routing",
-        "since": getattr(args, "since", None),
-        "pairs": pairs,
-    }
-    if getattr(args, "json", False):
-        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
-    else:
-        say(
-            f"routing: top {len(pairs)} 静默路由"
-            f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}"
-        )
-        for i, p in enumerate(pairs, 1):
-            say(
-                f"[{i:02d}] {p['count']:5d}×  {p['request_model']}  =>  {p['actual_model']}"
-            )
-    return 0
-
-
-def run_health(args, say) -> int:
-    """health 子命令：读 cc-switch 的 provider_health（被动流量健康度）。
-
-    注意：这是 cc-switch 从真实代理流量聚合的健康判定（如额度用完/502/529），
-    不是主动可用性探测，也不校验答案正确性。主动探测请用 check / inspect。
-    """
-    rows = query_provider_health(args.db)
-    report = {
-        "schema_version": 1,
-        "command": "health",
-        "source": "cc-switch provider_health（被动流量聚合，非主动探测）",
-        "total": len(rows),
-        "unhealthy": sum(1 for r in rows if not r.get("is_healthy")),
-        "providers": rows,
-    }
-    if getattr(args, "json", False):
-        print(json.dumps(report, ensure_ascii=False, indent=2, default=str), flush=True)
-        return 0
-    if not rows:
-        say("provider_health 表无数据（cc-switch 未记录流量健康度）")
-        return 0
-    say(
-        f"health: {len(rows)} 个供应商"
-        f"（cc-switch 被动流量健康度，非主动探测；主动探测请用 check）"
+    s = r.get("streaming") or {}
+    ttft = s.get("ttft_seconds")
+    s_str = (
+        f"{s.get('status', 'not_run')} · TTFT {ttft}s"
+        if ttft is not None
+        else str(s.get("status", "not_run"))
     )
-    hdr = f"{_pad('供应商', 24)} {'健康':>4} {'连续失败':>8} {'最近错误':40}"
-    _say_colored(_c(hdr, "bold"))
-    say("-" * 90)
-    for r in rows:
-        healthy = r.get("is_healthy")
-        name = _sanitize_for_terminal(str(r.get("provider_name") or "?")[:24])
-        h_c = _c("✓", "green") if healthy else _c("✗", "red", "bold")
-        fails = r.get("consecutive_failures") or 0
-        fail_c = _c(str(fails), "red", "bold") if fails > 0 else "0"
-        err = (r.get("last_error") or "-")[:60]
-        err = _sanitize_for_terminal(err)
-        _say_colored(f"{_pad(name, 24)} {h_c:>4} {fail_c:>8} {err}")
-    return 0
-
-
-def _filter_new_watch_rows(rows, last_ts, seen_ids) -> list[dict]:
-    """筛出新 watch 行：created_at >= last_ts 且 (request_id, created_at) 组合键未见过。"""
-    out = []
-    for r in rows:
-        rid = str(r.get("request_id") or "")
-        cts = r.get("created_at") or 0
-        key = f"{rid}|{cts}"
-        if cts >= last_ts and key not in seen_ids:
-            out.append(r)
-    return out
-
-
-def run_watch(args, say) -> int:
-    """轮询 proxy_request_logs，有新行就打印（Ctrl+C 退出）。
-
-    --json：stdout 输出 NDJSON（每行一个 {"event": "row", ...} 事件），
-    人类进度走 stderr，供 jq / CI / 联动脚本消费。
-    """
-    interval = max(1, int(getattr(args, "interval", 3) or 3))
-    fails_only = getattr(args, "fails", False)
-    prov = getattr(args, "provider", None) or None
-    json_mode = getattr(args, "json", False)
-
-    def _emit(line: str) -> None:
-        if not json_mode:
-            _say_colored(line)
-
-    def _emit_row(r: dict) -> None:
-        if json_mode:
-            print(
-                json.dumps({"event": "row", **r}, ensure_ascii=False, default=str),
-                flush=True,
-            )
-            return
-        st = r.get("status_code")
-        ok = st == 200 and not r.get("error_message")
-        badge = _status_badge(ok, st, r.get("error_category"))
-        pname = _sanitize_for_terminal(str(r.get("provider_name") or "?"))
-        ts = r.get("created_at_fmt") or "?"
-        _say_colored(f"{badge} {_c(ts, 'dim')}  {pname}")
-        req_m = _sanitize_for_terminal(str(r.get("request_model") or "?"))
-        act_m = _sanitize_for_terminal(str(r.get("model") or "?"))
-        model_line = f"  {req_m} -> {act_m}"
-        if r.get("routing_mismatch"):
-            model_line += _c("  ⚡路由", "yellow")
-        _say_colored(
-            f"{model_line}  "
-            f"status={st}  lat={r.get('latency_ms')}ms  ttft={r.get('first_token_ms')}ms"
-        )
-        # tokens：in/out + 缓存命中（cc-switch 记账，缺列时 0）
-        it, ot = r.get("input_tokens") or 0, r.get("output_tokens") or 0
-        crt = r.get("cache_read_tokens") or 0
-        cct = r.get("cache_creation_tokens") or 0
-        tok = f"  in={it} out={ot}"
-        if crt or cct:
-            tok += f" cache_r={crt} cache_w={cct}"
-        _say_colored(tok)
-        if r.get("error_message"):
-            cat = _sanitize_for_terminal(str(r.get("error_category") or ""))
-            msg = _sanitize_for_terminal(str(r.get("error_message") or ""))[:160]
-            _say_colored(f"  {_c('[' + cat + ']', 'red')} {msg}")
-
-    # 起点：当前最新 created_at（避免启动时刷屏历史）
-    bootstrap = query_proxy_logs(
-        args.db, limit=1, fails_only=False, provider_substr=prov
+    tools = r.get("tools") or {}
+    tools_str = (
+        f"{tools.get('status', 'skipped')} ({tools.get('protocol_support', '-')})"
+        if tools.get("status") != "skipped"
+        else "skipped"
     )
-    last_ts = bootstrap[0]["created_at"] if bootstrap else int(time.time())
-    # dict 保留插入顺序，截断时按真实时序而非哈希顺序（set 截断会丢新条目）
-    seen_ids: dict[str, None] = {}
-    if bootstrap:
-        rid = str(bootstrap[0].get("request_id") or "")
-        cts = bootstrap[0].get("created_at") or 0
-        if rid:
-            seen_ids[f"{rid}|{cts}"] = None
-    _emit(
-        f"watch: 每 {interval}s 轮询 proxy_request_logs"
-        f"{'（仅失败）' if fails_only else ''}"
-        f"{' provider~' + prov if prov else ''}"
+    th = r.get("thinking") or {}
+    th_str = th.get("verdict") or th.get("status", "skipped")
+    mc = r.get("model_consistency") or {}
+    mc_str = mc.get("match", "not_run")
+
+    auth = r.get("authenticity") or {}
+    av = auth.get("verdict", "inconclusive")
+    cp = auth.get("crosspack") or {}
+    cp_str = "suspicious" if cp.get("suspicious") else "clean"
+    ts = auth.get("thinking_signature") or {}
+    sig = ts.get("has_valid_signature")
+    sig_str = {True: "present", False: "missing", None: "none"}.get(sig, "none")
+    uc = auth.get("usage_consistency") or {}
+    uc_str = "suspicious" if uc.get("suspicious") else "ok"
+
+    verdict = (r.get("summary") or {}).get("verdict", "unknown")
+    lines = [
+        f"### CC-Pulse Relay Card — `{prov}` / `{model}`",
+        "",
+        "| Check | Result |",
+        "|---|---|",
+        f"| Overall Verdict | **{verdict}** |",
+        f"| Protocol / Backend | `{proto}` / `{bo_str}` |",
+        f"| Text / Streaming | `{t_str}` / `{s_str}` |",
+        f"| Model Routing | `{mc_str}` |",
+        f"| Tools / Thinking | `{tools_str}` / `{th_str}` |",
+        f"| Authenticity | **{av}** (crosspack=`{cp_str}`, sig=`{sig_str}`, usage=`{uc_str}`) |",
+    ]
+    ev = auth.get("evidence") or []
+    if ev and av == "suspicious":
+        lines.append(f"| Alerts | {_sanitize_for_terminal('；'.join(ev))[:120]} |")
+    lines.append("")
+    lines.append(
+        "_Generated by [CC-Pulse](https://github.com/mengyuchun/cc-pulse) (zero-secret sanitized card)_"
     )
-    _emit(f"从 created_at>{last_ts} 开始；Ctrl+C 结束\n")
-    try:
-        while True:
-            try:
-                # 突发补拉：拉 200 条兜住重度 agent 会话一秒内 >50 行的尖峰
-                rows = query_proxy_logs(
-                    args.db,
-                    since_ts=int(last_ts) if last_ts else None,
-                    limit=200,
-                    fails_only=fails_only,
-                    provider_substr=prov,
-                )
-            except sqlite3.Error as e:  # SQLITE_BUSY / 文件短暂锁 → 下一轮重试
-                say(f"（读取日志失败，{interval}s 后重试: {e}）")
-                time.sleep(interval)
-                continue
-            # query 是 DESC；反转让旧的先打
-            new_rows = _filter_new_watch_rows(list(reversed(rows)), last_ts, seen_ids)
-            for r in new_rows:
-                rid = str(r.get("request_id") or "")
-                cts = r.get("created_at") or 0
-                seen_ids[f"{rid}|{cts}"] = None
-                _emit_row(r)
-                if r.get("created_at") and r["created_at"] > last_ts:
-                    last_ts = r["created_at"]
-            # 防止 seen 无限涨：用 dict 保插入顺序，截断最近 2000 条
-            if len(seen_ids) > 5000:
-                seen_ids = dict(list(seen_ids.items())[-2000:])
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        say("\nwatch 已停止")
-        return 0
+    return "\n".join(lines)
 
 
-# ---------- analyze：多维聚合分析（只读，纯内存计算） ----------
-
-
-def _color_rate(rate: float) -> str:
-    """成功率带色：≥0.95 绿 / ≥0.80 黄 / <0.80 红。"""
-    s = f"{rate * 100:.0f}%"
-    if rate >= 0.95:
-        return _c(s, "green")
-    if rate >= 0.80:
-        return _c(s, "yellow")
-    return _c(s, "red", "bold")
-
-
-def _fmt_ms(v) -> str:
-    return f"{v:.0f}ms" if isinstance(v, (int, float)) else "-"
-
-
-def run_analyze(args, say) -> int:
-    """analyze 子命令：默认全维度报表，可用 --mode 选单个维度。"""
-    since_ts, error_code = _resolve_since_or_fail(args, say)
-    if error_code is not None:
-        return error_code
-    id_map = load_provider_id_map(args.db)
-    rows = query_analyze_raw(args.db, since_ts=since_ts)
-    mode = getattr(args, "mode", "all") or "all"
-    prov = getattr(args, "provider", None) or None
-
-    report: dict = {
-        "schema_version": 1,
-        "command": "analyze",
-        "since": getattr(args, "since", None),
-        "mode": mode,
-        "provider": prov,
-        "row_count": len(rows),
-    }
-    if mode in ("all", "provider-day"):
-        report["by_provider_day"] = analyze_by_provider_day(rows, id_map)
-    if mode in ("all", "model"):
-        report["by_model"] = analyze_by_model(rows)
-    if mode in ("all", "day"):
-        report["by_day"] = analyze_by_day(rows)
-    if prov and mode in ("all", "provider"):
-        report["provider_deep"] = analyze_provider_deep(rows, prov, id_map)
-
-    if getattr(args, "json", False):
-        print(json.dumps(report, ensure_ascii=False, indent=2, default=str), flush=True)
-        return 0
-
-    say(
-        f"analyze: {len(rows)} 条记录"
-        f"{' since=' + str(args.since) if getattr(args, 'since', None) else ''}"
-        f"  mode={mode}"
-        f"{'  provider~' + prov if prov else ''}"
-    )
-    if not rows:
-        say("（该时间窗内无记录）")
-        return 0
-
-    # ---- by_day ----
-    if "by_day" in report:
-        by_day = report["by_day"]
-        _say_colored(
-            _c(
-                "\n[按天] 日期 · 请求 · 成功率 · 独立供应商 · p50/p95 延迟 · 主失败因",
-                "bold",
-            )
-        )
-        say("-" * 90)
-        rates = [d["success_rate"] for d in by_day]
-        p50s = [d["lat_p50"] or 0 for d in by_day]
-        for d in by_day:
-            rate_c = _color_rate(d["success_rate"])
-            cat = d.get("top_fail_category") or "-"
-            cat_c = _c(cat[:20], "red") if cat != "-" else cat[:20]
-            _say_colored(
-                f"  {d['date']}  {d['total']:5d}  {rate_c:>7}  "
-                f"prov={d['unique_providers']:2d}  "
-                f"p50={_fmt_ms(d['lat_p50']):>7}  p95={_fmt_ms(d['lat_p95']):>7}  {cat_c}"
-            )
-        if len(by_day) >= 2:
-            spark_rate = _sparkline(rates, width=min(30, len(rates)))
-            spark_lat = _sparkline(p50s, width=min(30, len(p50s)))
-            say(f"  成功率趋势 {spark_rate}   p50 延迟 {spark_lat}")
-
-    # ---- by_model ----
-    if "by_model" in report:
-        by_model = report["by_model"][:20]
-        _say_colored(
-            _c(
-                "\n[按模型] 模型 · 请求 · 成功率 · p50/p95/p99 延迟 · 平均 tokens(in/out)",
-                "bold",
-            )
-        )
-        say("-" * 100)
-        for m in by_model:
-            rate_c = _color_rate(m["success_rate"])
-            mname = _sanitize_for_terminal(str(m["model"])[:36])
-            avg_in = m.get("avg_input_tokens")
-            avg_out = m.get("avg_output_tokens")
-            tok = (
-                f"{avg_in:.0f}/{avg_out:.0f}"
-                if avg_in is not None and avg_out is not None
-                else "-"
-            )
-            _say_colored(
-                f"  {mname:36} {m['total']:6d}  {rate_c:>7}  "
-                f"p50={_fmt_ms(m['lat_p50']):>7} p95={_fmt_ms(m['lat_p95']):>7} p99={_fmt_ms(m['lat_p99']):>7}  "
-                f"tok={tok}"
-            )
-
-    # ---- by_provider_day ----
-    if "by_provider_day" in report:
-        bpd = report["by_provider_day"]
-        _say_colored(
-            _c("\n[供应商 × 日期] 每格显示成功率；(总/失败) 汇总在最右列", "bold")
-        )
-        say("-" * 100)
-        days = bpd["days"]
-        if len(days) > 14:
-            days_show = days[-14:]
-        else:
-            days_show = days
-        head_days = " ".join(f"{d[-5:]:>7}" for d in days_show)  # MM-DD
-        _say_colored(_c(f"  {'供应商':24} {head_days}   {'总计':>10}", "dim"))
-        for pcell in bpd["providers"]:
-            pname = _sanitize_for_terminal(pcell["provider_name"][:24])
-            cells_str = []
-            for d in days_show:
-                idx = days.index(d)
-                c = pcell["days"][idx]
-                if c is None:
-                    cells_str.append(f"{_c('  -  ', 'dim'):>7}")
-                else:
-                    cells_str.append(f"{_color_rate(c['success_rate']):>7}")
-            rt = pcell["row_totals"]
-            tot_c = _color_rate(rt["success_rate"])
-            _say_colored(
-                f"  {pname:24} {' '.join(cells_str)}   {rt['total']:5d}/{rt['fail']:<3d} {tot_c}"
-            )
-        if len(days) > len(days_show):
-            say(
-                f"  （仅显示最近 {len(days_show)} 天；全量共 {len(days)} 天，见 --json）"
-            )
-
-    # ---- provider_deep ----
-    if report.get("provider_deep"):
-        pd = report["provider_deep"]
-        _say_colored(
-            _c(
-                f"\n[供应商深度] provider~'{prov}'  匹配={len(pd['match_provider_ids'])}"
-                f"  总请求={pd['total']}",
-                "bold",
-            )
-        )
-        if pd["match_provider_names"]:
-            say(f"  命中: {', '.join(pd['match_provider_names'])}")
-        say("-" * 90)
-        if pd["by_model"]:
-            _say_colored(_c("  · 按模型", "dim"))
-            for m in pd["by_model"][:10]:
-                rate_c = _color_rate(m["success_rate"])
-                mname = _sanitize_for_terminal(str(m["model"])[:36])
-                _say_colored(
-                    f"    {mname:36} {m['total']:5d}  {rate_c:>7}  "
-                    f"p50={_fmt_ms(m['lat_p50']):>7} p95={_fmt_ms(m['lat_p95']):>7}"
-                )
-        if pd["by_day"]:
-            _say_colored(_c("  · 按天", "dim"))
-            for d in pd["by_day"]:
-                _say_colored(
-                    f"    {d['date']}  {d['total']:5d}  {_color_rate(d['success_rate']):>7}  "
-                    f"p50={_fmt_ms(d['lat_p50']):>7}"
-                )
-
-    return 0
+# ---------- 辅助摘要（--with-history 可选使用） ----------
 
 
 def format_history_sidebar(db_path: str, provider_name: str, since: str = "24h") -> str:
@@ -2150,14 +1467,8 @@ SUBCOMMANDS = (
     "check",
     "list-models",
     "inspect",
-    "history",
-    "stats",
-    "routing",
-    "watch",
-    "analyze",
     "env-check",
     "trend",
-    "health",
 )
 # 主解析器上带值的全局选项：扫描子命令时要连它的值一起跳过，
 # 否则 `--db list-models` 这类会把选项的值误认成子命令。
@@ -2216,6 +1527,12 @@ def _make_common(suppress_defaults: bool):
         "--db", default=dflt(DB_PATH), help=f"cc-switch.db 路径 (默认: {DB_PATH})"
     )
     common.add_argument(
+        "--no-db",
+        action="store_true",
+        default=dflt(False),
+        help="不读取 cc-switch.db（仅用独立配置或 --base-url）",
+    )
+    common.add_argument(
         "--skip-tls-verify",
         action="store_true",
         default=dflt(False),
@@ -2242,13 +1559,39 @@ def _make_common(suppress_defaults: bool):
     return common
 
 
+def _add_standalone_endpoint_args(parser, *, include_model: bool = True) -> None:
+    """为 check / list-models / inspect 挂载无 DB 独立单端点参数。"""
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="独立模式：直接指定供应商 base_url（无需 cc-switch.db）",
+    )
+    parser.add_argument(
+        "--api-key-env",
+        default=None,
+        help="独立模式：存放 API Key 的环境变量名（如 ANTHROPIC_AUTH_TOKEN；避免明文密钥进命令历史）",
+    )
+    parser.add_argument(
+        "--protocol",
+        default=None,
+        choices=["anthropic", "openai_chat", "openai_responses"],
+        help="独立模式：显式指定协议（anthropic / openai_chat / openai_responses）",
+    )
+    if include_model:
+        parser.add_argument(
+            "--model",
+            default=None,
+            help="独立模式：指定单个模型 ID（配合 --base-url 使用）",
+        )
+
+
 def _build_parser():
-    """构造 argparse，公共选项 + 三个子命令：check / list-models / inspect。"""
+    """构造 argparse，公共选项 + 核心子命令：check / list-models / inspect / env-check / trend。"""
     common = _make_common(suppress_defaults=True)  # 子解析器共用
     root_common = _make_common(suppress_defaults=False)  # 主解析器，提供真实默认值
 
     ap = argparse.ArgumentParser(
-        description="CC-Pulse：cc-switch 供应商健康检测与单模型深度诊断",
+        description="CC-Pulse：Claude Code / 编程代理中转站可用性与真实性 CLI 哨兵",
         parents=[root_common],
     )
     sub = ap.add_subparsers(dest="command")
@@ -2330,8 +1673,9 @@ def _build_parser():
         "--alert-threshold",
         type=float,
         default=None,
-        help="可用率告警阈值（0-1，如 0.8 表示低于 80% 告警）；cron 巡检可据此触发",
+        help="可用率告警阈值（0-1，如 0.8 表示低于 80%% 告警）；触发时返回退出码 1",
     )
+    _add_standalone_endpoint_args(p_check, include_model=True)
 
     # list-models：拉取供应商 /v1/models
     p_lm = sub.add_parser(
@@ -2368,12 +1712,7 @@ def _build_parser():
     p_lm.add_argument(
         "--probe",
         action="store_true",
-        help="对每个模型发轻量探测（2+3 算术题），验证是否真能用",
-    )
-    p_lm.add_argument(
-        "--deep",
-        action="store_true",
-        help="深度探测每个模型（text/streaming/metadata/thinking/tools 五维度；较慢）",
+        help="对每个模型发轻量探测（动态算术题），验证是否真能用",
     )
     p_lm.add_argument(
         "--source",
@@ -2384,7 +1723,7 @@ def _build_parser():
     p_lm.add_argument(
         "--json",
         action="store_true",
-        help="以 JSON 输出模型目录（含 --probe/--deep 探测结果）",
+        help="以 JSON 输出模型目录（含 --probe 探测结果）",
     )
     p_lm.add_argument(
         "--probe-max-tokens",
@@ -2397,6 +1736,7 @@ def _build_parser():
         action="store_true",
         help="允许探测请求走 thinking 模式（默认禁用，避免 DeepSeek 等 thinking 模型耗光 max_tokens）",
     )
+    _add_standalone_endpoint_args(p_lm, include_model=True)
 
     # inspect：单一模型深度检测
     p_inspect = sub.add_parser(
@@ -2405,7 +1745,7 @@ def _build_parser():
     p_inspect.add_argument(
         "--provider",
         default=None,
-        help="供应商名称（与 cc-switch 中一致）；--compare 时可选",
+        help="供应商名称（与配置中一致）；--compare / --base-url 时可选",
     )
     p_inspect.add_argument(
         "--select",
@@ -2431,7 +1771,7 @@ def _build_parser():
         "--source",
         default="configured",
         choices=["configured", "listed", "manual"],
-        help="模型来源：configured(cc-switch 配置)、"
+        help="模型来源：configured(配置)、"
         "listed(供应商 /v1/models 声明)、manual(强制) (默认: configured)",
     )
     p_inspect.add_argument(
@@ -2449,22 +1789,15 @@ def _build_parser():
         "--include",
         default=None,
         help="要执行的检查项，逗号分隔；支持：text,streaming,"
-        "model-consistency,protocol,error-classification,metadata,thinking,tools,vision,cache-replay,knowledge-cutoff,js-fingerprint。"
-        "默认全开（不含 vision/cache-replay/knowledge-cutoff/js-fingerprint）；--compare 默认仅 text,streaming。"
-        "cache-replay=temp=1 双发查缓存回放/钳温（2 次额外请求）；"
-        "knowledge-cutoff=before/after 题库查模型版本/世代（6 次额外请求）；"
-        "js-fingerprint=单 token 随机数分布指纹 JSD（默认 --js-samples 50 次额外请求）",
+        "model-consistency,protocol,error-classification,metadata,context,thinking,tools,vision,cache-replay。"
+        "默认全开（不含 context/vision/cache-replay）；--compare 默认仅 text,streaming。"
+        "context=主动发送 512k/1m 上下文冒烟；"
+        "cache-replay=temp=1 双发高熵开放式 prompt 查缓存回放/钳温（2 次额外请求）",
     )
     p_inspect.add_argument(
         "--auth-full",
         action="store_true",
-        help="追加完整保真探针：缓存回放、知识截止、分布指纹；不覆盖 --include",
-    )
-    p_inspect.add_argument(
-        "--js-samples",
-        type=int,
-        default=50,
-        help="js-fingerprint 采样次数（默认 50；建议 ≥200 高置信，<20 不判定）",
+        help="追加可选保真探针（cache-replay）；不覆盖 --include",
     )
     p_inspect.add_argument(
         "--ttft-timeout",
@@ -2481,7 +1814,7 @@ def _build_parser():
         "--probe-context",
         choices=["512k", "1m"],
         default="512k",
-        help="上下文窗口探测档位：512k（默认）或 1m；仅在元数据无声明时触发",
+        help="上下文窗口探测档位：512k（默认）或 1m；配合 --include context 使用",
     )
     p_inspect.add_argument(
         "--human",
@@ -2491,9 +1824,9 @@ def _build_parser():
     p_inspect.add_argument(
         "--format",
         default=None,
-        choices=["human", "json"],
+        choices=["human", "json", "card"],
         dest="output_format",
-        help="输出格式：human / json（显式 --format 优先于 --human）",
+        help="输出格式：human / json / card（脱敏 Markdown 战报卡；显式 --format 优先于 --human）",
     )
     p_inspect.add_argument(
         "--compare",
@@ -2549,77 +1882,12 @@ def _build_parser():
         action="store_true",
         help="允许探测请求走 thinking 模式（默认禁用，避免 DeepSeek 等 thinking 模型耗光 max_tokens）",
     )
-
-    # history / stats / routing：只读日志，不发 HTTP
-    p_hist = sub.add_parser(
-        "history", parents=[common], help="读取 cc-switch 代理请求日志（最近 N 条）"
-    )
-    p_hist.add_argument("--limit", type=int, default=20, help="条数（默认 20）")
-    p_hist.add_argument("--fails", action="store_true", help="只显示失败记录")
-    p_hist.add_argument("--since", default=None, help="时间窗口：24h / 7d / 30m / 秒数")
-    p_hist.add_argument("--provider", default=None, help="按供应商名子串过滤")
-    p_hist.add_argument("--json", action="store_true", help="JSON 输出")
-    p_hist.add_argument(
-        "--log-file",
-        default=None,
-        help="可选：额外打印磁盘日志尾部（如 ~/.cc-switch/logs/cc-switch.log）",
-    )
-    p_hist.add_argument(
-        "--log-lines", type=int, default=50, help="磁盘日志尾部行数（默认 50）"
-    )
-    p_hist.add_argument("--log-keyword", default=None, help="磁盘日志关键词过滤")
-
-    p_stats = sub.add_parser(
-        "stats", parents=[common], help="按供应商汇总成功率/延迟/路由不一致/成本"
-    )
-    p_stats.add_argument("--since", default="7d", help="时间窗口（默认 7d）")
-    p_stats.add_argument(
-        "--include-deleted", action="store_true", help="包含已从 cc-switch 删除的供应商"
-    )
-    p_stats.add_argument("--json", action="store_true", help="JSON 输出")
-
-    p_route = sub.add_parser(
-        "routing",
-        parents=[common],
-        help="静默路由排行（request_model => actual model）",
-    )
-    p_route.add_argument("--since", default="7d", help="时间窗口（默认 7d）")
-    p_route.add_argument("--limit", type=int, default=20, help="显示条数（默认 20）")
-    p_route.add_argument("--json", action="store_true", help="JSON 输出")
-
-    p_watch = sub.add_parser(
-        "watch",
-        parents=[common],
-        help="实时轮询 proxy_request_logs，有新记录就打印（Ctrl+C 结束）",
-    )
-    p_watch.add_argument("--interval", type=int, default=3, help="轮询间隔秒（默认 3）")
-    p_watch.add_argument("--fails", action="store_true", help="只显示失败")
-    p_watch.add_argument("--provider", default=None, help="按供应商名子串过滤")
-    p_watch.add_argument(
-        "--json",
-        action="store_true",
-        help='NDJSON 流输出（每行一个 {"event":"row",...} 到 stdout，人类进度走 stderr）',
-    )
-
-    p_analyze = sub.add_parser(
-        "analyze", parents=[common], help="多维度聚合分析（按天/模型/供应商交叉）"
-    )
-    p_analyze.add_argument("--since", default="7d", help="时间窗口（默认 7d）")
-    p_analyze.add_argument(
-        "--mode",
-        default="all",
-        choices=["all", "day", "model", "provider-day", "provider"],
-        help="分析维度（默认 all 全部）",
-    )
-    p_analyze.add_argument(
-        "--provider", default=None, help="单供应商深度（--mode provider 或 all 时生效）"
-    )
-    p_analyze.add_argument("--json", action="store_true", help="JSON 输出")
+    _add_standalone_endpoint_args(p_inspect, include_model=False)
 
     p_env = sub.add_parser(
         "env-check",
         parents=[common],
-        help="检测环境变量是否覆盖 cc-switch 所选供应商（静默路由排查）",
+        help="检测环境变量是否覆盖本地/cc-switch 所选供应商（零 Key 零 DB 可运行）",
     )
     p_env.add_argument("--json", action="store_true", help="JSON 输出")
 
@@ -2645,204 +1913,84 @@ def _build_parser():
     )
     p_trend.add_argument("--json", action="store_true", help="JSON 输出")
 
-    p_health = sub.add_parser(
-        "health",
-        parents=[common],
-        help="读 cc-switch 被动流量健康度（provider_health，非主动探测）",
-    )
-    p_health.add_argument("--json", action="store_true", help="JSON 输出")
-
-    p_deep = sub.add_parser(
-        "deep-dive",
-        parents=[common],
-        help="从 check JSON 批量深挖失败/可用供应商（下沉自 PS1，CI 可串联）",
-    )
-    p_deep.add_argument(
-        "--from",
-        dest="from_file",
-        required=True,
-        help="check JSON 文件路径，或 - 读 stdin",
-    )
-    p_deep.add_argument(
-        "--target",
-        default="fail",
-        choices=["fail", "ok", "both"],
-        help="深挖目标：fail/ok/both（默认 fail）",
-    )
-    p_deep.add_argument(
-        "--models", default=None, help="指定模型（逗号分隔，默认全部去重）"
-    )
-    p_deep.add_argument("--yes", action="store_true", help="跳过容量确认（>20 组合时）")
-    p_deep.add_argument(
-        "--json", action="store_true", help="只输出任务列表 JSON 不执行"
-    )
-
     # 兜底默认（注入 check 后子解析器会覆盖这些）
     ap.set_defaults(command="check", type="claude", failover_only=False, json=False)
-    return ap, common, p_check, p_lm, p_inspect, p_hist, p_stats, p_route, p_watch
+    return ap, common, p_check, p_lm, p_inspect, p_env, p_trend
 
 
-def run_deep_dive(args, say) -> int:
-    """从 check JSON 读结果，对失败/可用供应商批量深挖（逐个调 inspect）。
-
-    下沉自 PS1 的 Ask-DeepDive/Invoke-DeepDive，让 CI 可串联
-    `ccpulse check --json | ccpulse deep-dive --from - --target fail`。
-    """
-    src = args.from_file
-    try:
-        if src == "-":
-            data = json.load(sys.stdin)
-        else:
-            with open(src, encoding="utf-8") as f:
-                data = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        say(f"读取 check JSON 失败: {e}")
-        return 2
-    providers = data.get("providers") or []
-    if not providers:
-        say("check JSON 无 providers")
-        return 2
-
-    # 过滤目标供应商
-    target = (args.target or "fail").lower()
-    if target == "fail":
-        targets = [p for p in providers if not p.get("overall_ok")]
-    elif target == "ok":
-        targets = [p for p in providers if p.get("overall_ok")]
-    elif target == "both":
-        targets = list(providers)
+def _resolve_manual_endpoint_provider(args, say) -> Provider | None:
+    """独立模式（--base-url）：仅从环境变量读密钥并构造 Provider，绝不接收明文密钥参数。"""
+    base_url = getattr(args, "base_url", None)
+    if not base_url:
+        return None
+    env_name = getattr(args, "api_key_env", None)
+    api_key = ""
+    if env_name:
+        api_key = os.environ.get(env_name, "").strip()
+        if not api_key:
+            say(f"环境变量 {env_name} 未设置或为空（请先 export {env_name}=...）")
+            return None
     else:
-        say(f"未知 --target: {target}（fail/ok/both）")
-        return 2
-    if not targets:
-        say(f"无符合的供应商（target={target}）")
-        return 0
+        for cand in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+            val = os.environ.get(cand, "").strip()
+            if val:
+                api_key = val
+                break
+        if not api_key:
+            say(
+                "独立模式需要 API Key：请设置 ANTHROPIC_AUTH_TOKEN / OPENAI_API_KEY 或传 --api-key-env ENV_VAR"
+            )
+            return None
 
-    # 去重模型（attempts[].model）
-    seen: dict[str, bool] = {}
-    all_models: list[str] = []
-    for p in targets:
-        for a in p.get("attempts") or []:
-            m = a.get("model")
-            if m and m not in seen:
-                seen[m] = True
-                all_models.append(m)
-    if args.models:
-        sel = {m.strip() for m in args.models.split(",") if m.strip()}
-        models = [m for m in all_models if m in sel] or list(sel)
-    else:
-        models = all_models
-    if not models:
-        say("无候选模型")
-        return 0
-
-    # 任务列表：每家供应商只测它自己 attempts 里出现过的、且被选中的模型
-    # （交集，非笛卡尔积——与 PS1 Invoke-DeepDive 37837e5 一致，避免测没配的模型白吃 403）
-    sel_set = (
-        {m.strip() for m in args.models.split(",") if m.strip()}
-        if args.models
-        else None
+    app_type = getattr(args, "type", "claude")
+    if app_type == "all":
+        app_type = "claude"
+    proto_arg = getattr(args, "protocol", None)
+    proto_map = {
+        "anthropic": Protocol.ANTHROPIC_MESSAGES,
+        "openai_chat": Protocol.OPENAI_CHAT_COMPLETIONS,
+        "openai_responses": Protocol.OPENAI_RESPONSES,
+    }
+    proto = proto_map.get(proto_arg, Protocol.UNKNOWN)
+    if proto == Protocol.OPENAI_CHAT_COMPLETIONS and app_type == "claude":
+        pass
+    elif proto == Protocol.OPENAI_RESPONSES and app_type == "claude":
+        app_type = "codex"
+    model = (getattr(args, "model", None) or "").strip()
+    if not model:
+        for m_env in (
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_MODEL",
+            "OPENAI_MODEL",
+        ):
+            v = os.environ.get(m_env, "").strip()
+            if v:
+                model = v
+                break
+    if not model:
+        model = (
+            "gpt-4o"
+            if proto in (Protocol.OPENAI_CHAT_COMPLETIONS, Protocol.OPENAI_RESPONSES)
+            or app_type == "codex"
+            else "claude-sonnet-4-5"
+        )
+    auth_mode = (
+        "authtoken"
+        if (env_name == "ANTHROPIC_AUTH_TOKEN" or proto == Protocol.ANTHROPIC_MESSAGES)
+        else "bearer"
     )
-    tasks = []
-    for p in targets:
-        prov_models = {
-            a.get("model") for a in (p.get("attempts") or []) if a.get("model")
-        }
-        for m in prov_models:
-            if sel_set is None or m in sel_set:
-                tasks.append((p["name"], p.get("type", "claude"), m))
-    if not tasks:
-        say("选中供应商均无选中模型")
-        return 0
-
-    # --json 只输出任务列表（dry-run），不执行；dry-run 不受执行容量确认阻断。
-    if args.json:
-        print(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "command": "deep-dive",
-                    "target": target,
-                    "tasks": [
-                        {"provider": p, "type": t, "model": m} for p, t, m in tasks
-                    ],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            flush=True,
-        )
-        return 0
-
-    # 容量保护只约束真正执行，避免非 TTY dry-run 空 stdout。
-    if len(tasks) > 20 and not args.yes:
-        est_min = len(tasks) * 35 // 60
-        say(
-            f"⚠ 组合数较多（{len(tasks)} 个），预计约 {est_min} 分钟。加 --yes 跳过确认。"
-        )
-        if not sys.stdin.isatty():
-            say("非交互环境，加 --yes 确认执行。")
-            return 0
-        try:
-            ans = input("继续？[y/N] ").strip().lower()
-        except EOFError:
-            say("非交互环境，未确认执行。")
-            return 0
-        if ans != "y":
-            say("已取消")
-            return 0
-
-    say(f"深挖: {len(targets)} 家供应商 × {len(models)} 模型 = {len(tasks)} 个组合")
-    script = str(Path(__file__).resolve())
-    overall = 0
-    for pname, ptype, model in tasks:
-        say(f"\n{'=' * 60}")
-        say(f"  深挖: {pname} ({ptype})  Model: {model}")
-        say(f"{'=' * 60}")
-        cmd = [
-            sys.executable,
-            script,
-            "inspect",
-            "--provider",
-            pname,
-            "--model",
-            model,
-            "--source",
-            "manual",
-            "--type",
-            ptype,
-            "--db",
-            args.db,
-            "--timeout",
-            str(args.timeout),
-            "--workers",
-            "1",
-            "--human",
-        ]
-        # 透传探测环境变量，让 deep-dive 与 check 用同一指纹（不然自签名站 check
-        # 过 deep-dive 必挂；UA 严格校验站深挖结论会与体检矛盾）
-        if getattr(args, "user_agent", None):
-            cmd += ["--user-agent", args.user_agent]
-        if getattr(args, "skip_tls_verify", False):
-            cmd += ["--skip-tls-verify"]
-        if getattr(args, "retry", 0):
-            cmd += ["--retry", str(args.retry)]
-        if getattr(args, "probe_max_tokens", None):
-            cmd += ["--probe-max-tokens", str(args.probe_max_tokens)]
-        if getattr(args, "probe_enable_thinking", False):
-            cmd += ["--probe-enable-thinking"]
-        if getattr(args, "stainless_version", None):
-            cmd += ["--stainless-version", args.stainless_version]
-        # 透传 --include / --auth-full：check 默认会带 include，深挖应一致；
-        # --auth-full 让 inspect 加 cache-replay/knowledge-cutoff/js-fingerprint
-        if getattr(args, "include", None):
-            cmd += ["--include", args.include]
-        if getattr(args, "auth_full", False):
-            cmd += ["--auth-full"]
-        rc = subprocess.call(cmd)
-        if rc != 0 and overall == 0:
-            overall = 1
-    return overall
+    if env_name == "ANTHROPIC_API_KEY":
+        auth_mode = "apikey"
+    return build_manual_provider(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        app_type=app_type,
+        name=getattr(args, "provider", None) or "manual",
+        auth_mode=auth_mode,
+        protocol=proto,
+    )
 
 
 def main():
@@ -2891,14 +2039,6 @@ def _main_with_args(args) -> int:
     if args.command == "trend":
         return run_trend(args, say)
 
-    # deep-dive：从 check JSON 读，不需要加载 cc-switch providers（自己 subprocess 调 inspect）
-    if args.command == "deep-dive":
-        return run_deep_dive(args, say)
-
-    if not Path(args.db).exists():
-        say(f"数据库不存在: {args.db}")
-        return 2
-
     # --archive 路径安全检查：复用 archive_path() 单一校验源，提前失败给清晰退出码
     if getattr(args, "archive", None):
         from ccpulse_archive import archive_path as _archive_path
@@ -2909,28 +2049,61 @@ def _main_with_args(args) -> int:
             print(f"错误: {exc}", file=sys.stderr)
             return 2
 
-    # 纯日志子命令：不加载 providers、不发 HTTP
-    if args.command == "history":
-        return run_history(args, say)
-    if args.command == "stats":
-        return run_stats(args, say)
-    if args.command == "routing":
-        return run_routing(args, say)
-    if args.command == "watch":
-        return run_watch(args, say)
-    if args.command == "analyze":
-        return run_analyze(args, say)
-    if args.command == "health":
-        return run_health(args, say)
+    no_db = bool(getattr(args, "no_db", False))
+    db_exists = Path(args.db).exists()
+    explicit_db = str(args.db) != str(DB_PATH)
+
+    # env-check：零 Key 零 DB 即可运行（有 DB 读 DB，无 DB 自动读原生配置）
+    if args.command == "env-check":
+        env_providers = []
+        if not no_db and db_exists:
+            for t in ("claude", "codex", "openclaw"):
+                env_providers.extend(load_providers(args.db, t))
+        return run_env_check(args, env_providers, say)
 
     types = (
         ["claude", "codex", "openclaw"]
         if getattr(args, "type", "claude") == "all"
         else [getattr(args, "type", "claude")]
     )
+
+    # 独立单端点模式（--base-url）优先，不依赖 cc-switch.db
     providers = []
-    for t in types:
-        providers.extend(load_providers(args.db, t))
+    if getattr(args, "base_url", None):
+        manual_p = _resolve_manual_endpoint_provider(args, say)
+        if manual_p is None:
+            return 2
+        providers = [manual_p]
+        args._config_source_label = "手动端点 (--base-url)"
+        if args.command == "inspect" and not getattr(args, "provider", None):
+            args.provider = manual_p.name
+            if not getattr(args, "all_models", False) and not getattr(
+                args, "models", None
+            ):
+                args.source = "manual"
+    elif not no_db and db_exists:
+        for t in types:
+            providers.extend(load_providers(args.db, t))
+        args._config_source_label = args.db
+    elif explicit_db and not no_db:
+        say(f"数据库不存在: {args.db}")
+        return 2
+    else:
+        standalone = load_standalone_providers()
+        if standalone:
+            providers = [p for p in standalone if p.app_type in types]
+            args._config_source_label = "独立配置 (~/.claude / ~/.codex / ~/.cc-pulse)"
+        else:
+            if not db_exists and not no_db:
+                say(
+                    f"数据库不存在: {args.db}；且未发现 ~/.claude/settings.json、"
+                    "~/.codex/config.toml 或 ~/.cc-pulse/providers.toml（可用 --base-url + --api-key-env 直接测活）"
+                )
+            else:
+                say(
+                    "未发现可用独立配置（可用 --base-url + --api-key-env 或配置 ~/.cc-pulse/providers.toml）"
+                )
+            return 2
 
     if getattr(args, "current_only", False) and providers:
         before = len(providers)
@@ -2959,6 +2132,8 @@ def _main_with_args(args) -> int:
             before = len(providers)
             providers = [providers[i] for i in indices]
             say(f"--select: {before} -> {len(providers)}（交互式选择）")
+            if args.command == "inspect" and not getattr(args, "provider", None):
+                args.provider = providers[0].name
 
     # --compare 自带多 provider 目标，跳过全局 --provider 过滤以免裁掉对比对象
     if (
@@ -2989,9 +2164,6 @@ def _main_with_args(args) -> int:
 
     if args.command == "inspect":
         return run_inspect(args, providers, out_say)
-
-    if args.command == "env-check":
-        return run_env_check(args, providers, say)
 
     say(f"未知子命令: {args.command}")
     return 2

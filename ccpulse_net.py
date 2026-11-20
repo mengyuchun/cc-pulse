@@ -10,7 +10,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from ccpulse_output import _sanitize_for_terminal
@@ -145,6 +145,7 @@ def _sanitize_raw_body(body: str, api_key: str) -> str:
     mask = api_key[:show] + "***"
     if api_key in body:
         body = body.replace(api_key, mask)
+
     # JSON 字符串可能逐字符使用 \uXXXX，且可与明文混合；只匹配 key 的精确表示，
     # 不对普通文本整体解码，避免改写非 JSON 内容。
     def _unicode_escape_pattern(code_point: int) -> str:
@@ -160,9 +161,7 @@ def _sanitize_raw_body(body: str, api_key: str) -> str:
         for unit in code_units:
             hex_code = f"{unit:04x}"
             hex_pattern = "".join(
-                f"[{digit.lower()}{digit.upper()}]"
-                if digit in "abcdef"
-                else digit
+                f"[{digit.lower()}{digit.upper()}]" if digit in "abcdef" else digit
                 for digit in hex_code
             )
             escaped_units.append(chr(92) * 2 + "u" + hex_pattern)
@@ -182,9 +181,7 @@ def _sanitize_raw_body(body: str, api_key: str) -> str:
     def _percent_byte_pattern(byte: int) -> str:
         hex_code = f"{byte:02x}"
         hex_pattern = "".join(
-            f"[{digit.lower()}{digit.upper()}]"
-            if digit in "abcdef"
-            else digit
+            f"[{digit.lower()}{digit.upper()}]" if digit in "abcdef" else digit
             for digit in hex_code
         )
         encoded_byte = "%" + hex_pattern
@@ -256,6 +253,30 @@ class HttpResponse:
     error_category: str | None
     error_msg: str
     truncated: bool = False
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """拒绝自动跟随 3xx 重定向，防止把 x-api-key / Authorization 转发给恶意目标站。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_ORIG_URLOPEN = urllib.request.urlopen
+
+
+def open_url_no_redirect(
+    req: urllib.request.Request, *, timeout: int | float, context: ssl.SSLContext
+):
+    """打开 HTTP(S) 请求且禁用 3xx 自动重定向。"""
+    if urllib.request.urlopen is not _ORIG_URLOPEN:
+        return urllib.request.urlopen(req, timeout=timeout, context=context)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context),
+        _NoRedirectHandler(),
+    )
+    return opener.open(req, timeout=timeout)
 
 
 def _read_httperror_body(e: urllib.error.HTTPError) -> tuple[str, bytes]:
@@ -299,7 +320,7 @@ def _http_request(
     req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
     for attempt in range(max_retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            with open_url_no_redirect(req, timeout=timeout, context=ctx) as resp:
                 try:
                     raw = resp.read(2 << 20)  # 2MB 限长，防止异常响应耗尽内存
                 except http.client.IncompleteRead as e:
@@ -316,6 +337,11 @@ def _http_request(
                                 truncated = True
                         except ValueError:
                             pass
+                resp_headers = (
+                    {str(k).lower(): str(v) for k, v in resp.headers.items()}
+                    if resp.headers
+                    else {}
+                )
                 return HttpResponse(
                     status=resp.status,
                     body=raw.decode("utf-8", errors="replace"),
@@ -325,16 +351,23 @@ def _http_request(
                     ),
                     error_msg="响应不完整" if truncated else "",
                     truncated=truncated,
+                    headers=resp_headers,
                 )
         except urllib.error.HTTPError as e:
             # HTTPError 有 status code，不算连接层错误；不重试
             body_resp, _raw = _read_httperror_body(e)
+            err_headers = (
+                {str(k).lower(): str(v) for k, v in e.headers.items()}
+                if e.headers
+                else {}
+            )
             return HttpResponse(
                 status=e.code,
                 body=body_resp,
                 content_type=e.headers.get("Content-Type", "") if e.headers else "",
                 error_category=None,
                 error_msg="",
+                headers=err_headers,
             )
         except urllib.error.URLError as e:
             if attempt < max_retries:
@@ -343,15 +376,21 @@ def _http_request(
             return HttpResponse(
                 0, "", "", _error_category_for_urlerror(e), f"连接失败: {e.reason}"
             )
-        except (OSError, ssl.SSLError, ValueError) as e:
+        except TimeoutError as e:
             if attempt < max_retries:
                 time.sleep(1 + attempt)
                 continue
-            cat = (
-                _error_category_for_urlerror(e)
-                if _is_tls_error(e)
-                else ErrorCategory.UNKNOWN.value
-            )
+            return HttpResponse(0, "", "", ErrorCategory.NETWORK.value, f"超时: {e}")
+        except (http.client.HTTPException, OSError, ssl.SSLError, ValueError) as e:
+            if attempt < max_retries:
+                time.sleep(1 + attempt)
+                continue
+            if _is_tls_error(e):
+                cat = _error_category_for_urlerror(e)
+            elif isinstance(e, http.client.HTTPException):
+                cat = ErrorCategory.NETWORK.value
+            else:
+                cat = ErrorCategory.UNKNOWN.value
             return HttpResponse(0, "", "", cat, f"异常: {type(e).__name__}: {e}")
     # 不应走到这里，但防御性兜底
     return HttpResponse(0, "", "", ErrorCategory.UNKNOWN.value, "重试耗尽")
@@ -586,6 +625,8 @@ def _process_sse_event(
                         raw=j,
                     )
                 )
+            else:
+                on_event(StreamEvent(kind="message_start", model=j.get("model"), raw=j))
         elif "choices" in j:
             on_event(StreamEvent(kind="message_start", model=j.get("model"), raw=j))
     elif data and proto_name == "openai_responses":
@@ -605,9 +646,7 @@ def _process_sse_event(
             failure = failure if failure is not None else j.get("error")
             if isinstance(failure, dict):
                 failure = (
-                    failure.get("message")
-                    or failure.get("code")
-                    or failure.get("type")
+                    failure.get("message") or failure.get("code") or failure.get("type")
                 )
             failure = str(failure or "Responses response.failed")
             on_event(StreamEvent(kind="error", failure=failure, raw=j))
@@ -617,4 +656,3 @@ def _process_sse_event(
 
     # first_chunk 标记：on_event 由内部决定（已分类型处理）
     return False
-

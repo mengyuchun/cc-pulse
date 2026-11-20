@@ -45,7 +45,7 @@ _POOL_ANSWER = {p["q"]: p["a"] for p in mod.PROBE_PROMPTS}
 
 
 def _answer_for_body(j: dict) -> str:
-    """从请求体（Anthropic messages / Responses input）取问题，回配对答案，默认 "5"。"""
+    """从请求体（Anthropic messages / Responses input）取问题，动态计算或回配对答案。"""
     q = ""
     msgs = j.get("messages") or []
     if msgs and isinstance(msgs[0], dict):
@@ -59,7 +59,21 @@ def _answer_for_body(j: dict) -> str:
                     break
     if not q and isinstance(j.get("input"), str):
         q = j["input"]
-    return _POOL_ANSWER.get(q, "5")
+    if q in _POOL_ANSWER:
+        return _POOL_ANSWER[q]
+    import re as _re
+
+    nums = [int(x) for x in _re.findall(r"\d+", q)]
+    if len(nums) >= 2:
+        if any(k in q for k in ("minus", "减", "-")):
+            return str(nums[0] - nums[1])
+        if any(k in q for k in ("times", "Multiply", "乘", "*")):
+            return str(nums[0] * nums[1])
+        if any(k in q for k in ("divided", "除", "/")):
+            return str(nums[0] // nums[1]) if nums[1] else "0"
+        if any(k in q for k in ("plus", "加", "+")):
+            return str(nums[0] + nums[1])
+    return "5"
 
 
 PASSED = []
@@ -264,15 +278,15 @@ test(
 )
 _auth_args = types.SimpleNamespace(include=None, auth_full=True)
 test(
-    "auth-full 在默认维度上追加三个保真探针",
+    "auth-full 在默认维度上追加 cache-replay 探针",
     mod._resolve_inspect_include(_auth_args, mod._INSPECT_DEFAULT_INCLUDE)
-    >= {"cache-replay", "knowledge-cutoff", "js-fingerprint", "text"},
+    >= {"cache-replay", "text"},
 )
 _auth_custom_args = types.SimpleNamespace(include="text,tools", auth_full=True)
 test(
     "auth-full 保留显式 include",
     mod._resolve_inspect_include(_auth_custom_args, mod._INSPECT_DEFAULT_INCLUDE)
-    == {"text", "tools", "cache-replay", "knowledge-cutoff", "js-fingerprint"},
+    == {"text", "tools", "cache-replay"},
 )
 _parser, *_ = mod._build_parser()
 _auth_cli_args = _parser.parse_args(
@@ -307,16 +321,12 @@ _h_auth_on = mod.format_inspect_human(
         "authenticity": {
             "verdict": "clean",
             "cache_replay": {"note": "双发答案不同，无回放"},
-            "knowledge_cutoff": {"note": "before 全对 / after 全对"},
-            "js_fingerprint": {"note": "JSD=0.12，符合 LLM 偏置特征"},
         },
     }
 )
 test(
     "human 已启用的 P2 探针结果显示 note 且无提示行",
     "缓存回放：双发答案不同" in _h_auth_on
-    and "知识截止：before 全对" in _h_auth_on
-    and "分布指纹：JSD" in _h_auth_on
     and "提示：使用 --auth-full" not in _h_auth_on,
     f"out={_h_auth_on[-400:]}",
 )
@@ -1435,38 +1445,8 @@ try:
         all("streaming" not in m for m in models),
     )
     test(
-        "list-models --probe deep 标记为 False",
-        (j.get("probe") or {}).get("deep") is False,
-    )
-finally:
-    srv.shutdown()
-
-
-print("\n[End-to-end] list-models --deep 深度探测（12356 五维度）")
-srv, port = start_server(MockAnthropicHandler)
-try:
-    write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
-    rc, out, err = run_cli(["list-models", "--deep", "--json"], timeout=30)
-    j = json.loads(out) if out else {}
-    test("list-models --deep 退出码 0", rc == 0, f"rc={rc} stderr={err[:200]}")
-    reports = (j.get("probe") or {}).get("reports") or []
-    models = [m for rep in reports for m in rep.get("models", [])]
-    test("list-models --deep 非空", len(models) > 0, f"models={len(models)}")
-    test(
-        "list-models --deep 含 5 维度 text/streaming/metadata/thinking/tools",
-        all(
-            all(k in m for k in ("text", "streaming", "metadata", "thinking", "tools"))
-            for m in models
-        ),
-        f"keys={[list(m.keys()) for m in models]}",
-    )
-    test(
-        "list-models --deep 跳过 context/vision",
-        all("context" not in m and "vision" not in m for m in models),
-    )
-    test(
-        "list-models --deep deep 标记为 True",
-        (j.get("probe") or {}).get("deep") is True,
+        "list-models --probe 不再含已裁剪的 deep 字段",
+        "deep" not in (j.get("probe") or {}),
     )
 finally:
     srv.shutdown()
@@ -1590,134 +1570,41 @@ try:
         "available_ratio" in j2.get("summary", {}),
         f"summary={j2.get('summary')}",
     )
+    # 负向回归：部分成功且低于阈值 → 告警 + alert_triggered=True + exit 1
+    _mixed_conn = sqlite3.connect(db_path)
+    _mixed_conn.execute(
+        "INSERT INTO providers VALUES (?,?,?,?,?,?)",
+        (
+            "Fail-Prov",
+            "claude",
+            json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "http://127.0.0.1:9/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "sk-bad",
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+                    }
+                }
+            ),
+            0,
+            1,
+            1,
+        ),
+    )
+    _mixed_conn.commit()
+    _mixed_conn.close()
+    rc_bad, out_bad, err_bad = run_cli(
+        ["check", "--failover-only", "--alert-threshold", "0.8", "--json"]
+    )
+    j_bad = json.loads(out_bad) if out_bad else {}
+    test("alert-threshold 低于阈值 → exit 1", rc_bad == 1, f"rc={rc_bad}")
+    test(
+        "alert-threshold 低于阈值 → stderr 告警且 JSON alert_triggered=True",
+        "告警" in err_bad and j_bad.get("summary", {}).get("alert_triggered") is True,
+        f"err={err_bad[-200:]} summary={j_bad.get('summary')}",
+    )
 finally:
     srv.shutdown()
-
-
-print("\n[End-to-end] deep-dive 真实执行路径")
-# monkeypatch subprocess.call 代替真正 inspect 子进程，验证任务聚合和退出码
-_real_call = subprocess.call
-_dd_calls = []
-
-
-def _mock_call(cmd, **kw):
-    _dd_calls.append(list(cmd))
-    return 1  # 模拟 inspect 失败
-
-
-subprocess.call = _mock_call
-_dd_json = {
-    "schema_version": 2,
-    "providers": [
-        {
-            "name": "FailProv",
-            "type": "claude",
-            "overall_ok": False,
-            "attempts": [{"model": "m-a"}, {"model": "m-b"}],
-        },
-        {
-            "name": "OkProv",
-            "type": "claude",
-            "overall_ok": True,
-            "best_tier": "haiku",
-            "attempts": [{"model": "m-c"}],
-        },
-    ],
-}
-_dd_dir = tempfile.mkdtemp(prefix="ccpulse_ddexec_")
-_dd_file = os.path.join(_dd_dir, "check.json")
-with open(_dd_file, "w", encoding="utf-8") as _f:
-    json.dump(_dd_json, _f)
-try:
-    _dd_calls.clear()
-    _ns = lambda **kw: type("Args", (), kw)()
-    args_ns = _ns(
-        from_file=_dd_file,
-        target="fail",
-        models=None,
-        yes=True,
-        json=False,
-        db=db_path,
-        timeout=3,
-        workers=1,
-        skip_tls_verify=False,
-        user_agent=None,
-        stainless_version=None,
-        probe_max_tokens=None,
-        probe_enable_thinking=False,
-        probe_context=None,
-        vision=False,
-        stealth=False,
-        archive=None,
-    )
-    rc_dd = mod.run_deep_dive(args_ns, mod.say)
-    test("deep-dive fail rc=1（模拟失败）", rc_dd == 1, f"rc={rc_dd}")
-    test(
-        "deep-dive fail 2 任务（FailProv×m-a + FailProv×m-b）",
-        len(_dd_calls) == 2,
-        f"calls={len(_dd_calls)}",
-    )
-    test(
-        "deep-dive 每个命令含 inspect",
-        all("inspect" in c for c in _dd_calls),
-    )
-    # --models 过滤
-    _dd_calls.clear()
-    args_ns2 = _ns(
-        from_file=_dd_file,
-        target="both",
-        models="m-a",
-        yes=True,
-        json=False,
-        db=db_path,
-        timeout=3,
-        workers=1,
-        skip_tls_verify=False,
-        user_agent=None,
-        stainless_version=None,
-        probe_max_tokens=None,
-        probe_enable_thinking=False,
-        probe_context=None,
-        vision=False,
-        stealth=False,
-        archive=None,
-    )
-    rc_dd2 = mod.run_deep_dive(args_ns2, mod.say)
-    # 交集语义：--models m-a 时只有 FailProv 配过 m-a；OkProv 只有 m-c，不硬测
-    test(
-        "deep-dive --models m-a 交集 = 1 任务（OkProv 未配 m-a 不硬测）",
-        len(_dd_calls) == 1,
-        f"calls={len(_dd_calls)}",
-    )
-    test(
-        "deep-dive --models m-a 只含 FailProv",
-        {c[c.index("--provider") + 1] for c in _dd_calls} == {"FailProv"},
-    )
-    # --json dry-run
-    args_ns3 = _ns(
-        from_file=_dd_file,
-        target="both",
-        models=None,
-        yes=True,
-        json=True,
-        db=db_path,
-        timeout=3,
-        workers=1,
-        skip_tls_verify=False,
-        user_agent=None,
-        stainless_version=None,
-        probe_max_tokens=None,
-        probe_enable_thinking=False,
-        probe_context=None,
-        vision=False,
-        stealth=False,
-        archive=None,
-    )
-    rc_dd3 = mod.run_deep_dive(args_ns3, mod.say)
-    test("deep-dive --json exit 0", rc_dd3 == 0, f"rc={rc_dd3}")
-finally:
-    subprocess.call = _real_call
-    shutil.rmtree(_dd_dir, ignore_errors=True)
 
 
 print("\n[End-to-end] 无子命令默认进 check")
@@ -2150,7 +2037,7 @@ try:
     write_fake_db(f"http://127.0.0.1:{port}", "codex")
     rc, out, err = run_cli_with_type(["check", "--json"], "codex")
     j = json.loads(out) if out else {}
-    test("check --type codex 退出码 0/1", rc in (0, 1), f"rc={rc} stderr={err[:200]}")
+    test("check --type codex 全部失败退出码 3", rc == 3, f"rc={rc} stderr={err[:200]}")
     test("check --type codex JSON type=codex", j.get("type") == "codex")
     test("check --type codex 含 1 个 provider", len(j.get("providers", [])) == 1)
     test(
@@ -2328,11 +2215,7 @@ finally:
     srv.shutdown()
 
 
-print("\n[End-to-end] inspect --auth-full 三探针真实执行")
-# b49b83c 的接线此前只有单元层 include 集合断言；这里验证
-# include 集合 → 三处 if "xxx" in include → _probe_* 真调用 全链路。
-# --js-samples 1 让 JSD 样本不足（<20 不判定）但 note 不含「未启用」，
-# 恰好证明探针跑了且不拖时间。
+print("\n[End-to-end] inspect --auth-full 探针真实执行")
 srv, port = start_server(MockAnthropicHandler)
 try:
     write_fake_db(f"http://127.0.0.1:{port}/v1", "claude")
@@ -2344,24 +2227,16 @@ try:
             "--model",
             "claude-sonnet-4-5",
             "--auth-full",
-            "--js-samples",
-            "1",
         ],
         timeout=60,
     )
     j = json.loads(out) if out else {}
     auth = j.get("authenticity") or {}
-    for _k in ("cache_replay", "knowledge_cutoff", "js_fingerprint"):
-        _note = (auth.get(_k) or {}).get("note") or ""
-        test(
-            f"auth-full {_k} 探针已执行（note 不含未启用）",
-            _note != "" and "未启用" not in _note,
-            f"note={_note!r} rc={rc} err={err[:150]}",
-        )
+    _note = (auth.get("cache_replay") or {}).get("note") or ""
     test(
-        "auth-full js_fingerprint 样本不足被标注",
-        "不足" in (auth.get("js_fingerprint") or {}).get("note", ""),
-        f"js={auth.get('js_fingerprint')}",
+        "auth-full cache_replay 探针已执行（note 不含未启用）",
+        _note != "" and "未启用" not in _note,
+        f"note={_note!r} rc={rc} err={err[:150]}",
     )
 finally:
     srv.shutdown()
@@ -2906,21 +2781,21 @@ try:
         auth_mode="authtoken",
         tiers=[mod.ModelTier("default", "claude-sonnet-4-5", "claude-sonnet-4-5")],
     )
-    _pool_q = {p["q"] for p in mod.PROBE_PROMPTS}
-    # 多跑几次，抽到的问题都应来自池，且都能宽松校验通过
+    # 多跑几次，动态算术题应具备多样性，且都能宽松校验通过
     oks = []
     for _ in range(6):
         r = mod.probe_tier(prov, prov.tiers[0], 3, False)
         oks.append(r.get("correct"))
     test(
-        "probe_tier 问题均来自 PROBE_PROMPTS",
-        all(q in _pool_q for q in PoolCaptureHandler.seen_q),
+        "probe_tier 动态出题非空且有变化",
+        len(PoolCaptureHandler.seen_q) == 6
+        and len(set(PoolCaptureHandler.seen_q)) >= 2,
         f"seen={PoolCaptureHandler.seen_q}",
     )
     test("probe_tier 池内问题宽松校验全通过", all(oks), f"oks={oks}")
     test(
         "probe_tier 结果记录实际 question",
-        mod.probe_tier(prov, prov.tiers[0], 3, False).get("question") in _pool_q,
+        bool(mod.probe_tier(prov, prov.tiers[0], 3, False).get("question")),
     )
 finally:
     srv.shutdown()
@@ -3063,76 +2938,6 @@ test(
     "URL 无 key 时脱敏 credential-like 段",
     "sk-obvious-secret"
     not in mod._sanitize_url_for_display("https://x.test/v1/sk-obvious-secret"),
-)
-
-
-print("\n[Unit] _filter_new_watch_rows 去重 helper")
-
-
-def _watch_new(rows, last_ts, seen_ids):
-    """调用契约纯函数；兼容返回 (new_rows, new_seen) 与仅返回 list 两种形态。"""
-    out = mod._filter_new_watch_rows(rows, last_ts, seen_ids)
-    if isinstance(out, tuple) and len(out) == 2:
-        new_rows, new_seen = out
-        seen_ids.clear()
-        seen_ids.update(new_seen)
-    else:
-        new_rows = out
-        # 兼容形态：函数不就地更新 seen_ids 时，测试按契约键 f"{rid}|{cts}" 补充
-        for r in new_rows:
-            seen_ids.add(f"{r.get('request_id') or ''}|{r.get('created_at') or 0}")
-    return list(new_rows)
-
-
-# 同 request_id 在第二次调用时被过滤
-_seen = set()
-_row = {"created_at": 1000, "request_id": "r1", "provider_name": "P"}
-_first = _watch_new([_row], 1000, _seen)
-_second = _watch_new([_row], 1000, _seen)
-test(
-    "watch 同 request_id 第二次过滤",
-    len(_first) == 1 and len(_second) == 0,
-    f"1st={len(_first)} 2nd={len(_second)}",
-)
-
-# 空 request_id 且 created_at 相同 → 同秒内去重；跨秒则是新行
-_seen = set()
-_row_e = {"created_at": 2000, "request_id": "", "provider_name": "P"}
-_e1 = _watch_new([_row_e], 2000, _seen)
-_e2 = _watch_new([_row_e], 2000, _seen)
-test(
-    "watch 空 request_id 同秒去重",
-    len(_e1) == 1 and len(_e2) == 0,
-    f"1st={len(_e1)} 2nd={len(_e2)}",
-)
-_row_e2 = {"created_at": 2001, "request_id": "", "provider_name": "P"}
-_e3 = _watch_new([_row_e2], 2000, _seen)
-test("watch 空 request_id 跨秒保留", len(_e3) == 1, f"n={len(_e3)}")
-
-# created_at < last_ts 的行被排除
-_seen = set()
-_old_rows = [
-    {"created_at": 900, "request_id": "x", "provider_name": "P"},
-    {"created_at": 1000, "request_id": "y", "provider_name": "P"},
-]
-_out_old = _watch_new(_old_rows, 1000, _seen)
-test(
-    "watch created_at<last_ts 排除",
-    [r["request_id"] for r in _out_old] == ["y"],
-    f"out={_out_old}",
-)
-
-# created_at >= last_ts 且键未见过的行被保留
-_seen = set()
-_new_rows = [
-    {"created_at": 1000, "request_id": "n1", "provider_name": "P"},
-    {"created_at": 1001, "request_id": "n2", "provider_name": "P"},
-]
-_out_new = _watch_new(_new_rows, 1000, _seen)
-test(
-    "watch 未见过键保留",
-    {r["request_id"] for r in _out_new} == {"n1", "n2"},
-    f"out={_out_new}",
 )
 
 
@@ -3704,18 +3509,34 @@ pd_miss = mod.analyze_provider_deep(raw, "NoSuchProv", id_map2)
 test("provider_deep miss returns None", pd_miss is None)
 
 
-print("\n[End-to-end] 只读日志子命令冒烟")
-rc, out, err = run_cli_db(["history", "--json", "--limit", "2"], log_db)
+print("\n[End-to-end] 迁出日志脚本 scripts/ccswitch_logs.py 冒烟")
+_LOGS_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(SCRIPT)), "scripts", "ccswitch_logs.py"
+)
+
+
+def _run_logs_cli(args, db_file):
+    p = subprocess.run(
+        [PY, _LOGS_SCRIPT] + args + ["--db", db_file],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    return p.returncode, p.stdout, p.stderr
+
+
+rc, out, err = _run_logs_cli(["history", "--json", "--limit", "2"], log_db)
 history_report = json.loads(out) if out else {}
-test("history CLI exit 0", rc == 0, f"rc={rc} err={err[:200]}")
+test("history 脚本 exit 0", rc == 0, f"rc={rc} err={err[:200]}")
 test(
-    "history CLI JSON entries",
+    "history 脚本 JSON entries",
     history_report.get("command") == "history" and history_report.get("count") == 2,
     f"report={history_report}",
 )
 
 # --since 非法 → exit 2 + stderr 提示（--json 下不输出可解析 JSON）
-rc, out, err = run_cli_db(["history", "--since", "7x", "--json"], log_db)
+rc, out, err = _run_logs_cli(["history", "--since", "7x", "--json"], log_db)
 test("history --since 7x → exit 2", rc == 2, f"rc={rc}")
 try:
     json.loads(out)
@@ -3733,147 +3554,29 @@ test(
     f"err={err[:150]!r}",
 )
 
-rc, out, err = run_cli_db(["stats", "--json", "--since", "7d"], log_db)
+rc, out, err = _run_logs_cli(["stats", "--json", "--since", "7d"], log_db)
 stats_report = json.loads(out) if out else {}
-test("stats CLI exit 0", rc == 0, f"rc={rc} err={err[:200]}")
+test("stats 脚本 exit 0", rc == 0, f"rc={rc} err={err[:200]}")
 test(
-    "stats CLI JSON providers",
+    "stats 脚本 JSON providers",
     stats_report.get("command") == "stats"
     and stats_report.get("since") == "7d"
     and bool(stats_report.get("providers")),
     f"report={stats_report}",
 )
-# token 用量汇总：r1 贡献 input=10 output=5
 _tot_in = sum(p.get("input_tokens") or 0 for p in stats_report.get("providers", []))
 _tot_out = sum(p.get("output_tokens") or 0 for p in stats_report.get("providers", []))
 test("stats 汇总 input_tokens", _tot_in >= 10, f"tot_in={_tot_in}")
 test("stats 汇总 output_tokens", _tot_out >= 5, f"tot_out={_tot_out}")
 
-rc, out, err = run_cli_db(["routing", "--json", "--limit", "1"], log_db)
+rc, out, err = _run_logs_cli(["routing", "--json", "--limit", "1"], log_db)
 routing_report = json.loads(out) if out else {}
-test("routing CLI exit 0", rc == 0, f"rc={rc} err={err[:200]}")
+test("routing 脚本 exit 0", rc == 0, f"rc={rc} err={err[:200]}")
 test(
-    "routing CLI JSON pairs",
+    "routing 脚本 JSON pairs",
     routing_report.get("command") == "routing"
     and len(routing_report.get("pairs", [])) == 1,
     f"report={routing_report}",
-)
-
-rc, out, err = run_cli_db(["analyze", "--json", "--mode", "day"], log_db2)
-analyze_report = json.loads(out) if out else {}
-test("analyze CLI exit 0", rc == 0, f"rc={rc} err={err[:200]}")
-test(
-    "analyze CLI day report",
-    analyze_report.get("command") == "analyze"
-    and analyze_report.get("mode") == "day"
-    and bool(analyze_report.get("by_day"))
-    and "by_model" not in analyze_report,
-    f"report={analyze_report}",
-)
-
-# watch e2e：启动后插入新行 → 下一轮轮询应打印（含 tokens + NDJSON 模式）
-# 修复前 watch 只验证启动横幅，从不验证「新行到达真的打印」
-_w_db = os.path.join(tmp, "watch.db")
-_w_conn = sqlite3.connect(_w_db)
-_w_conn.execute("""CREATE TABLE providers (
-    id TEXT, name TEXT, app_type TEXT, settings_config TEXT,
-    is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER
-)""")
-_w_conn.execute(
-    "INSERT INTO providers VALUES (?,?,?,?,?,?,?)",
-    ("pid-w", "Prov-W", "claude", "{}", 1, 1, 0),
-)
-_w_conn.execute("""CREATE TABLE proxy_request_logs (
-    request_id TEXT, provider_id TEXT, app_type TEXT, model TEXT,
-    request_model TEXT, input_tokens INTEGER, output_tokens INTEGER,
-    cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
-    input_cost_usd TEXT, output_cost_usd TEXT, cache_read_cost_usd TEXT,
-    cache_creation_cost_usd TEXT, total_cost_usd TEXT,
-    latency_ms INTEGER, first_token_ms INTEGER, duration_ms INTEGER,
-    status_code INTEGER, error_message TEXT, session_id TEXT,
-    provider_type TEXT, is_streaming INTEGER, cost_multiplier TEXT,
-    created_at INTEGER, data_source TEXT, pricing_model TEXT,
-    input_token_semantics INTEGER
-)""")
-_w_now = int(time.time())
-_w_conn.execute(
-    "INSERT INTO proxy_request_logs VALUES (" + ",".join(["?"] * 27) + ")",
-    _log_row("w-boot", "pid-w", "m", 1, 1, 10, 2, 200, None, _w_now),
-)
-_w_conn.commit()
-_w_conn.close()
-
-
-def _watch_run(extra_args, insert_row):
-    """起 watch 进程 → 插入新行 → 等一轮轮询 → terminate 收输出。"""
-    proc = subprocess.Popen(
-        [PY, "-u", SCRIPT, "watch", "--interval", "1", "--db", _w_db] + extra_args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        time.sleep(1.2)  # 等第一轮轮询完成（bootstrap 起点 = w-boot）
-        if insert_row:
-            _c = sqlite3.connect(_w_db)
-            _c.execute(
-                "INSERT INTO proxy_request_logs VALUES (" + ",".join(["?"] * 27) + ")",
-                _log_row(
-                    "w-new",
-                    "pid-w",
-                    "model-w",
-                    1234,
-                    567,
-                    800,
-                    120,
-                    200,
-                    None,
-                    int(time.time()),
-                ),
-            )
-            _c.commit()
-            _c.close()
-        time.sleep(1.6)  # 等下一轮轮询捕获新行
-        proc.terminate()
-        out, err = proc.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        out, err = proc.communicate(timeout=5)
-    return out, err
-
-
-_w_out, _w_err = _watch_run([], insert_row=True)
-test(
-    "watch 打印新行（供应商名）",
-    "Prov-W" in _w_out,
-    f"out={_w_out[:400]!r}",
-)
-test(
-    "watch 新行带 in/out tokens（#1 输入输出显示）",
-    "in=1234" in _w_out and "out=567" in _w_out,
-    f"out={_w_out[:400]!r}",
-)
-
-_w_jout, _w_jerr = _watch_run(["--json"], insert_row=True)
-_w_lines = [ln for ln in _w_jout.splitlines() if ln.strip().startswith("{")]
-_w_new_json = {}
-for _ln in _w_lines:
-    try:
-        _j = json.loads(_ln)
-        if _j.get("event") == "row" and _j.get("request_id") == "w-new":
-            _w_new_json = _j
-            break
-    except (json.JSONDecodeError, TypeError):
-        pass
-test(
-    "watch --json NDJSON 输出新行事件（#6 机器可读）",
-    bool(_w_new_json),
-    f"lines={_w_lines[:3]} out={_w_jout[:400]!r}",
-)
-test(
-    "watch --json 行含 tokens 字段",
-    _w_new_json.get("input_tokens") == 1234 and _w_new_json.get("output_tokens") == 567,
-    f"j={_w_new_json}",
 )
 
 shutil.rmtree(tmp, ignore_errors=True)
@@ -4613,134 +4316,6 @@ _cat, _disp = mod.classify_error(
 test("429 -> rate_limit", _cat == mod.ErrorCategory.RATE_LIMIT, f"cat={_cat}")
 test(
     "429 display 含恢复提示", "恢复" in _disp or "23:10:15" in _disp, f"disp={_disp!r}"
-)
-
-
-# ============ P1：deep-dive 子命令（CI 串联，非交互） ============
-
-print("\n[End-to-end] deep-dive --json dry-run（CI 串联）")
-_dd_json = {
-    "schema_version": 2,
-    "providers": [
-        {
-            "name": "FailProv",
-            "type": "claude",
-            "overall_ok": False,
-            "attempts": [{"model": "m-fail"}],
-        },
-        {
-            "name": "OkProv",
-            "type": "claude",
-            "overall_ok": True,
-            "best_tier": "haiku",
-            "attempts": [{"model": "m-ok"}],
-        },
-    ],
-}
-_dd_file = os.path.join(tempfile.mkdtemp(prefix="ccpulse_dd_"), "dd_check.json")
-with open(_dd_file, "w", encoding="utf-8") as _f:
-    json.dump(_dd_json, _f)
-
-rc, out, err = run_cli(["deep-dive", "--from", _dd_file, "--target", "fail", "--json"])
-test("deep-dive fail exit 0", rc == 0, f"rc={rc} err={err[:200]}")
-_dd_rep = json.loads(out) if out else {}
-test("deep-dive command=deep-dive", _dd_rep.get("command") == "deep-dive")
-_fail_t = [t for t in _dd_rep.get("tasks", []) if t["provider"] == "FailProv"]
-_ok_t = [t for t in _dd_rep.get("tasks", []) if t["provider"] == "OkProv"]
-test(
-    "deep-dive --target fail 只含失败家",
-    len(_fail_t) == 1 and len(_ok_t) == 0,
-    f"fail={_fail_t} ok={_ok_t}",
-)
-
-rc2, out2, _ = run_cli(["deep-dive", "--from", _dd_file, "--target", "both", "--json"])
-_rep2 = json.loads(out2) if out2 else {}
-test(
-    "deep-dive --target both = 交集组合（每家只测自己 attempts 的模型）",
-    len(_rep2.get("tasks", [])) == 2,
-    f"n={len(_rep2.get('tasks', []))}",
-)
-
-# 交集语义：37837e5 已修 PS1，deep-dive CLI 须一致——每家供应商只测
-# 自己 attempts 里出现过的、且被 --models（或全集）选中的模型。
-_dd_x = {
-    "schema_version": 2,
-    "providers": [
-        {
-            "name": "P1",
-            "type": "claude",
-            "overall_ok": False,
-            "attempts": [{"model": "m-a"}, {"model": "m-b"}],
-        },
-        {
-            "name": "P2",
-            "type": "claude",
-            "overall_ok": False,
-            "attempts": [{"model": "m-a"}],
-        },
-    ],
-}
-_dd_x_file = os.path.join(tempfile.mkdtemp(prefix="ccpulse_dd_"), "dd_x.json")
-with open(_dd_x_file, "w", encoding="utf-8") as _f:
-    json.dump(_dd_x, _f)
-rcx, outx, _ = run_cli(
-    ["deep-dive", "--from", _dd_x_file, "--target", "fail", "--json"]
-)
-_repx = json.loads(outx) if outx else {}
-_xpairs = {(t["provider"], t["model"]) for t in _repx.get("tasks", [])}
-test(
-    "deep-dive 交集：P1 两模型 + P2 一模型 = 3 组合（非笛卡尔积 6）",
-    len(_xpairs) == 3 and ("P2", "m-b") not in _xpairs,
-    f"tasks={sorted(_xpairs)}",
-)
-
-rc3, out3, _ = run_cli(
-    [
-        "deep-dive",
-        "--from",
-        _dd_file,
-        "--target",
-        "both",
-        "--models",
-        "m-fail",
-        "--json",
-    ]
-)
-_rep3 = json.loads(out3) if out3 else {}
-test(
-    "deep-dive --models 过滤：只含配过 m-fail 的 FailProv（交集）",
-    len(_rep3.get("tasks", [])) == 1
-    and all(t["model"] == "m-fail" for t in _rep3.get("tasks", [])),
-    f"tasks={_rep3.get('tasks')}",
-)
-
-# stdin 读取
-import subprocess as _sp
-
-_p = _sp.run(
-    [
-        PY,
-        SCRIPT,
-        "deep-dive",
-        "--from",
-        "-",
-        "--target",
-        "ok",
-        "--json",
-        "--db",
-        db_path,
-    ],
-    input=json.dumps(_dd_json),
-    capture_output=True,
-    text=True,
-    timeout=10,
-    check=False,
-)
-_rep4 = json.loads(_p.stdout) if _p.stdout else {}
-test(
-    "deep-dive --from - 读 stdin",
-    _p.returncode == 0 and len(_rep4.get("tasks", [])) == 1,
-    f"rc={_p.returncode} err={_p.stderr[:200]}",
 )
 
 

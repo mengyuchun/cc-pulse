@@ -26,14 +26,20 @@ _SPEC.loader.exec_module(mod)
 
 # ── build_probe_request temperature 参数 ────────────────────────────
 
+
 class TemperatureParamTest(unittest.TestCase):
     def _provider(self):
         return mod.Provider(
             name="T",
             app_type="claude",
             base_url="http://127.0.0.1:9/v1",
-            api_key="sk-test", auth_mode="apikey",
-            tiers=[mod.ModelTier(tier="haiku", model="claude-haiku-4-5", raw_model="claude-haiku-4-5")],
+            api_key="sk-test",
+            auth_mode="apikey",
+            tiers=[
+                mod.ModelTier(
+                    tier="haiku", model="claude-haiku-4-5", raw_model="claude-haiku-4-5"
+                )
+            ],
         )
 
     def test_temperature_in_body_when_set(self):
@@ -55,6 +61,7 @@ class TemperatureParamTest(unittest.TestCase):
 
 # ── _probe_cache_replay 判定逻辑 ────────────────────────────────────
 
+
 class CacheReplayVerdictTest(unittest.TestCase):
     """_probe_cache_replay 的判定逻辑（monkeypatch probe_tier 模拟双发）。"""
 
@@ -63,8 +70,13 @@ class CacheReplayVerdictTest(unittest.TestCase):
             name="T",
             app_type="claude",
             base_url="http://127.0.0.1:9/v1",
-            api_key="sk-test", auth_mode="apikey",
-            tiers=[mod.ModelTier(tier="haiku", model="claude-haiku-4-5", raw_model="claude-haiku-4-5")],
+            api_key="sk-test",
+            auth_mode="apikey",
+            tiers=[
+                mod.ModelTier(
+                    tier="haiku", model="claude-haiku-4-5", raw_model="claude-haiku-4-5"
+                )
+            ],
         )
 
     def _patch_probe_tier(self, returns):
@@ -166,8 +178,38 @@ class CacheReplayVerdictTest(unittest.TestCase):
         finally:
             mod.probe_tier = orig
 
+    def test_uses_shared_high_entropy_open_ended_prompt(self):
+        """双发必须用同一条高熵开放式 prompt（绝不能用 2+3=? 确定性算术题）。"""
+        p = self._provider()
+        seen_questions = []
+        seen_temps = []
+        orig = mod.probe_tier
+
+        def capture(prov, tier, *a, **kw):
+            seen_questions.append(kw.get("question", ""))
+            seen_temps.append(kw.get("temperature"))
+            return {
+                "status": 200,
+                "answer": f"ans-{len(seen_questions)}",
+                "raw_body": "{}",
+            }
+
+        mod.probe_tier = capture
+        try:
+            r = mod._probe_cache_replay(
+                p, p.tiers[0], timeout=5, skip_tls=False, max_tokens=16, user_agent=None
+            )
+            self.assertEqual(len(seen_questions), 2)
+            self.assertEqual(seen_questions[0], seen_questions[1])
+            self.assertNotIn("2+3", seen_questions[0])
+            self.assertEqual(seen_temps, [1.0, 1.0])
+            self.assertFalse(r["suspicious"])
+        finally:
+            mod.probe_tier = orig
+
 
 # ── verdict 汇总 ────────────────────────────────────────────────────
+
 
 class AuthenticityVerdictWithCacheTest(unittest.TestCase):
     def test_cache_suspicious_yields_suspicious(self):

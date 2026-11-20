@@ -1,4 +1,4 @@
-#Requires -Version 7
+﻿#Requires -Version 7
 # CC-Pulse - cc-switch 供应商健康检测与单模型深度诊断 · 桌面启动器
 # 双击运行：层次化菜单（快速体检 / 自定义 / 拉模型 / 深度诊断 / 高级设置 / 退出）
 
@@ -272,9 +272,6 @@ $script:AdvScope = "failover"     # check 默认范围：failover(队列+当前)
 # inspect 保真鉴别 P2 探针（默认关，烧请求时显式开）
 $script:AdvAuthFull = $false             # 一键入口临时启用 --auth-full
 $script:AdvAuthCacheReplay = $false      # --include cache-replay（2 次额外请求）
-$script:AdvAuthKnowledgeCutoff = $false  # --include knowledge-cutoff（6 次额外请求）
-$script:AdvAuthJsFingerprint = $false    # --include js-fingerprint（默认 50 次额外请求）
-$script:AdvJsSamples = ""                 # --js-samples N（留空=50）
 
 function Show-Banner {
     param([string]$Title = "CC-Pulse · cc-switch 供应商健康检测与单模型深度诊断")
@@ -345,8 +342,6 @@ function Apply-AdvancedArgs {
         # 保真鉴别 P2 探针：追加到已有 --include（默认全关，烧请求时显式开）
         $authExtras = @()
         if ($script:AdvAuthCacheReplay) { $authExtras += "cache-replay" }
-        if ($script:AdvAuthKnowledgeCutoff) { $authExtras += "knowledge-cutoff" }
-        if ($script:AdvAuthJsFingerprint) { $authExtras += "js-fingerprint" }
         if ($authExtras.Count -gt 0) {
             $incIdx = $CmdArgs.IndexOf("--include")
             $extra = $authExtras -join ","
@@ -356,9 +351,6 @@ function Apply-AdvancedArgs {
             } else {
                 $CmdArgs.Add("--include")
                 $CmdArgs.Add("text,streaming,model-consistency,protocol,error-classification,metadata,thinking,tools," + $extra)
-            }
-            if ($script:AdvAuthJsFingerprint -and -not [string]::IsNullOrWhiteSpace($script:AdvJsSamples)) {
-                $CmdArgs.Add("--js-samples"); $CmdArgs.Add($script:AdvJsSamples)
             }
         }
     }
@@ -785,13 +777,12 @@ function Menu-ListModels {
     Write-Host ""
     $probeIdx = Select-MenuItem -Options @(
         "只拉列表（默认，最快）"
-        "轻量探测每个模型（2+3 题）"
-        "深度探测（text/streaming/metadata/thinking/tools）"
+        "轻量探测每个模型（动态算术题）"
     ) -Title "探测模式"
     if ($probeIdx -lt 0) { return 1 }
-    $probeMode = switch ($probeIdx) { 1 { "2" } 2 { "3" } default { "1" } }
+    $probeMode = switch ($probeIdx) { 1 { "2" } default { "1" } }
     $src = "listed"
-    if ($probeMode -eq "2" -or $probeMode -eq "3") {
+    if ($probeMode -eq "2") {
         $srcIdx = Select-MenuItem -Options @(
             "listed     - /v1/models 列表（默认）"
             "configured - cc-switch 配置档位"
@@ -800,7 +791,7 @@ function Menu-ListModels {
         if ($srcIdx -lt 0) { return 1 }
         $src = switch ($srcIdx) { 1 { "configured" } 2 { "both" } default { "listed" } }
     }
-    $lmTimeout = if ($probeMode -eq "3") { "60" } else { "30" }
+    $lmTimeout = "30"
 
     $cmdArgs = [System.Collections.Generic.List[string]]::new()
     $cmdArgs.Add("list-models")
@@ -810,7 +801,6 @@ function Menu-ListModels {
     $cmdArgs.Add("--timeout"); $cmdArgs.Add($lmTimeout)
     if ($scope -ne "2") { $cmdArgs.Add("--failover-only") }
     if ($probeMode -eq "2") { $cmdArgs.Add("--probe"); $cmdArgs.Add("--source"); $cmdArgs.Add($src) }
-    elseif ($probeMode -eq "3") { $cmdArgs.Add("--deep"); $cmdArgs.Add("--source"); $cmdArgs.Add($src) }
     Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "list-models"
     $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
     Write-Host ""
@@ -1175,16 +1165,14 @@ function Menu-Logs {
     if (-not (Show-Banner "运行日志 · 只读 cc-switch 历史 + cc-pulse 归档")) {
         Read-HostSafe "按回车返回主菜单" | Out-Null; return 1
     }
+    $logsScript = Join-Path $PSScriptRoot "scripts\ccswitch_logs.py"
     $logOptions = @(
         "最近失败日志        history --fails"
         "最近全部日志        history"
         "供应商统计          stats --since 7d"
         "静默路由排行        routing --since 7d"
-        "实时监控（轮询）    watch · 有新日志就打印"
-        "分析报表            analyze · 按天/模型/供应商交叉"
-        "排查静默路由        env-check · 环境变量是否覆盖 cc-switch"
+        "排查静默路由        env-check · 环境变量覆盖检测"
         "探测历史趋势        trend --since 7d · cc-pulse 自家归档"
-        "被动健康度          health · cc-switch 真实流量汇总"
         "返回主菜单"
     )
     $idx = Select-MenuItem -Options $logOptions -Title "请选择"
@@ -1192,63 +1180,32 @@ function Menu-Logs {
     $code = 0
     switch ($idx) {
         1 {
-            $cmdArgs = [System.Collections.Generic.List[string]]::new()
-            $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
-            $cmdArgs.Add("--limit"); $cmdArgs.Add("30")
-            Apply-AdvancedArgs -CmdArgs $cmdArgs -SubCommand "history"
-            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            & $Python -u $logsScript history --db $DB --limit 30 2>&1 | ForEach-Object { Write-Host $_ }
+            $code = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
         }
         2 {
-            $cmdArgs = [System.Collections.Generic.List[string]]::new()
-            $cmdArgs.Add("stats"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
-            $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
-            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            & $Python -u $logsScript stats --db $DB --since 7d 2>&1 | ForEach-Object { Write-Host $_ }
+            $code = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
         }
         3 {
-            $cmdArgs = [System.Collections.Generic.List[string]]::new()
-            $cmdArgs.Add("routing"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
-            $cmdArgs.Add("--since"); $cmdArgs.Add("7d"); $cmdArgs.Add("--limit"); $cmdArgs.Add("20")
-            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            & $Python -u $logsScript routing --db $DB --since 7d --limit 20 2>&1 | ForEach-Object { Write-Host $_ }
+            $code = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
         }
         4 {
-            $cmdArgs = [System.Collections.Generic.List[string]]::new()
-            $cmdArgs.Add("watch"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
-            $cmdArgs.Add("--interval"); $cmdArgs.Add("3")
-            Write-Host "实时监控中，Ctrl+C 结束…" -ForegroundColor Cyan
-            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-        }
-        5 {
-            $cmdArgs = [System.Collections.Generic.List[string]]::new()
-            $cmdArgs.Add("analyze"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
-            $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
-            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-        }
-        6 {
-            # 排查静默路由：env-check 不发 HTTP，秒级返回。
-            # README「突然不能用」首推动作——但之前 PS1 没有入口，用户被引导去深挖白烧请求。
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("env-check"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
-        7 {
-            # 探测历史趋势：CC-Pulse 自家 ~/.cc-pulse/probe_history.jsonl，
-            # 此前 PS1 用户看不到自己生产的数据
+        5 {
             $cmdArgs = [System.Collections.Generic.List[string]]::new()
             $cmdArgs.Add("trend"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
             $cmdArgs.Add("--since"); $cmdArgs.Add("7d")
             $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
         }
-        8 {
-            $cmdArgs = [System.Collections.Generic.List[string]]::new()
-            $cmdArgs.Add("health"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
-            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
-        }
-        9 { return 0 }
+        6 { return 0 }
         default {
-            $cmdArgs = [System.Collections.Generic.List[string]]::new()
-            $cmdArgs.Add("history"); $cmdArgs.Add("--db"); $cmdArgs.Add($DB)
-            $cmdArgs.Add("--fails"); $cmdArgs.Add("--limit"); $cmdArgs.Add("30")
-            $code = Invoke-Ccpulse -CmdArgs $cmdArgs.ToArray()
+            & $Python -u $logsScript history --db $DB --fails --limit 30 2>&1 | ForEach-Object { Write-Host $_ }
+            $code = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
         }
     }
     Write-Host ""
@@ -1260,26 +1217,24 @@ function Menu-Logs {
 # ── [6] 高级设置（进程内有效） ───────────────────────────────────
 function Menu-AdvancedSettings {
     Show-Banner "高级设置（本进程有效，重开需重设）" | Out-Null
-    # 编号清单循环：箭头选择项号，ESC/末项返回主菜单。避免改一项须回车 9 次。
+    # 编号清单循环：箭头选择项号，ESC/末项返回主菜单。
     while ($true) {
         $opts = @(
             "JSON 输出         [check]        $(if ($script:AdvJson) {'开'} else {'关（默认）'})"
             "probe-max-tokens  [check/inspect/list] $(if ($script:AdvMaxTokens) {$script:AdvMaxTokens} else {'1024（默认）'})"
             "允许 thinking     [check/inspect] $(if ($script:AdvEnableThinking) {'开'} else {'关（默认）'})"
             "user-agent        [全部子命令]   $(if ($script:AdvUserAgent) {$script:AdvUserAgent} else {'本机版本（默认）'})"
-            "上下文档位        [inspect]      $($script:AdvProbeContext)（无声明时冒烟）"
+            "上下文档位        [inspect]      $($script:AdvProbeContext)（--include context 时生效）"
             "vision 探测       [inspect]      $(if ($script:AdvVision) {'开'} else {'关（默认）'})"
             "保真·缓存回放     [inspect]      $(if ($script:AdvAuthCacheReplay) {'开'} else {'关（默认）'})"
-            "保真·知识截止     [inspect]      $(if ($script:AdvAuthKnowledgeCutoff) {'开'} else {'关（默认）'})"
-            "保真·分布指纹     [inspect]      $(if ($script:AdvAuthJsFingerprint) {"$($script:AdvJsSamples)次"} else {'关（默认）'})"
             "stealth 隐身      [check]        $(if ($script:AdvStealth) {'开'} else {'关（默认）'})"
             "快速体检类型      [快速体检]     $($script:AdvType)"
             "快速体检范围      [快速体检]     $(if ($script:AdvScope -eq 'all') {'全部'} else {'队列+当前（默认）'})"
             "返回主菜单"
         )
         Write-Host "当前设置（箭头选择修改，ESC 或选末项返回主菜单）:" -ForegroundColor Yellow
-        $pick = Select-MenuItem -Options $opts -Title "高级设置" -Prompt "输入 1-13"
-        if ($pick -lt 0 -or $pick -eq 12) { return }
+        $pick = Select-MenuItem -Options $opts -Title "高级设置" -Prompt "输入 1-11"
+        if ($pick -lt 0 -or $pick -eq 10) { return }
         switch ($pick) {
             0 {
                 $j = Read-HostSafe "JSON 输出？(y/N)"
@@ -1310,28 +1265,14 @@ function Menu-AdvancedSettings {
                 if (-not [string]::IsNullOrWhiteSpace($cr)) { $script:AdvAuthCacheReplay = ($cr -eq "y" -or $cr -eq "Y") }
             }
             7 {
-                $kc = Read-HostSafe "inspect 开启保真·知识截止探针？(y/N)"
-                if (-not [string]::IsNullOrWhiteSpace($kc)) { $script:AdvAuthKnowledgeCutoff = ($kc -eq "y" -or $kc -eq "Y") }
-            }
-            8 {
-                $js = Read-HostSafe "inspect 开启保真·分布指纹探针？(y/N，可填采样次数)"
-                $jsTrim = "$js".Trim()
-                if ([string]::IsNullOrWhiteSpace($jsTrim)) { $script:AdvAuthJsFingerprint = $false; $script:AdvJsSamples = "" }
-                elseif ($jsTrim -eq "y" -or $jsTrim -eq "Y") { $script:AdvAuthJsFingerprint = $true; $script:AdvJsSamples = "" }
-                else {
-                    $script:AdvAuthJsFingerprint = $true
-                    $script:AdvJsSamples = $jsTrim
-                }
-            }
-            9 {
                 $st = Read-HostSafe "check 开启 stealth 隐身？(y/N)"
                 if (-not [string]::IsNullOrWhiteSpace($st)) { $script:AdvStealth = ($st -eq "y" -or $st -eq "Y") }
             }
-            10 {
+            8 {
                 $tyIdx = Select-MenuItem -Options @("claude(默认)", "codex", "openclaw", "all") -Title "快速体检类型"
                 if ($tyIdx -ge 0) { $script:AdvType = switch ($tyIdx) { 1 { "codex" } 2 { "openclaw" } 3 { "all" } default { "claude" } } }
             }
-            11 {
+            9 {
                 $scIdx = Select-MenuItem -Options @("队列+当前(默认,快)", "全部(完整)") -Title "快速体检范围"
                 if ($scIdx -ge 0) { $script:AdvScope = if ($scIdx -eq 1) { "all" } else { "failover" } }
             }

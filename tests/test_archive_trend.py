@@ -317,7 +317,11 @@ if hasattr(mod, "trim_archive"):
     _removed = mod.trim_archive(_tr_path, max_records=5)
     test("trim_archive 移除 7 条", _removed == 7, f"removed={_removed}")
     _left = mod.load_records(_tr_path)
-    test("trim_archive 保留最新 5 条", len(_left) == 5 and _left[0]["ts"] == 7, f"left={len(_left)}")
+    test(
+        "trim_archive 保留最新 5 条",
+        len(_left) == 5 and _left[0]["ts"] == 7,
+        f"left={len(_left)}",
+    )
     # 未超限不移除
     _removed2 = mod.trim_archive(_tr_path, max_records=5)
     test("trim_archive 未超限返回 0", _removed2 == 0, f"removed={_removed2}")

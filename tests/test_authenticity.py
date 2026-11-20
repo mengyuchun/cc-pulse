@@ -26,18 +26,21 @@ _SPEC.loader.exec_module(mod)
 
 # ── 3.1 换芯字段检测 ──────────────────────────────────────────────
 
+
 class CrosspackOpenAITest(unittest.TestCase):
     def test_anthropic_field_in_openai_usage_is_suspicious(self):
         """OpenAI 响应 usage 冒出 Anthropic 专属字段 → 可疑。"""
-        body = json.dumps({
-            "model": "gpt-5",
-            "choices": [{"message": {"content": "5"}}],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 2,
-                "cache_creation_input_tokens": 5,
-            },
-        })
+        body = json.dumps(
+            {
+                "model": "gpt-5",
+                "choices": [{"message": {"content": "5"}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cache_creation_input_tokens": 5,
+                },
+            }
+        )
         r = mod._detect_crosspack_fields(body, "codex")
         self.assertTrue(r["suspicious"])
         fields = [f["field"] for f in r["findings"]]
@@ -45,68 +48,92 @@ class CrosspackOpenAITest(unittest.TestCase):
 
     def test_usage_source_anthropic_is_suspicious(self):
         """顶层 usage_source 自曝后端来源 → 可疑。"""
-        body = json.dumps({
-            "model": "gpt-5",
-            "choices": [{"message": {"content": "5"}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
-            "usage_source": "anthropic",
-        })
+        body = json.dumps(
+            {
+                "model": "gpt-5",
+                "choices": [{"message": {"content": "5"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                "usage_source": "anthropic",
+            }
+        )
         r = mod._detect_crosspack_fields(body, "codex")
         self.assertTrue(r["suspicious"])
         self.assertIn("usage_source", [f["field"] for f in r["findings"]])
 
     def test_pure_openai_usage_is_clean(self):
         """纯 OpenAI usage（仅三键）→ 不可疑。"""
-        body = json.dumps({
-            "model": "gpt-5",
-            "choices": [{"message": {"content": "5"}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-        })
+        body = json.dumps(
+            {
+                "model": "gpt-5",
+                "choices": [{"message": {"content": "5"}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                },
+            }
+        )
         r = mod._detect_crosspack_fields(body, "codex")
         self.assertFalse(r["suspicious"])
         self.assertEqual(r["findings"], [])
 
     def test_system_fingerprint_in_anthropic_is_suspicious(self):
         """Anthropic 响应出现 system_fingerprint（OpenAI 专属）→ 可疑。"""
-        body = json.dumps({
-            "model": "claude-sonnet-4-5",
-            "content": [{"type": "text", "text": "5"}],
-            "usage": {"input_tokens": 10, "output_tokens": 2},
-            "system_fingerprint": "fp_abc",
-        })
+        body = json.dumps(
+            {
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "5"}],
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "system_fingerprint": "fp_abc",
+            }
+        )
         r = mod._detect_crosspack_fields(body, "claude")
         self.assertTrue(r["suspicious"])
 
     def test_pure_anthropic_is_clean(self):
         """纯 Anthropic 响应 → 不可疑。"""
-        body = json.dumps({
-            "model": "claude-sonnet-4-5",
-            "content": [{"type": "text", "text": "5"}],
-            "usage": {"input_tokens": 10, "output_tokens": 2},
-            "stop_reason": "end_turn",
-        })
+        body = json.dumps(
+            {
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "5"}],
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "stop_reason": "end_turn",
+            }
+        )
         r = mod._detect_crosspack_fields(body, "claude")
         self.assertFalse(r["suspicious"])
 
     def test_claude_app_type_with_explicit_openai_chat_uses_openai_fields(self):
         """显式 OpenAI Chat 协议的 claude app_type 不应因合法字段误报。"""
-        body = json.dumps({
-            "model": "gpt-5",
-            "choices": [{"message": {"content": "5"}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-            "system_fingerprint": "fp_abc",
-        })
+        body = json.dumps(
+            {
+                "model": "gpt-5",
+                "choices": [{"message": {"content": "5"}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                },
+                "system_fingerprint": "fp_abc",
+            }
+        )
         r = mod._detect_crosspack_fields(
             body, "claude", mod.Protocol.OPENAI_CHAT_COMPLETIONS
         )
         self.assertFalse(r["suspicious"])
 
-    def test_explicit_openai_chat_reasoning_without_signature_is_not_anthropic_failure(self):
+    def test_explicit_openai_chat_reasoning_without_signature_is_not_anthropic_failure(
+        self,
+    ):
         """OpenAI Chat 无 Anthropic signature 不应被当作伪造 Claude。"""
-        body = json.dumps({
-            "model": "gpt-5",
-            "choices": [{"message": {"content": "5", "reasoning_content": "thinking"}}],
-        })
+        body = json.dumps(
+            {
+                "model": "gpt-5",
+                "choices": [
+                    {"message": {"content": "5", "reasoning_content": "thinking"}}
+                ],
+            }
+        )
         sigs = mod._extract_thinking_signatures(
             body, mod.Protocol.OPENAI_CHAT_COMPLETIONS
         )
@@ -123,17 +150,24 @@ class CrosspackOpenAITest(unittest.TestCase):
 
 # ── 3.2 thinking 签名提取 ──────────────────────────────────────────
 
+
 class ThinkingSignatureTest(unittest.TestCase):
     def test_anthropic_thinking_with_signature(self):
         """Anthropic content[].type=thinking + signature 非空 → has_valid_signature=True。"""
-        body = json.dumps({
-            "model": "claude-sonnet-4-5",
-            "content": [
-                {"type": "thinking", "thinking": "let me compute", "signature": "EuYBCo..."},
-                {"type": "text", "text": "5"},
-            ],
-            "usage": {"input_tokens": 10, "output_tokens": 8},
-        })
+        body = json.dumps(
+            {
+                "model": "claude-sonnet-4-5",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "let me compute",
+                        "signature": "EuYBCo...",
+                    },
+                    {"type": "text", "text": "5"},
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 8},
+            }
+        )
         sigs = mod._extract_thinking_signatures(body)
         self.assertTrue(sigs)
         self.assertTrue(sigs[0]["signature_present"])
@@ -143,13 +177,15 @@ class ThinkingSignatureTest(unittest.TestCase):
 
     def test_thinking_block_without_signature(self):
         """thinking 块存在但无 signature → has_valid_signature=False（疑似伪造）。"""
-        body = json.dumps({
-            "model": "claude-sonnet-4-5",
-            "content": [
-                {"type": "thinking", "thinking": "thinking but no sig"},
-                {"type": "text", "text": "5"},
-            ],
-        })
+        body = json.dumps(
+            {
+                "model": "claude-sonnet-4-5",
+                "content": [
+                    {"type": "thinking", "thinking": "thinking but no sig"},
+                    {"type": "text", "text": "5"},
+                ],
+            }
+        )
         sigs = mod._extract_thinking_signatures(body)
         self.assertTrue(sigs)
         self.assertFalse(sigs[0]["signature_present"])
@@ -157,21 +193,27 @@ class ThinkingSignatureTest(unittest.TestCase):
 
     def test_no_thinking_block(self):
         """无 thinking 块 → 空列表，汇总 None（不能下结论）。"""
-        body = json.dumps({
-            "model": "claude-sonnet-4-5",
-            "content": [{"type": "text", "text": "5"}],
-        })
+        body = json.dumps(
+            {
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "5"}],
+            }
+        )
         sigs = mod._extract_thinking_signatures(body)
         self.assertEqual(sigs, [])
         self.assertIsNone(mod._has_valid_thinking_signature(sigs))
 
     def test_openai_reasoning_has_no_signature(self):
         """OpenAI reasoning_content 无 signature → has_valid_signature=False。"""
-        body = json.dumps({
-            "model": "gpt-5",
-            "choices": [{"message": {"content": "5", "reasoning_content": "thinking..."}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
-        })
+        body = json.dumps(
+            {
+                "model": "gpt-5",
+                "choices": [
+                    {"message": {"content": "5", "reasoning_content": "thinking..."}}
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            }
+        )
         sigs = mod._extract_thinking_signatures(body)
         # OpenAI reasoning 块应被识别为 thinking，但无签名字段
         self.assertTrue(sigs)
@@ -180,6 +222,7 @@ class ThinkingSignatureTest(unittest.TestCase):
 
 
 # ── 3.3 verdict 汇总 ───────────────────────────────────────────────
+
 
 class AuthenticityVerdictTest(unittest.TestCase):
     def _clean(self):

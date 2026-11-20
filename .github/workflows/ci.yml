@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "fix/*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run Python test suites
+        run: |
+          python tests/test_ccpulse_full.py
+          python tests/test_p0_protocol_fix.py
+          python tests/test_env_check.py
+          python tests/test_archive_trend.py
+          python tests/test_tui.py
+          python tests/test_authenticity.py
+          python tests/test_usage_consistency.py
+          python tests/test_cache_replay.py
+          python tests/test_p0_p1_fixes.py
+          python tests/test_docs_consistency.py
+
+      - name: Run PS1 launcher tests (Windows)
+        if: runner.os == 'Windows'
+        run: python tests/test_ps1_launcher.py
+
+      - name: Lint and format check
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: |
+          pip install ruff
+          ruff check .
+          ruff format --check .
+
+      - name: Build and smoke-test wheel entrypoint
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: |
+          pip install build
+          python -m build --wheel
+          pip install dist/*.whl
+          cc-pulse --help
+          cc-pulse check --help
+          cc-pulse env-check --no-db --json

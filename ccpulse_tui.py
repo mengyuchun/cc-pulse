@@ -2,6 +2,7 @@
 
 Windows 用 msvcrt，Unix 用 termios+tty。非 TTY 环境自动降级。
 """
+
 from __future__ import annotations
 
 import sys
@@ -20,6 +21,7 @@ def _is_tty() -> bool:
 
 
 def _getch_unix() -> str:
+    import select
     import termios
     import tty
 
@@ -28,10 +30,16 @@ def _getch_unix() -> str:
     try:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
-        # ESC 开头读转义序列
+        # ESC 开头：仅在 50ms 内有后续字节时读取转义序列，防止单按 ESC 阻塞
         if ch == "\x1b":
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                return ch
             ch2 = sys.stdin.read(1)
             if ch2 == "[":
+                ready2, _, _ = select.select([fd], [], [], 0.05)
+                if not ready2:
+                    return ch + ch2
                 ch3 = sys.stdin.read(1)
                 return f"\x1b[{ch3}"
             return ch + ch2
@@ -119,7 +127,9 @@ def select(
                 arrow = "▸" if i == cursor else " "
                 extra = ""
                 lines.append(f"  {arrow} {mark} {options[i]}{extra}")
-            lines.append(f"  [{sum(checked)}/{n}]" if multi else f"  [{cursor + 1}/{n}]")
+            lines.append(
+                f"  [{sum(checked)}/{n}]" if multi else f"  [{cursor + 1}/{n}]"
+            )
             _print_lines(lines, redraw_from=prev_lines)
             prev_lines = len(lines)
 

@@ -8,6 +8,7 @@ trend 读取归档，按供应商（可选按模型）聚合成功率/延迟分�
 import json
 import os
 import re
+import tempfile
 import time
 
 from ccpulse_output import _pad, _sanitize_for_terminal
@@ -35,9 +36,14 @@ def archive_path(override: str | None = None) -> str:
         from pathlib import Path
 
         p = Path(override).resolve()
-        home = Path.home()
-        if not (p.is_relative_to(home) or p.is_relative_to(Path.cwd())):
-            raise ValueError(f"归档路径必须在 {home} 或当前目录下: {p}")
+        home = Path.home().resolve()
+        tmpdir = Path(tempfile.gettempdir()).resolve()
+        if not (
+            p.is_relative_to(home)
+            or p.is_relative_to(Path.cwd().resolve())
+            or p.is_relative_to(tmpdir)
+        ):
+            raise ValueError(f"归档路径必须在 {home}、当前目录或临时目录下: {p}")
         return str(p)
     return os.path.join(os.path.expanduser("~"), ".cc-pulse", "probe_history.jsonl")
 
@@ -247,7 +253,9 @@ def format_trend_human(trend: dict) -> str:
     lines.append("-" * 88)
     for p in trend["providers"]:
         rate = f"{p['success_rate'] * 100:.0f}%"
-        dir_mark = {"up": "↑", "down": "↓", "stable": "→"}.get(p.get("trend_direction"), "")
+        dir_mark = {"up": "↑", "down": "↓", "stable": "→"}.get(
+            p.get("trend_direction"), ""
+        )
         if dir_mark:
             rate += dir_mark
         p50 = f"{p['lat_p50']:.0f}ms" if p["lat_p50"] is not None else "-"

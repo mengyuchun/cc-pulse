@@ -136,9 +136,11 @@ combined = out + err
 test("再测一次 exit 0 或 1", rc in (0, 1), f"rc={rc}")
 test("输出含 '重新检测中'", "重新检测中" in combined)
 # check 应被调用两次（首测 + 重测）：stderr 里 Invoke-CcpulseJson 的命令行出现 2 次
-check_count = combined.count("check --type") + combined.count(
-    "check_ccswitch_health.py check"
-) + combined.count("-u check_ccswitch_health.py check")
+check_count = (
+    combined.count("check --type")
+    + combined.count("check_ccswitch_health.py check")
+    + combined.count("-u check_ccswitch_health.py check")
+)
 test("check 被调用 2 次（首测+重测）", check_count >= 2, f"check_count={check_count}")
 
 
@@ -182,7 +184,10 @@ stdin_text = (
 rc, out, err = run_pwsh(stdin_text, timeout=180)
 combined = out + err
 test("退出码 0 或 1 或 2", rc in (0, 1, 2), f"rc={rc} stderr_tail={err[-300:]}")
-test("输出含 inspect 步骤", "1/2" in combined or "Provider" in combined or "模型" in combined)
+test(
+    "输出含 inspect 步骤",
+    "1/2" in combined or "Provider" in combined or "模型" in combined,
+)
 test("输出含 Provider 提示", "Provider" in combined or "Mock-Provider" in combined)
 test("输出含模型名", "claude-haiku-4-5" in combined)
 test(
@@ -229,12 +234,12 @@ test("显示保真探针入口", "保真·" in combined)
 
 
 print("\n[PS1] 高级设置端到端：开启 JSON 后快速体检输出 JSON")
-# [4]高级设置 -> 1(JSON项) -> y 开 -> 13/返主菜单 -> [1]体检 -> [1]快速 -> 不深挖(5) -> [5]退出
+# [4]高级设置 -> 1(JSON项) -> y 开 -> 11/返主菜单 -> [1]体检 -> [1]快速 -> 不深挖(5) -> [5]退出
 stdin_text = (
     "4\n"  # 主菜单: 高级设置
     "1\n"  # 选第 1 项: JSON
     "y\n"  # JSON: 开
-    "13\n"  # 返回主菜单（末项）
+    "11\n"  # 返回主菜单（末项）
     "1\n"  # 主菜单: 体检
     "1\n"  # 子菜单: 快速
     "5\n"  # 深挖选择：不深挖（末项）
@@ -248,7 +253,7 @@ test("stdout 含 JSON 报告", '"schema_version"' in combined or '"providers"' i
 
 
 print("\n[PS1] 高级设置：上下文档位 1m + vision 后 inspect 带参")
-# [4]高级设置 -> 5(上下文档位,选1m) -> 6(vision) y -> 13 返主菜单
+# [4]高级设置 -> 5(上下文档位,选1m) -> 6(vision) y -> 11 返主菜单
 #        -> [1]体检 -> [2]inspect: type默认 -> provider序号1 -> 模式默认 -> model序号1 -> 返回 -> [5]退出
 stdin_text = (
     "4\n"  # 主菜单: 高级设置
@@ -256,7 +261,7 @@ stdin_text = (
     "2\n"  # 上下文档位选择: 2 = 1m
     "6\n"  # 第 6 项: vision
     "y\n"  # vision: 开
-    "13\n"  # 返回主菜单（末项）
+    "11\n"  # 返回主菜单（末项）
     "2\n"  # 主菜单: 深度诊断
     "2\n"  # 子菜单: inspect
     "\n"  # type 默认 claude
@@ -281,17 +286,14 @@ test(
 )
 
 
-print("\n[PS1] 高级设置：开启保真探针后 inspect 带参")
-# [4]高级设置 -> 8(知识截止) y -> 9(分布指纹) 5 -> 13 返主菜单
+print("\n[PS1] 高级设置：开启缓存回放保真探针后 inspect 带参")
+# [4]高级设置 -> 7(缓存回放) y -> 11 返主菜单
 #        -> [2]inspect: type默认 -> provider序号1 -> 模式默认 -> model序号1 -> 返回 -> [5]退出
-# js-samples 用小值 5（测试只验命令行带参，不真跑 200 次）
 stdin_text = (
     "4\n"  # 主菜单: 高级设置
-    "8\n"  # 第 8 项: 保真·知识截止
-    "y\n"  # 知识截止: 开
-    "9\n"  # 第 9 项: 保真·分布指纹
-    "5\n"  # 分布指纹: 开 + 采样 5（测试用小值）
-    "13\n"  # 返回主菜单（末项）
+    "7\n"  # 第 7 项: 保真·缓存回放
+    "y\n"  # 缓存回放: 开
+    "11\n"  # 返回主菜单（末项）
     "2\n"  # 主菜单: 深度诊断
     "2\n"  # 子菜单: inspect
     "\n"  # type 默认 claude
@@ -305,21 +307,15 @@ rc, out, err = run_pwsh(stdin_text, timeout=180)
 combined = out + err
 test("保真探针 inspect exit 0/1/2", rc in (0, 1, 2), f"rc={rc} tail={combined[-500:]}")
 test(
-    "inspect 命令含 knowledge-cutoff include",
-    "knowledge-cutoff" in combined,
-    f"tail={combined[-500:]}",
-)
-test(
-    "inspect 命令含 js-fingerprint + --js-samples",
-    "js-fingerprint" in combined and "--js-samples" in combined,
+    "inspect 命令含 cache-replay include",
+    "cache-replay" in combined,
     f"tail={combined[-500:]}",
 )
 
 
 print("\n[PS1] 运行日志入口 - 选项 3")
-# 主菜单 3(运行日志) -> 日志菜单选 10(返回主菜单) -> 主菜单 5 退出
-# 新增 env-check/trend/health 三个入口后返回项从 7 变 10
-rc, out, err = run_pwsh("3\n10\n5\n", timeout=60)
+# 主菜单 3(运行日志) -> 日志菜单选 7(返回主菜单) -> 主菜单 5 退出
+rc, out, err = run_pwsh("3\n7\n5\n", timeout=60)
 combined = out + err
 test(
     "运行日志菜单可见",
@@ -390,6 +386,8 @@ cur.execute("""CREATE TABLE providers (
     name TEXT, app_type TEXT, settings_config TEXT,
     is_current INTEGER, in_failover_queue INTEGER, sort_index INTEGER
 )""")
+
+
 def _insert_ps1_provider(name, haiku, sonnet=None):
     env = {
         "ANTHROPIC_BASE_URL": "http://127.0.0.1:9/v1",
@@ -402,6 +400,8 @@ def _insert_ps1_provider(name, haiku, sonnet=None):
         "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)",
         (name, "claude", json.dumps({"env": env}), 0, 1, 0),
     )
+
+
 _insert_ps1_provider("P1", "claude-haiku-4-5", "claude-sonnet-4-5")
 _insert_ps1_provider("P2", "claude-haiku-4-5")
 conn.commit()

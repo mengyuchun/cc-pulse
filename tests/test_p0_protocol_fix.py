@@ -40,9 +40,7 @@ class ProbeStreamConsistency(unittest.TestCase):
         answer = "答案是 13"
         self.assertTrue(mod._answer_correct(answer, "13"))
         self.assertFalse(mod._answer_correct(answer, "5"))
-        with open(
-            os.path.join(_ROOT, "ccpulse_probe.py"), encoding="utf-8"
-        ) as file:
+        with open(os.path.join(_ROOT, "ccpulse_probe.py"), encoding="utf-8") as file:
             source = file.read()
         start = source.index("def probe_stream(")
         end = source.index("\n\ndef _status_badge", start)
@@ -106,7 +104,7 @@ class HealthCheckWrongAnswerDetail(unittest.TestCase):
         finally:
             mod.probe = original_probe
         output = "\n".join(lines)
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 3)
         self.assertIn("不可用详情", output)
         self.assertIn("答案不符，实际回答", output)
         self.assertIn("错误答案", output)

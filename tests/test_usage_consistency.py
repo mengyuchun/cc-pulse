@@ -268,7 +268,7 @@ class BatchOneResponseTest(unittest.TestCase):
     def test_probe_stream_preserves_responses_failed_reason(self):
         provider = self._responses_provider()
         body = (
-            b'event: response.failed\r\n'
+            b"event: response.failed\r\n"
             b'data: {"type":"response.failed","response":{"status":"failed",'
             b'"error":{"code":"server_error","message":"quota exceeded"}}}\r\n\r\n'
         )
@@ -321,10 +321,10 @@ class BatchOneResponseTest(unittest.TestCase):
         )
         original = mod.urllib.request.urlopen
         body = (
-            b'event: response.output_text.delta\r\n'
+            b"event: response.output_text.delta\r\n"
             b'data: {"type":"response.output_text.delta",'
             b'"delta":"answer sk-stream-secret\x1b[31m"}\r\n\r\n'
-            b'event: response.completed\r\n'
+            b"event: response.completed\r\n"
             b'data: {"type":"response.completed",'
             b'"response":{"usage":{"input_tokens":1,"output_tokens":1}}}\r\n\r\n'
         )
@@ -409,6 +409,8 @@ class BatchOneResponseTest(unittest.TestCase):
             result["error_category"], mod.ErrorCategory.INVALID_RESPONSE.value
         )
         self.assertIn("backend failed", result["error"])
+
+
 class BatchTwoProtocolPayloadTest(unittest.TestCase):
     def _claude_openai_chat_provider(self):
         return mod.Provider(
@@ -428,7 +430,15 @@ class BatchTwoProtocolPayloadTest(unittest.TestCase):
 
         def fake_request(url, method, headers, body, timeout, skip_tls_verify):
             captured["payload"] = __import__("json").loads(body)
-            return type("Response", (), {"error_category": None, "status": 200, "body": '{"choices":[{"message":{"tool_calls":[{"function":{"name":"get_probe_number"}}]}}]}'})()
+            return type(
+                "Response",
+                (),
+                {
+                    "error_category": None,
+                    "status": 200,
+                    "body": '{"choices":[{"message":{"tool_calls":[{"function":{"name":"get_probe_number"}}]}}]}',
+                },
+            )()
 
         try:
             mod._http_request = fake_request
@@ -451,7 +461,15 @@ class BatchTwoProtocolPayloadTest(unittest.TestCase):
 
         def fake_request(url, method, headers, body, timeout, skip_tls_verify):
             captured["payload"] = __import__("json").loads(body)
-            return type("Response", (), {"error_category": None, "status": 200, "body": '{"choices":[{"message":{"content":"red"}}]}'})()
+            return type(
+                "Response",
+                (),
+                {
+                    "error_category": None,
+                    "status": 200,
+                    "body": '{"choices":[{"message":{"content":"red"}}]}',
+                },
+            )()
 
         try:
             mod._http_request = fake_request
@@ -464,3 +482,7 @@ class BatchTwoProtocolPayloadTest(unittest.TestCase):
         self.assertEqual(content[0]["type"], "text")
         self.assertEqual(content[1]["type"], "image_url")
         self.assertNotIn("thinking", captured["payload"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -36,37 +36,17 @@ models-probe:
 models-probe-all:
     {{PYTHON}} {{SCRIPT}} list-models --probe --source both
 
-# 拉列表 + 深度探测每个模型（5 维度：text/streaming/metadata/thinking/tools）
-models-deep:
-    {{PYTHON}} {{SCRIPT}} list-models --failover-only --deep --timeout 60
-
-# 最近失败日志
+# 最近失败日志（已迁至独立个人脚本 scripts/ccswitch_logs.py）
 history-fails:
-    {{PYTHON}} {{SCRIPT}} history --fails --limit 30
+    {{PYTHON}} scripts/ccswitch_logs.py history --fails --limit 30
 
-# 7 天统计
+# 7 天统计（已迁至独立个人脚本 scripts/ccswitch_logs.py）
 stats:
-    {{PYTHON}} {{SCRIPT}} stats --since 7d
+    {{PYTHON}} scripts/ccswitch_logs.py stats --since 7d
 
-# 静默路由排行
+# 静默路由排行（已迁至独立个人脚本 scripts/ccswitch_logs.py）
 routing:
-    {{PYTHON}} {{SCRIPT}} routing --since 7d --limit 20
-
-# 实时监控 cc-switch 日志（Ctrl+C 结束）
-watch:
-    {{PYTHON}} {{SCRIPT}} watch --interval 3
-
-# 多维分析报表（全维度，7 天）
-analyze:
-    {{PYTHON}} {{SCRIPT}} analyze --since 7d
-
-# 按模型延迟分析
-analyze-model:
-    {{PYTHON}} {{SCRIPT}} analyze --mode model --since 7d
-
-# 按天健康趋势
-analyze-daily:
-    {{PYTHON}} {{SCRIPT}} analyze --mode day --since 30d
+    {{PYTHON}} scripts/ccswitch_logs.py routing --since 7d --limit 20
 
 # JSON 健康报告（管道到 jq）
 check-json:
@@ -80,7 +60,7 @@ test:
 test-ps1:
     {{PYTHON}} tests/test_ps1_launcher.py
 
-# 全部测试（12 个文件：主套件 + 保真探针专项 + PS1 + 环境检测 + 归档 + TUI + 文档守卫）
+# 全部测试（主套件 + 保真探针专项 + PS1 + 环境检测 + 归档 + TUI + 文档守卫）
 test-all:
     {{PYTHON}} tests/test_ccpulse_full.py
     {{PYTHON}} tests/test_p0_protocol_fix.py
@@ -92,8 +72,7 @@ test-all:
     {{PYTHON}} tests/test_authenticity.py
     {{PYTHON}} tests/test_usage_consistency.py
     {{PYTHON}} tests/test_cache_replay.py
-    {{PYTHON}} tests/test_knowledge_cutoff.py
-    {{PYTHON}} tests/test_js_fingerprint.py
+    {{PYTHON}} tests/test_p0_p1_fixes.py
 
 # 探测历史趋势（归档跨次聚合）
 trend:

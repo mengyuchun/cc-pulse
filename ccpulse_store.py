@@ -33,6 +33,7 @@ def _fmt_ts(ts) -> str:
     except (TypeError, ValueError, OverflowError, OSError):
         return str(ts)
 
+
 def _sanitize_log_text(value, secrets: tuple[str, ...] = ()) -> str:
     """Remove common and known credential forms before reports."""
     text = str(value or "")
@@ -274,7 +275,6 @@ def parse_provider(
     return out
 
 
-
 # --- from check_ccswitch_health.py:1578-1934 ---
 def load_provider_id_map(db_path: str) -> dict:
     """provider_id(uuid) -> name；只读。"""
@@ -362,7 +362,182 @@ def classify_log_error(status_code: int | None, error_message: str | None) -> st
 
 
 def _open_ro(db_path: str):
-    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    import urllib.parse
+
+    quoted = urllib.parse.quote(str(db_path), safe="/:\\")
+    return sqlite3.connect(f"file:{quoted}?mode=ro", uri=True, timeout=2.0)
+
+
+def build_manual_provider(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str = "",
+    app_type: str = "claude",
+    name: str = "manual",
+    auth_mode: str | None = None,
+    protocol: Protocol = Protocol.UNKNOWN,
+) -> Provider:
+    """无 cc-switch.db 时由 --base-url / --api-key-env 构造单供应商实例。"""
+    resolved_auth = auth_mode or (
+        "bearer" if app_type in ("codex", "openclaw") else "authtoken"
+    )
+    clean_model = re.sub(r"\[.*?\]$", "", model or "").strip()
+    tiers = [ModelTier("default", clean_model, model)] if clean_model else []
+    base_stripped = base_url.rstrip("/")
+    is_or = "/chat/completions" in base_stripped
+    proto = protocol
+    p_source = "cli_arg" if proto != Protocol.UNKNOWN else ""
+    if proto == Protocol.UNKNOWN:
+        if "/chat/completions" in base_stripped:
+            proto = Protocol.OPENAI_CHAT_COMPLETIONS
+            p_source = "url_suffix"
+        elif base_stripped.endswith("/responses") or "/v1/responses" in base_stripped:
+            proto = Protocol.OPENAI_RESPONSES
+            p_source = "url_suffix"
+        elif app_type == "codex":
+            proto = Protocol.OPENAI_RESPONSES
+            p_source = "app_type"
+        elif app_type == "openclaw":
+            proto = Protocol.OPENAI_CHAT_COMPLETIONS
+            p_source = "app_type"
+    return Provider(
+        name=name,
+        app_type=app_type,
+        base_url=base_url,
+        api_key=api_key,
+        auth_mode=resolved_auth,
+        tiers=tiers,
+        is_current=True,
+        in_failover=True,
+        is_openrouter=is_or,
+        protocol=proto,
+        protocol_source=p_source,
+    )
+
+
+def load_standalone_providers(home_dir: Path | None = None) -> list:
+    """无 cc-switch.db 时按顺序自动发现独立配置：
+    1) ~/.cc-pulse/providers.toml
+    2) ~/.claude/settings.json（env 块）
+    3) ~/.codex/config.toml + ~/.codex/auth.json
+    """
+    from ccpulse_env import _load_toml_minimal
+
+    home = Path.home() if home_dir is None else Path(home_dir)
+    out: list[Provider] = []
+
+    pulse_toml = home / ".cc-pulse" / "providers.toml"
+    if pulse_toml.exists():
+        try:
+            data = _load_toml_minimal(pulse_toml)
+            provs = data.get("providers")
+            items = provs.items() if isinstance(provs, dict) else []
+            for pname, pcfg in items:
+                if not isinstance(pcfg, dict):
+                    continue
+                base = str(pcfg.get("base_url") or "").strip()
+                key = str(pcfg.get("api_key") or "").strip()
+                if not key and pcfg.get("api_key_env"):
+                    import os
+
+                    key = os.environ.get(str(pcfg["api_key_env"]), "").strip()
+                app_type = str(
+                    pcfg.get("app_type") or pcfg.get("type") or "claude"
+                ).strip()
+                model = str(pcfg.get("model") or "").strip()
+                tiers = []
+                for tname in TIER_ORDER:
+                    tm = str(pcfg.get(tname) or "").strip()
+                    if tm:
+                        tiers.append(ModelTier(tname, re.sub(r"\[.*?\]$", "", tm), tm))
+                if not tiers and model:
+                    tiers.append(
+                        ModelTier("default", re.sub(r"\[.*?\]$", "", model), model)
+                    )
+                if base and key and tiers:
+                    p = build_manual_provider(
+                        base_url=base,
+                        api_key=key,
+                        model=tiers[0].raw_model,
+                        app_type=app_type,
+                        name=str(pname),
+                        auth_mode=str(pcfg.get("auth_mode") or "") or None,
+                    )
+                    out.append(
+                        Provider(
+                            name=p.name,
+                            app_type=p.app_type,
+                            base_url=p.base_url,
+                            api_key=p.api_key,
+                            auth_mode=p.auth_mode,
+                            tiers=tiers,
+                            is_current=bool(pcfg.get("is_current", True)),
+                            in_failover=bool(pcfg.get("in_failover", True)),
+                            is_openrouter=p.is_openrouter,
+                            protocol=p.protocol,
+                            protocol_source=p.protocol_source,
+                        )
+                    )
+        except (OSError, ValueError, TypeError):
+            pass
+
+    claude_settings = home / ".claude" / "settings.json"
+    if claude_settings.exists():
+        try:
+            cfg = json.loads(
+                claude_settings.read_text(encoding="utf-8", errors="replace")
+            )
+            env = cfg.get("env") if isinstance(cfg, dict) else None
+            if isinstance(env, dict):
+                out.extend(
+                    parse_provider(
+                        "claude-settings", "claude", {"env": env}, True, True
+                    )
+                )
+        except (OSError, ValueError, TypeError):
+            pass
+
+    codex_toml = home / ".codex" / "config.toml"
+    if codex_toml.exists():
+        try:
+            tdata = _load_toml_minimal(codex_toml)
+            mp_name = tdata.get("model_provider")
+            mp_tbl = (
+                (tdata.get("model_providers") or {}).get(mp_name, {}) if mp_name else {}
+            )
+            base = str(
+                (mp_tbl.get("base_url") if isinstance(mp_tbl, dict) else "")
+                or tdata.get("base_url")
+                or ""
+            ).strip()
+            model = str(tdata.get("model") or "").strip()
+            key = ""
+            codex_auth = home / ".codex" / "auth.json"
+            if codex_auth.exists():
+                try:
+                    adata = json.loads(
+                        codex_auth.read_text(encoding="utf-8", errors="replace")
+                    )
+                    if isinstance(adata, dict):
+                        key = str(adata.get("OPENAI_API_KEY") or "").strip()
+                except (OSError, ValueError, TypeError):
+                    pass
+            if base and key and model:
+                out.append(
+                    build_manual_provider(
+                        base_url=base,
+                        api_key=key,
+                        model=model,
+                        app_type="codex",
+                        name=str(mp_name or "codex-config"),
+                        auth_mode="bearer",
+                    )
+                )
+        except (OSError, ValueError, TypeError):
+            pass
+
+    return out
 
 
 def _table_exists(conn, name: str) -> bool:
@@ -492,7 +667,10 @@ def query_stats(db_path: str, *, since_ts: int | None = None) -> list:
                 except (TypeError, ValueError):
                     pass
             # token 用量聚合
-            for tk, dk in (("input_tokens", "input_tokens"), ("output_tokens", "output_tokens")):
+            for tk, dk in (
+                ("input_tokens", "input_tokens"),
+                ("output_tokens", "output_tokens"),
+            ):
                 tv = d.get(dk)
                 if isinstance(tv, (int, float)) and tv >= 0:
                     b[tk] += int(tv)
@@ -633,7 +811,6 @@ def read_log_file_tail(path: str, lines: int = 50, keyword: str | None = None) -
     if keyword:
         raw_lines = [ln for ln in raw_lines if keyword.lower() in ln.lower()]
     return raw_lines[-lines:]
-
 
 
 # --- from check_ccswitch_health.py:2245-2596 ---
@@ -987,6 +1164,3 @@ def analyze_provider_deep(
         "by_model": by_model,
         "by_day_model": dm,
     }
-
-
-

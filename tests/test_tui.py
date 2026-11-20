@@ -1,4 +1,5 @@
 """CC-Pulse TUI 选择器单元测试。"""
+
 from __future__ import annotations
 
 import importlib

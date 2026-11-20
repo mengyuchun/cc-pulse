@@ -68,7 +68,10 @@ coverage.xml
 .cache/
 *.cache
 .ruff_cache/
+.pytest_cache/
 
-# Local data dumps
+# Local data dumps / scratch tests
 outputs/
 results/
+Test/
+AGENTS.md
