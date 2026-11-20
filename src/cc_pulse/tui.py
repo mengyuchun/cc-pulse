@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sys
 
-from ccpulse_output import _sanitize_for_terminal
+from cc_pulse.output import _sanitize_for_terminal
 
 # ANSI 转义
 _HIDE_CURSOR = "\x1b[?25l"

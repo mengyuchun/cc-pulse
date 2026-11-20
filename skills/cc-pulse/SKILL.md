@@ -5,7 +5,7 @@ description: Zero-dependency CLI health check, capability probe, and authenticit
 
 # CC-Pulse Relay & API Key Diagnostic Skill
 
-Use `cc-pulse` (or `python check_ccswitch_health.py` if running from a local checkout) to diagnose API endpoints safely without printing raw API keys.
+Use `cc-pulse` (or `python src/cc_pulse/cli.py` if running from a local checkout) to diagnose API endpoints safely without printing raw API keys.
 
 ## Recommended Progressive Workflow
 
@@ -35,4 +35,4 @@ Use `cc-pulse` (or `python check_ccswitch_health.py` if running from a local che
 ## Safety Rules
 - Never pass a raw secret key literal on `--api-key-env`; pass the environment variable name (e.g. `ANTHROPIC_AUTH_TOKEN`).
 - Never paste unmasked keys from configs into responses.
-- Keep `check_ccswitch_health.py` / `cc-pulse` strictly read-only toward `cc-switch.db`.
+- Keep `cc-pulse` strictly read-only toward `cc-switch.db`.

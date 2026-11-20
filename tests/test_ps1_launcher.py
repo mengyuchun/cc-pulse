@@ -25,8 +25,8 @@ PY = os.environ.get("CC_PULSE_PYTHON", sys.executable)
 SCRIPT_DIR = os.environ.get(
     "CC_PULSE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
-PS1 = os.path.join(SCRIPT_DIR, "run_health_check.ps1")
-MAIN = os.path.join(SCRIPT_DIR, "check_ccswitch_health.py")
+PS1 = os.path.join(SCRIPT_DIR, "scripts", "run_health_check.ps1")
+MAIN = os.path.join(SCRIPT_DIR, "src", "cc_pulse", "cli.py")
 PWSH = os.environ.get("CC_PULSE_PWSH") or shutil.which("pwsh") or "pwsh"
 
 PASSED = []
@@ -112,9 +112,9 @@ test("输出含 '健康检测'", "健康检测" in combined)
 test("输出含 '完成'", "完成" in combined)
 test(
     "调用了 check 子命令",
-    "check_ccswitch_health.py check" in combined
+    "src/cc_pulse/cli.py check" in combined
     or "check --type" in combined
-    or "-u check_ccswitch_health.py check" in combined
+    or "-u src/cc_pulse/cli.py check" in combined
     or " -u " in combined,
 )
 test("快速体检带 --failover-only", "--failover-only" in combined)
@@ -138,8 +138,8 @@ test("输出含 '重新检测中'", "重新检测中" in combined)
 # check 应被调用两次（首测 + 重测）：stderr 里 Invoke-CcpulseJson 的命令行出现 2 次
 check_count = (
     combined.count("check --type")
-    + combined.count("check_ccswitch_health.py check")
-    + combined.count("-u check_ccswitch_health.py check")
+    + combined.count("src/cc_pulse/cli.py check")
+    + combined.count("-u src/cc_pulse/cli.py check")
 )
 test("check 被调用 2 次（首测+重测）", check_count >= 2, f"check_count={check_count}")
 

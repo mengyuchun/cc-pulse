@@ -1,6 +1,5 @@
 """ccpulse_env 环境变量覆盖检测 单元测试（纯标准库，不依赖 pytest）。"""
 
-import importlib.util
 import io
 import json
 import os
@@ -10,15 +9,11 @@ from types import SimpleNamespace
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-SCRIPT = os.path.join(_ROOT, "ccpulse_env.py")
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+_SRC = os.path.join(_ROOT, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
-# 通过 importlib 加载项目模块
-spec = importlib.util.spec_from_file_location("ccpulse_env", SCRIPT)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-
+from cc_pulse import env as mod
 
 PASSED = []
 FAILED = []

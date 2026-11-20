@@ -6,17 +6,17 @@ import importlib
 import os
 import sys
 
-# 项目根目录加入 sys.path
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _root not in sys.path:
-    sys.path.insert(0, _root)
+# 项目 src 目录加入 sys.path
+_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
 
 def _reload_tui():
     """强制重新加载模块（确保从源码加载）。"""
-    if "ccpulse_tui" in sys.modules:
-        del sys.modules["ccpulse_tui"]
-    return importlib.import_module("ccpulse_tui")
+    if "cc_pulse.tui" in sys.modules:
+        del sys.modules["cc_pulse.tui"]
+    return importlib.import_module("cc_pulse.tui")
 
 
 mod = _reload_tui()

@@ -13,16 +13,19 @@ from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+_SRC = os.path.join(_ROOT, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
-import ccpulse_archive
-import ccpulse_env
-import ccpulse_net
-import ccpulse_probe
-import ccpulse_store
+from cc_pulse import archive as ccpulse_archive
+from cc_pulse import cli as ccpulse_cli
+from cc_pulse import env as ccpulse_env
+from cc_pulse import interactive as ccpulse_interactive
+from cc_pulse import net as ccpulse_net
+from cc_pulse import probe as ccpulse_probe
+from cc_pulse import store as ccpulse_store
 
-SCRIPT = os.path.join(_ROOT, "check_ccswitch_health.py")
+SCRIPT = os.path.join(_SRC, "cc_pulse", "cli.py")
 
 
 class HelpSubcommandsTest(unittest.TestCase):
@@ -372,17 +375,21 @@ class StandaloneAndArchiveTempTest(unittest.TestCase):
 
     def test_claude_code_headers_dynamic_os_and_arch(self):
         with (
-            unittest.mock.patch("ccpulse_probe.platform.system", return_value="Darwin"),
-            unittest.mock.patch("ccpulse_probe.platform.machine", return_value="arm64"),
+            unittest.mock.patch(
+                "cc_pulse.probe.platform.system", return_value="Darwin"
+            ),
+            unittest.mock.patch(
+                "cc_pulse.probe.platform.machine", return_value="arm64"
+            ),
         ):
             hdrs = ccpulse_probe._claude_code_headers(user_agent="test/1.0")
             self.assertEqual(hdrs["x-stainless-os"], "MacOS")
             self.assertEqual(hdrs["x-stainless-arch"], "arm64")
 
         with (
-            unittest.mock.patch("ccpulse_probe.platform.system", return_value="Linux"),
+            unittest.mock.patch("cc_pulse.probe.platform.system", return_value="Linux"),
             unittest.mock.patch(
-                "ccpulse_probe.platform.machine", return_value="x86_64"
+                "cc_pulse.probe.platform.machine", return_value="x86_64"
             ),
         ):
             hdrs = ccpulse_probe._claude_code_headers(user_agent="test/1.0")
@@ -391,9 +398,11 @@ class StandaloneAndArchiveTempTest(unittest.TestCase):
 
         with (
             unittest.mock.patch(
-                "ccpulse_probe.platform.system", return_value="Windows"
+                "cc_pulse.probe.platform.system", return_value="Windows"
             ),
-            unittest.mock.patch("ccpulse_probe.platform.machine", return_value="AMD64"),
+            unittest.mock.patch(
+                "cc_pulse.probe.platform.machine", return_value="AMD64"
+            ),
         ):
             hdrs = ccpulse_probe._claude_code_headers(user_agent="test/1.0")
             self.assertEqual(hdrs["x-stainless-os"], "Windows")
@@ -416,12 +425,6 @@ class StandaloneAndArchiveTempTest(unittest.TestCase):
             self.assertEqual(findings[0]["severity"], "conflict")
 
     def test_cloud_backend_openai_official_with_resolved_protocol_and_card_link(self):
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location("ccpulse_card_mod", SCRIPT)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-
         p = ccpulse_probe.Provider(
             name="codex-auto",
             app_type="codex",
@@ -439,7 +442,7 @@ class StandaloneAndArchiveTempTest(unittest.TestCase):
             ccpulse_probe._resolve_protocol(p),
         )
         self.assertEqual(bo["origin"], "openai_official")
-        card = mod.format_inspect_card(
+        card = ccpulse_cli.format_inspect_card(
             {
                 "provider": "codex-auto",
                 "model": "gpt-5",
@@ -449,6 +452,59 @@ class StandaloneAndArchiveTempTest(unittest.TestCase):
             }
         )
         self.assertIn("https://github.com/mengyuchun/cc-pulse", card)
+
+    def test_interactive_menu_dispatches_and_cleans_temp_key(self):
+        calls = []
+        seen_keys = []
+
+        def fake_run(argv):
+            calls.append(list(argv))
+            seen_keys.append(os.environ.get(ccpulse_interactive._TEMP_KEY_ENV))
+            return 0
+
+        # 依次选 1(env-check) -> 2(单端点测活，输入 URL/protocol/model) -> 0(退出)
+        answers = iter(["1", "2", "https://relay.test", "2", "claude-sonnet-4-5", "0"])
+        rc = ccpulse_interactive.run_interactive_menu(
+            fake_run,
+            input_fn=lambda _p: next(answers),
+            secret_fn=lambda _p: "sk-temp-menu-key",
+            print_fn=lambda _s="": None,
+            pause=False,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls[0], ["env-check"])
+        self.assertEqual(
+            calls[1],
+            [
+                "check",
+                "--no-db",
+                "--base-url",
+                "https://relay.test",
+                "--api-key-env",
+                ccpulse_interactive._TEMP_KEY_ENV,
+                "--protocol",
+                "anthropic",
+                "--model",
+                "claude-sonnet-4-5",
+            ],
+        )
+        self.assertEqual(seen_keys[1], "sk-temp-menu-key")
+        self.assertNotIn(ccpulse_interactive._TEMP_KEY_ENV, os.environ)
+
+    def test_should_open_interactive_menu_only_on_no_arg_tty(self):
+        self.assertFalse(
+            ccpulse_cli._should_open_interactive_menu(["cc-pulse", "check"])
+        )
+        with (
+            unittest.mock.patch.object(sys.stdin, "isatty", return_value=True),
+            unittest.mock.patch.object(sys.stdout, "isatty", return_value=True),
+        ):
+            self.assertTrue(ccpulse_cli._should_open_interactive_menu(["cc-pulse"]))
+        with (
+            unittest.mock.patch.object(sys.stdin, "isatty", return_value=False),
+            unittest.mock.patch.object(sys.stdout, "isatty", return_value=True),
+        ):
+            self.assertFalse(ccpulse_cli._should_open_interactive_menu(["cc-pulse"]))
 
 
 if __name__ == "__main__":

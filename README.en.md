@@ -10,7 +10,7 @@ Don't trust HTTP 200. Verify that your API key actually answers, isn't silently 
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-595%20pass-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/tests-597%20pass-brightgreen.svg)](#tests)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -28,7 +28,7 @@ Don't trust HTTP 200. Verify that your API key actually answers, isn't silently 
 
 ## 10-Second Quick Start (No `git clone`, No `cc-switch.db` Required)
 
-> **No Python installed?** Download a standalone single-file binary from [GitHub Releases](https://github.com/mengyuchun/cc-pulse/releases) (`cc-pulse-windows-x64.exe`, `cc-pulse-macos-arm64`, `cc-pulse-linux-x64`, or cross-platform `cc-pulse.pyz`) and replace `uvx cc-pulse` below with the downloaded binary.
+> **No Python installed? Double-click ready:** Download a standalone single-file binary from [GitHub Releases](https://github.com/mengyuchun/cc-pulse/releases) (`cc-pulse-windows-x64.exe`, `cc-pulse-macos-arm64`, `cc-pulse-linux-x64`, or cross-platform `cc-pulse.pyz`). Running it with **no arguments (or double-clicking `.exe`)** opens an interactive guided menu with masked API-key input; passing CLI subcommands runs headless automation.
 
 ### Step 1: Zero-Key Environment Check (Sends Zero HTTP Requests)
 ```bash
@@ -54,7 +54,7 @@ Outputs a ≤25-line sanitized Markdown card (zero keys, zero full URLs) coverin
 - **Zero-request cloud backend origin** (`Official / AWS Bedrock / Google Vertex / Unknown`)
 - **P0/P1 authenticity checks** (cross-protocol spoofing, thinking signature presence, usage consistency)
 
-> From source: `python check_ccswitch_health.py ...` or `pip install .`.
+> From source: `python src/cc_pulse/cli.py ...` or `pip install .`.
 
 ---
 
@@ -95,7 +95,7 @@ Outputs a ≤25-line sanitized Markdown card (zero keys, zero full URLs) coverin
 
 ## Tests
 
-Pure-stdlib unit + local mock HTTP server end-to-end tests (zero real provider calls). Currently **543 Python tests + 52 PS1 tests**:
+Pure-stdlib unit + local mock HTTP server end-to-end tests (zero real provider calls). Currently **545 Python tests + 52 PS1 tests**:
 
 | Test file | Scope | Cases |
 |---|---|---|
@@ -107,7 +107,7 @@ Pure-stdlib unit + local mock HTTP server end-to-end tests (zero real provider c
 | `tests/test_p0_protocol_fix.py` | P0 protocol inference regression | 4 |
 | `tests/test_env_check.py` | Environment override detection | 14 |
 | `tests/test_tui.py` | Cross-platform TUI selector | 9 |
-| `tests/test_p0_p1_fixes.py` | 3xx redirect safety, closed-socket SSE, standalone & card | 12 |
+| `tests/test_p0_p1_fixes.py` | 3xx redirect safety, SSE, standalone, menu & card | 14 |
 | `tests/test_ps1_launcher.py` | Windows PS1 launcher E2E | 52 |
 | `tests/test_docs_consistency.py` | Docs-to-code consistency guard | — |
 

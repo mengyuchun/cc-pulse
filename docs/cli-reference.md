@@ -111,5 +111,5 @@ sonnet = "claude-sonnet-4-5"
   python scripts/ccswitch_logs.py stats --since 7d
   python scripts/ccswitch_logs.py routing --since 7d --limit 20
   ```
-- **Windows 桌面交互菜单**：`run_health_check.ps1`（需 PowerShell 7+，面向个人桌面 `cc-switch.db` 一键体检，功能已冻结同步）。
+- **Windows 桌面交互菜单**：`scripts/run_health_check.ps1`（需 PowerShell 7+，面向个人桌面 `cc-switch.db` 一键体检，功能已冻结同步）。
 - **本地归档轮转**：`trim_archive` 在 `~/.cc-pulse/probe_history.jsonl` 超过 5MB 且超过 10000 条记录时自动保留最新记录；`trend_direction` 使用 `↑` / `↓` / `→` 标注趋势方向。

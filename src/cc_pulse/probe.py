@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypedDict
 
-from ccpulse_net import (
+from cc_pulse.net import (
     STREAM_DONE_MARKERS,
     ErrorCategory,
     StreamEvent,
@@ -36,7 +36,7 @@ from ccpulse_net import (
     create_ssl_context,
     open_url_no_redirect,
 )
-from ccpulse_output import _c, _sanitize_url_for_display
+from cc_pulse.output import _c, _sanitize_url_for_display
 
 # 默认兜底的 claude-cli 版本（读取本机版本失败时用）
 _DEFAULT_CLAUDE_CLI_VERSION = "2.1.44"

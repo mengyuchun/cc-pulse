@@ -10,7 +10,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/stdlib%20only-green.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-595%20pass-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/tests-597%20pass-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -28,7 +28,7 @@
 
 ## 10 秒快速上手（免配置，无需 `cc-switch.db`）
 
-> **小白推荐（免装 Python）**：直接前往 [GitHub Releases](https://github.com/mengyuchun/cc-pulse/releases) 下载对应系统的单文件程序（`cc-pulse-windows-x64.exe` / `cc-pulse-macos-arm64` / `cc-pulse-linux-x64`），把下面命令里的 `uvx cc-pulse` 换成下载的程序名即可运行；也可下载纯 Python 单文件 `cc-pulse.pyz`（`python cc-pulse.pyz ...`）。
+> **小白推荐（免装 Python，双击即用）**：前往 [GitHub Releases](https://github.com/mengyuchun/cc-pulse/releases) 下载单文件程序（`cc-pulse-windows-x64.exe` / `cc-pulse-macos-arm64` / `cc-pulse-linux-x64`），**直接双击或无参数运行即进入交互式向导菜单**（支持安全隐藏输入 API Key，测完不闪退）；在命令行传参则走下方 CLI 模式。也可下载纯 Python 单文件 `cc-pulse.pyz`（`python cc-pulse.pyz`）。
 
 ### 第一步：零 Key 排雷（绝不发送任何 API Key）
 ```bash
@@ -54,7 +54,7 @@ uvx cc-pulse inspect --base-url https://relay.example.com --api-key-env MY_RELAY
 - **云后端来源归因**（零额外请求识别 `Official / AWS Bedrock / Google Vertex / Unknown`）
 - **P0/P1 防掺水保真**（跨协议换芯字段、`thinking` 签名存在性、`usage` 计费自洽）
 
-> 本地源码运行：`git clone` 后用 `python check_ccswitch_health.py ...` 或 `pip install .` 即可。
+> 本地源码运行：`git clone` 后用 `python src/cc_pulse/cli.py ...` 或 `pip install .` 即可。
 
 ---
 
@@ -95,7 +95,7 @@ uvx cc-pulse inspect --base-url https://relay.example.com --api-key-env MY_RELAY
 
 ## 测试
 
-纯标准库单元测试 + 本地 mock HTTP 端到端测试（不触达任何真实供应商）。当前 **543 个 Python 测试 + 52 个 PS1 测试**：
+纯标准库单元测试 + 本地 mock HTTP 端到端测试（不触达任何真实供应商）。当前 **545 个 Python 测试 + 52 个 PS1 测试**：
 
 | 测试文件 | 用途 | 用例数 |
 |---|---|---|
@@ -107,7 +107,7 @@ uvx cc-pulse inspect --base-url https://relay.example.com --api-key-env MY_RELAY
 | `tests/test_p0_protocol_fix.py` | P0 协议推断修复回归 | 4 |
 | `tests/test_env_check.py` | 环境变量覆盖检测 | 14 |
 | `tests/test_tui.py` | 跨平台 TUI 选择器 | 9 |
-| `tests/test_p0_p1_fixes.py` | 安全重定向、闭套接字 SSE、独立模式与战报卡 | 12 |
+| `tests/test_p0_p1_fixes.py` | 安全重定向、闭套接字 SSE、独立模式、交互菜单与战报卡 | 14 |
 | `tests/test_ps1_launcher.py` | Windows PS1 启动器交互测试 | 52 |
 | `tests/test_docs_consistency.py` | 文档与代码一致性守卫 | — |
 

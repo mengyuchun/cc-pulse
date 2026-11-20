@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ccpulse_output import _pad
+from cc_pulse.output import _pad
 
 # env 变量 → (tool, 配置取值类别)
 # 取值类别: base_url=供应商 base_url；token=供应商 api_key；tier:xxx=对应档位模型

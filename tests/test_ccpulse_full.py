@@ -27,18 +27,13 @@ from typing import ClassVar
 # 从项目根定位主脚本与当前解释器（可从任意目录运行）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-SCRIPT = os.path.join(_ROOT, "check_ccswitch_health.py")
+_SRC = os.path.join(_ROOT, "src")
+SCRIPT = os.path.join(_SRC, "cc_pulse", "cli.py")
 PY = sys.executable
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
-# 1. 通过 importlib 加载项目模块
-import importlib.util
-
-spec = importlib.util.spec_from_file_location("ccpulse", SCRIPT)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-
+from cc_pulse import cli as mod
 
 # 问题池 → 答案映射：mock 按实际收到的问题回对应答案（问题池随机化后不能写死 "5"）
 _POOL_ANSWER = {p["q"]: p["a"] for p in mod.PROBE_PROMPTS}
@@ -2695,7 +2690,7 @@ def fake_probe_tier(
 
 
 mod.probe_tier = fake_probe_tier
-import ccpulse_probe as _ccpulse_probe
+from cc_pulse import probe as _ccpulse_probe
 
 _orig_probe_tier_mod = _ccpulse_probe.probe_tier
 _ccpulse_probe.probe_tier = fake_probe_tier
@@ -3127,7 +3122,7 @@ test("vision codex unsupported", r.get("status") == "unsupported", f"r={r}")
 
 
 print("\n[Unit] classify_log_error + parse_since + history helpers")
-import ccpulse_archive
+from cc_pulse import archive as ccpulse_archive
 
 old_time = ccpulse_archive.time.time
 ccpulse_archive.time.time = lambda: 1_000_000
@@ -3510,9 +3505,7 @@ test("provider_deep miss returns None", pd_miss is None)
 
 
 print("\n[End-to-end] 迁出日志脚本 scripts/ccswitch_logs.py 冒烟")
-_LOGS_SCRIPT = os.path.join(
-    os.path.dirname(os.path.abspath(SCRIPT)), "scripts", "ccswitch_logs.py"
-)
+_LOGS_SCRIPT = os.path.join(_ROOT, "scripts", "ccswitch_logs.py")
 
 
 def _run_logs_cli(args, db_file):

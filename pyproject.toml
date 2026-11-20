@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cc-pulse"
-version = "0.1.0"
+version = "0.2.0"
 description = "Zero-dependency CLI health check, capability diagnostics, and authenticity guard for Claude Code / coding-agent LLM relays."
 readme = "README.md"
 license = "MIT"
@@ -22,16 +22,15 @@ classifiers = [
 ]
 
 [project.scripts]
-cc-pulse = "check_ccswitch_health:main"
+cc-pulse = "cc_pulse.cli:main"
 
-[tool.setuptools]
-py-modules = [
-    "check_ccswitch_health",
-    "ccpulse_archive",
-    "ccpulse_env",
-    "ccpulse_net",
-    "ccpulse_output",
-    "ccpulse_probe",
-    "ccpulse_store",
-    "ccpulse_tui",
-]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["F", "I", "F402", "RUF059", "RUF100", "FURB122"]
+ignore = ["E402"]

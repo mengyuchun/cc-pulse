@@ -2,7 +2,7 @@
 
 # 默认解释器为 PATH 中的 python；可通过 PYTHON 覆盖
 PYTHON := env_var_or_default("PYTHON", "python")
-SCRIPT := "check_ccswitch_health.py"
+SCRIPT := "src/cc_pulse/cli.py"
 
 # Default: show available commands
 default:

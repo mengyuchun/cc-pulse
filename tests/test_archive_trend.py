@@ -8,7 +8,6 @@
 """
 
 import contextlib
-import importlib.util
 import io
 import json
 import os
@@ -22,13 +21,11 @@ from pathlib import Path
 # 从项目根定位模块（可从任意目录运行）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-SCRIPT = os.path.join(_ROOT, "ccpulse_archive.py")
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+_SRC = os.path.join(_ROOT, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
-spec = importlib.util.spec_from_file_location("ccpulse_archive", SCRIPT)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+from cc_pulse import archive as mod
 
 PASSED = []
 FAILED = []

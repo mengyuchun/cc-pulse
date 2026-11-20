@@ -29,16 +29,21 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import ccpulse_net as _ccpulse_net
-import ccpulse_output as _ccpulse_output
-import ccpulse_probe
+if __package__ in (None, ""):
+    _src_dir = str(Path(__file__).resolve().parent.parent)
+    if _src_dir not in sys.path:
+        sys.path.insert(0, _src_dir)
+
+from cc_pulse import net as _ccpulse_net
+from cc_pulse import output as _ccpulse_output
+from cc_pulse import probe as ccpulse_probe
 
 # 拆分后子模块的私有名经 module __getattr__ 透传，保证 importlib.util
 # 加载本文件时外部仍可按原名访问 net/output/probe/store 层符号。
-import ccpulse_store
-from ccpulse_archive import parse_since, run_trend
-from ccpulse_env import run_env_check
-from ccpulse_net import (  # noqa: F401
+from cc_pulse import store as ccpulse_store
+from cc_pulse.archive import parse_since, run_trend
+from cc_pulse.env import run_env_check
+from cc_pulse.net import (  # noqa: F401
     STREAM_DONE_MARKERS,
     ErrorCategory,
     HttpResponse,
@@ -58,14 +63,14 @@ from ccpulse_net import (  # noqa: F401
     open_url_no_redirect,
     parse_sse_lines,
 )
-from ccpulse_output import (
+from cc_pulse.output import (
     _output_stream,
     _sanitize_for_terminal,
     _sanitize_url_for_display,
     ensure_utf8_stdio,
     say,
 )
-from ccpulse_probe import (  # noqa: F401
+from cc_pulse.probe import (  # noqa: F401
     _CLAUDE_CLI_VERSION_CACHE,
     _CLAUDE_VERSION_LOCK,
     _COMPARE_DEFAULT_INCLUDE,
@@ -142,7 +147,7 @@ from ccpulse_probe import (  # noqa: F401
     probe_tier,
     rebuild_provider_for_inspect,
 )
-from ccpulse_store import (  # noqa: F401
+from cc_pulse.store import (  # noqa: F401
     build_manual_provider,
     load_providers,
     load_standalone_providers,
@@ -300,7 +305,7 @@ def _archive_check_results(args, providers, results) -> None:
     失败不阻断探测：IO 或数据异常全部吞掉。
     """
     try:
-        from ccpulse_archive import append_record, archive_path, trim_archive
+        from cc_pulse.archive import append_record, archive_path, trim_archive
 
         path = archive_path(getattr(args, "archive", None))
         now = int(time.time())
@@ -980,7 +985,7 @@ def run_inspect(args, providers, say) -> int:
 
     # 归档：inspect 结果追加一行（供 trend 跨次聚合），失败不阻断
     try:
-        from ccpulse_archive import append_record, archive_path
+        from cc_pulse.archive import append_record, archive_path
 
         lat = None
         ttft = None
@@ -1994,11 +1999,27 @@ def _resolve_manual_endpoint_provider(args, say) -> Provider | None:
     )
 
 
-def main():
+def _should_open_interactive_menu(argv: list[str]) -> bool:
+    """无参数且在交互终端运行（如双击 .exe）时进入跨平台向导菜单。"""
+    if len(argv) > 1:
+        return False
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, OSError):
+        return False
+
+
+def main(argv: list[str] | None = None):
     ensure_utf8_stdio()
-    sys.argv = _inject_default_command(sys.argv)
+    raw_argv = list(sys.argv if argv is None else argv)
+    if argv is None and _should_open_interactive_menu(raw_argv):
+        from cc_pulse.interactive import run_interactive_menu
+
+        return run_interactive_menu(lambda sub_argv: main([raw_argv[0], *sub_argv]))
+
+    effective_argv = _inject_default_command(raw_argv)
     ap, *_ = _build_parser()
-    args = ap.parse_args()
+    args = ap.parse_args(effective_argv[1:])
 
     if getattr(args, "quiet", False) and (_is_human_output(args)):
         print(
@@ -2043,7 +2064,7 @@ def _main_with_args(args) -> int:
 
     # --archive 路径安全检查：复用 archive_path() 单一校验源，提前失败给清晰退出码
     if getattr(args, "archive", None):
-        from ccpulse_archive import archive_path as _archive_path
+        from cc_pulse.archive import archive_path as _archive_path
 
         try:
             _archive_path(args.archive)
@@ -2122,7 +2143,7 @@ def _main_with_args(args) -> int:
         and providers
         and not getattr(args, "compare", None)
     ):
-        from ccpulse_tui import select_providers
+        from cc_pulse.tui import select_providers
 
         indices = select_providers(providers)
         if indices is None:

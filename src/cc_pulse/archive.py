@@ -11,7 +11,7 @@ import re
 import tempfile
 import time
 
-from ccpulse_output import _pad, _sanitize_for_terminal
+from cc_pulse.output import _pad, _sanitize_for_terminal
 
 
 def parse_since(s: str | None) -> int | None:

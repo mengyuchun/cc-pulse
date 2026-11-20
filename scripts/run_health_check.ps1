@@ -247,7 +247,8 @@ if (-not $Python) {
     Read-HostSafe "按回车关闭"
     exit 2
 }
-$MainScript = Join-Path $ScriptDir "check_ccswitch_health.py"
+$RepoRoot = Split-Path -Parent $ScriptDir
+$MainScript = Join-Path $RepoRoot "src\cc_pulse\cli.py"
 if (-not (Test-Path $MainScript)) {
     Write-Host "未找到主脚本: $MainScript" -ForegroundColor Red
     Read-HostSafe "按回车关闭"
@@ -364,7 +365,7 @@ function Invoke-Ccpulse {
     param([string[]]$CmdArgs)
     $CmdArgs = @($CmdArgs | Where-Object { $_ -ne $null -and "$_" -ne "" })
     Write-Host "----------------------------------------"
-    Write-Host "运行: $Python -u check_ccswitch_health.py $($CmdArgs -join ' ')" -ForegroundColor DarkGray
+    Write-Host "运行: $Python -u src/cc_pulse/cli.py $($CmdArgs -join ' ')" -ForegroundColor DarkGray
     Write-Host "----------------------------------------"
     Write-Host "探测中，预计 1-3 分钟，请勿关闭窗口…" -ForegroundColor Cyan
     # -u：Python 无缓冲，完成一个就刷一行（管道下默认块缓冲会「全跑完才显示」）
@@ -404,7 +405,7 @@ function Invoke-CcpulseJson {
     param([string[]]$CmdArgs)
     $CmdArgs = @($CmdArgs | Where-Object { $_ -ne $null -and "$_" -ne "" })
     Write-Host "----------------------------------------" -ForegroundColor DarkGray
-    Write-Host "运行: $Python -u check_ccswitch_health.py $($CmdArgs -join ' ')" -ForegroundColor DarkGray
+    Write-Host "运行: $Python -u src/cc_pulse/cli.py $($CmdArgs -join ' ')" -ForegroundColor DarkGray
     Write-Host "----------------------------------------" -ForegroundColor DarkGray
     # 人类进度在 stderr（check --json 模式下）→ 直接显示；stdout 仅 JSON → 捕获
     $jsonText = ""
@@ -1165,7 +1166,7 @@ function Menu-Logs {
     if (-not (Show-Banner "运行日志 · 只读 cc-switch 历史 + cc-pulse 归档")) {
         Read-HostSafe "按回车返回主菜单" | Out-Null; return 1
     }
-    $logsScript = Join-Path $PSScriptRoot "scripts\ccswitch_logs.py"
+    $logsScript = Join-Path $PSScriptRoot "ccswitch_logs.py"
     $logOptions = @(
         "最近失败日志        history --fails"
         "最近全部日志        history"

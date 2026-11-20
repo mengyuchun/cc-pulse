@@ -1,6 +1,5 @@
 """P2-A 模型保真鉴别测试：高熵缓存回放/钳温双发探测。"""
 
-import importlib.util
 import json
 import os
 import sys
@@ -8,17 +7,11 @@ import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+_SRC = os.path.join(_ROOT, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
-_SPEC = importlib.util.spec_from_file_location(
-    "ccpulse_cache", os.path.join(_ROOT, "ccpulse_probe.py")
-)
-assert _SPEC is not None and _SPEC.loader is not None
-mod = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = mod
-_SPEC.loader.exec_module(mod)
-
+from cc_pulse import probe as mod
 
 # ── build_probe_request temperature 参数 ────────────────────────────
 

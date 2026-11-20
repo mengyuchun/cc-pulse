@@ -11,9 +11,9 @@ import sqlite3
 import time
 from pathlib import Path
 
-from ccpulse_net import ErrorCategory, _sanitize_raw_body
-from ccpulse_output import say
-from ccpulse_probe import (
+from cc_pulse.net import ErrorCategory, _sanitize_raw_body
+from cc_pulse.output import say
+from cc_pulse.probe import (
     TIER_ENV_KEYS,
     TIER_ORDER,
     ModelTier,
@@ -422,7 +422,7 @@ def load_standalone_providers(home_dir: Path | None = None) -> list:
     2) ~/.claude/settings.json（env 块）
     3) ~/.codex/config.toml + ~/.codex/auth.json
     """
-    from ccpulse_env import _load_toml_minimal
+    from cc_pulse.env import _load_toml_minimal
 
     home = Path.home() if home_dir is None else Path(home_dir)
     out: list[Provider] = []

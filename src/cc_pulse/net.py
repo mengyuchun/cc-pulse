@@ -13,7 +13,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ccpulse_output import _sanitize_for_terminal
+from cc_pulse.output import _sanitize_for_terminal
 
 
 class ErrorCategory(str, Enum):

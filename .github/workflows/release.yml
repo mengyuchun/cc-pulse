@@ -39,15 +39,16 @@ jobs:
         shell: bash
         run: |
           pip install pyinstaller
-          pyinstaller --onefile --clean --name "${{ matrix.asset }}" \
-            --hidden-import ccpulse_archive \
-            --hidden-import ccpulse_env \
-            --hidden-import ccpulse_net \
-            --hidden-import ccpulse_output \
-            --hidden-import ccpulse_probe \
-            --hidden-import ccpulse_store \
-            --hidden-import ccpulse_tui \
-            check_ccswitch_health.py
+          pyinstaller --onefile --clean --paths src --name "${{ matrix.asset }}" \
+            --hidden-import cc_pulse.archive \
+            --hidden-import cc_pulse.env \
+            --hidden-import cc_pulse.interactive \
+            --hidden-import cc_pulse.net \
+            --hidden-import cc_pulse.output \
+            --hidden-import cc_pulse.probe \
+            --hidden-import cc_pulse.store \
+            --hidden-import cc_pulse.tui \
+            src/cc_pulse/cli.py
 
       - name: Smoke-test binary
         shell: bash
@@ -76,8 +77,8 @@ jobs:
           pip install build
           python -m build --wheel
           mkdir -p build_pyz
-          cp check_ccswitch_health.py ccpulse_*.py build_pyz/
-          python -m zipapp build_pyz -o dist/cc-pulse.pyz -m "check_ccswitch_health:main" -p "/usr/bin/env python3"
+          cp -r src/cc_pulse build_pyz/cc_pulse
+          python -m zipapp build_pyz -o dist/cc-pulse.pyz -m "cc_pulse.cli:main" -p "/usr/bin/env python3"
           python dist/cc-pulse.pyz --help
           python dist/cc-pulse.pyz env-check --no-db --json
 

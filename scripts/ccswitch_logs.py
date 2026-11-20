@@ -10,12 +10,12 @@ import json
 import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-from ccpulse_archive import parse_since
-from ccpulse_output import (
+from cc_pulse.archive import parse_since
+from cc_pulse.output import (
     _c,
     _output_stream,
     _pad,
@@ -24,8 +24,8 @@ from ccpulse_output import (
     ensure_utf8_stdio,
     say,
 )
-from ccpulse_probe import _status_badge
-from ccpulse_store import (
+from cc_pulse.probe import _status_badge
+from cc_pulse.store import (
     _provider_api_keys,
     _sanitize_log_text,
     query_proxy_logs,
