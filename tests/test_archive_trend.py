@@ -74,7 +74,10 @@ test(
     ),
 )
 try:
-    mod.archive_path("D:/x/y.jsonl")
+    outside = os.path.join(
+        os.path.abspath(os.sep), "__ccpulse_outside_path__", "y.jsonl"
+    )
+    mod.archive_path(outside)
     test("archive_path 外部路径拒绝", False)
 except ValueError:
     test("archive_path 外部路径拒绝", True)

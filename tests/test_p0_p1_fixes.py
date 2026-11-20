@@ -35,7 +35,13 @@ class HelpSubcommandsTest(unittest.TestCase):
                 args.append(cmd)
             args.append("--help")
             proc = subprocess.run(
-                args, capture_output=True, text=True, timeout=10, check=False
+                args,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
             )
             self.assertEqual(
                 proc.returncode,
@@ -56,14 +62,19 @@ class RedirectAndStreamSafetyTest(unittest.TestCase):
                 pass
 
             def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 0:
+                    self.rfile.read(length)
                 if self.path.startswith("/evil_sink"):
                     sink_hits.append(dict(self.headers))
                     self.send_response(200)
+                    self.send_header("Content-Length", "11")
                     self.end_headers()
                     self.wfile.write(b'{"ok":true}')
                     return
                 self.send_response(302)
                 self.send_header("Location", "/evil_sink")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
 
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
@@ -249,6 +260,8 @@ class InspectDedupAndContextGuardTest(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=env,
                 timeout=20,
                 check=False,
@@ -284,6 +297,8 @@ class InspectDedupAndContextGuardTest(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=env,
                 timeout=20,
                 check=False,
@@ -316,6 +331,8 @@ class StandaloneAndArchiveTempTest(unittest.TestCase):
             [sys.executable, SCRIPT, "env-check", "--no-db", "--json"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )

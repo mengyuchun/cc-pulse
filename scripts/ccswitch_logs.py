@@ -21,6 +21,7 @@ from ccpulse_output import (
     _pad,
     _sanitize_for_terminal,
     _say_colored,
+    ensure_utf8_stdio,
     say,
 )
 from ccpulse_probe import _status_badge
@@ -142,6 +143,7 @@ def run_routing(args, output) -> int:
 
 
 def main() -> int:
+    ensure_utf8_stdio()
     ap = argparse.ArgumentParser(
         description="cc-switch 只读日志辅助脚本（独立个人工具）"
     )

@@ -4197,6 +4197,10 @@ print("\n[End-to-end] Content-Length 虚增 → IncompleteRead → truncated")
 
 class IncompleteReadHandler(BaseHTTPRequestHandler):
     def do_POST(self):
+        # 先排空请求体，避免 BSD/macOS 在仍有未读输入时对客户端发 TCP RST
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 0:
+            self.rfile.read(length)
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", "5000")  # 虚增：实际只发一小段

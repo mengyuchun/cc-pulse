@@ -326,6 +326,9 @@ def _http_request(
                 except http.client.IncompleteRead as e:
                     raw = e.partial or b""
                     truncated = True
+                except (ConnectionResetError, BrokenPipeError):
+                    raw = b""
+                    truncated = True
                 else:
                     truncated = False
                     # read(amt) 不抛 IncompleteRead：声明长度 > 实际读取且未达上限 → 截断

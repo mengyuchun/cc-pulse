@@ -177,3 +177,13 @@ def _say_colored(text: str, **kwargs: Any) -> None:
     stream = _output_stream.get() or sys.stdout
     with _say_lock:
         print(cleaned, file=stream, **kwargs)
+
+
+def ensure_utf8_stdio() -> None:
+    """在非 UTF-8 控制台/管道（如英文 Windows cp1252）下安全切换 stdout/stderr 为 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass

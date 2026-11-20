@@ -62,6 +62,7 @@ from ccpulse_output import (
     _output_stream,
     _sanitize_for_terminal,
     _sanitize_url_for_display,
+    ensure_utf8_stdio,
     say,
 )
 from ccpulse_probe import (  # noqa: F401
@@ -1994,6 +1995,7 @@ def _resolve_manual_endpoint_provider(args, say) -> Provider | None:
 
 
 def main():
+    ensure_utf8_stdio()
     sys.argv = _inject_default_command(sys.argv)
     ap, *_ = _build_parser()
     args = ap.parse_args()

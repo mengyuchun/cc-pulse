@@ -8,6 +8,8 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -24,16 +26,26 @@ jobs:
 
       - name: Run Python test suites
         run: |
-          python tests/test_ccpulse_full.py
-          python tests/test_p0_protocol_fix.py
-          python tests/test_env_check.py
-          python tests/test_archive_trend.py
-          python tests/test_tui.py
-          python tests/test_authenticity.py
-          python tests/test_usage_consistency.py
-          python tests/test_cache_replay.py
-          python tests/test_p0_p1_fixes.py
-          python tests/test_docs_consistency.py
+          python -c "
+          import subprocess, sys
+          suites = [
+              'tests/test_ccpulse_full.py',
+              'tests/test_p0_protocol_fix.py',
+              'tests/test_env_check.py',
+              'tests/test_archive_trend.py',
+              'tests/test_tui.py',
+              'tests/test_authenticity.py',
+              'tests/test_usage_consistency.py',
+              'tests/test_cache_replay.py',
+              'tests/test_p0_p1_fixes.py',
+              'tests/test_docs_consistency.py',
+          ]
+          for s in suites:
+              print(f'=== {s} ===', flush=True)
+              r = subprocess.run([sys.executable, s])
+              if r.returncode != 0:
+                  sys.exit(r.returncode)
+          "
 
       - name: Run PS1 launcher tests (Windows)
         if: runner.os == 'Windows'
