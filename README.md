@@ -28,15 +28,15 @@
 
 ## 10 秒快速上手（免配置，无需 `cc-switch.db`）
 
-> **小白推荐（免装 Python，双击即用）**：前往 [GitHub Releases](https://github.com/mengyuchun/cc-pulse/releases) 下载单文件程序（`cc-pulse-windows-x64.exe` / `cc-pulse-macos-arm64` / `cc-pulse-linux-x64`），**直接双击或无参数运行即进入交互式向导菜单**（支持安全隐藏输入 API Key，测完不闪退）；在命令行传参则走下方 CLI 模式。也可下载纯 Python 单文件 `cc-pulse.pyz`（`python cc-pulse.pyz`）。
+> **小白推荐（免装 Python，双击即用）**：前往 [GitHub Releases](https://github.com/mengyuchun/cc-pulse/releases) 下载单文件程序（`cc-pulse-windows-x64.exe` / `cc-pulse-macos-arm64` / `cc-pulse-linux-x64`），**直接双击或无参数运行即进入交互式向导菜单**（支持安全隐藏输入 API Key）；在命令行传参则走下方 CLI 模式。也可下载纯 Python 单文件 `cc-pulse.pyz`（`python cc-pulse.pyz`）。
 
-### 第一步：零 Key 排雷（绝不发送任何 API Key）
+### 第一步：零 Key 排雷（绝不保存传输任何 API Key）
 ```bash
 uvx cc-pulse env-check --no-db
 ```
 自动检测 shell 环境变量是否覆盖 `~/.claude/settings.json`、`~/.codex/config.toml` 或 `cc-switch.db`。
 
-### 第二步：单端点测活（无需安装任何前置 App）
+### 第二步：单端点测活（无需安装任何前置）
 ```bash
 export MY_RELAY_KEY="sk-..."
 uvx cc-pulse check --base-url https://relay.example.com --api-key-env MY_RELAY_KEY
